@@ -11,7 +11,7 @@ const (
 	defaultSlotSize             = 32768 // 32KB
 	pagerHeaderSize       int64 = 4096
 	magicValue      uint32      = 0x42505452 // "BPTR"
-	versionValue    uint32      = 1
+	currentVersion  uint32      = 2
 )
 
 var ErrCorrupted = errors.New("bptree: corrupted file")
@@ -71,7 +71,7 @@ func NewPager(filePath string, slotSize int64) (*Pager, error) {
 		p.file = f
 		if err := p.writeFileHeader(fileHeader{
 			Magic:    magicValue,
-			Version:  versionValue,
+			Version:  currentVersion,
 			SlotSize: uint32(slotSize),
 		}); err != nil {
 			f.Close()
@@ -92,7 +92,7 @@ func NewPager(filePath string, slotSize int64) (*Pager, error) {
 		f.Close()
 		return nil, err
 	}
-	if h.Magic != magicValue || h.Version != versionValue {
+	if h.Magic != magicValue || h.Version > currentVersion {
 		f.Close()
 		return nil, ErrCorrupted
 	}
@@ -163,12 +163,12 @@ func (p *Pager) writePage(pageID int64, data []byte) error {
 }
 
 // WriteHeader persists tree metadata into the file header.
-func (p *Pager) WriteHeader(rootID int64, order int) error {
+func (p *Pager) WriteHeader(rootID int64, order int, version uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.writeFileHeader(fileHeader{
 		Magic:      magicValue,
-		Version:    versionValue,
+		Version:    version,
 		Order:      uint32(order),
 		SlotSize:   uint32(p.slotSize),
 		RootPageID: rootID,

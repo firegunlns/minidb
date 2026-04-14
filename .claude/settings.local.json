@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(go test:*)"
+      "Bash(go test:*)",
+      "Bash(go build:*)",
+      "Bash(/tmp/bptree_bench:*)",
+      "Bash(ls -la /tmp/bptree_bench*)",
+      "Bash(go get:*)"
     ]
   }
 }

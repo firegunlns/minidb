@@ -1,49 +1,94 @@
 package bptree
 
-import "container/list"
+import (
+	"container/list"
+	"sync"
+)
 
-// LRUCache holds recently-accessed pnode objects.
-// When the number of cached entries reaches capacity, the least-recently-used
-// entry is evicted; if it is dirty it is serialized and flushed to disk via
-// the Pager.
 type LRUCache struct {
-	capacity int
-	items    map[int64]*list.Element
-	order    *list.List // front = MRU, back = LRU
-	pager    *Pager
+	mu            sync.Mutex
+	capacity      int
+	items         map[int64]*list.Element
+	order         *list.List // front = MRU, back = LRU
+	pager         *Pager
+	compressor    Compressor
+	formatVersion uint32
 }
 
 type cacheEntry struct {
 	pageID int64
 	node   *pnode
+	pins   int // while > 0, entry cannot be evicted
 }
 
-// NewLRUCache creates a cache that holds up to capacity nodes.
-func NewLRUCache(capacity int, pager *Pager) *LRUCache {
+func NewLRUCache(capacity int, pager *Pager, compressor Compressor, formatVersion uint32) *LRUCache {
 	return &LRUCache{
-		capacity: capacity,
-		items:    make(map[int64]*list.Element),
-		order:    list.New(),
-		pager:    pager,
+		capacity:      capacity,
+		items:         make(map[int64]*list.Element),
+		order:         list.New(),
+		pager:         pager,
+		compressor:    compressor,
+		formatVersion: formatVersion,
 	}
 }
 
-// Get returns the cached node for pageID, or nil on miss.
-// A hit promotes the entry to MRU position.
-func (c *LRUCache) Get(pageID int64) *pnode {
+// GetOrLoad atomically checks the cache and loads from disk if absent.
+// The returned node is pinned (pins incremented). Caller must call Unpin when done.
+func (c *LRUCache) GetOrLoad(pageID int64) (*pnode, error) {
+	c.mu.Lock()
 	if elem, ok := c.items[pageID]; ok {
 		c.order.MoveToFront(elem)
-		return elem.Value.(*cacheEntry).node
+		ent := elem.Value.(*cacheEntry)
+		ent.pins++
+		node := ent.node
+		c.mu.Unlock()
+		return node, nil
 	}
-	return nil
+	c.mu.Unlock()
+
+	// Load from disk without holding cache lock to avoid deadlock.
+	data, err := c.pager.Read(pageID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decompress if needed.
+	if c.compressor != nil {
+		data, err = c.compressor.Decompress(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	n := deserializeNode(pageID, data, c.formatVersion)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Double-check: another goroutine might have loaded it concurrently.
+	if elem, ok := c.items[pageID]; ok {
+		ent := elem.Value.(*cacheEntry)
+		ent.pins++
+		return ent.node, nil
+	}
+
+	for len(c.items) >= c.capacity {
+		c.evict()
+	}
+
+	entry := &cacheEntry{pageID: pageID, node: n, pins: 1}
+	elem := c.order.PushFront(entry)
+	c.items[pageID] = elem
+	return n, nil
 }
 
-// Put adds or updates a node in the cache.
-// If the cache is at capacity the LRU entry is evicted first.
-func (c *LRUCache) Put(n *pnode) {
-	if elem, ok := c.items[n.pageID]; ok {
-		c.order.MoveToFront(elem)
-		elem.Value.(*cacheEntry).node = n
+// PutPinned inserts a newly allocated node into the cache with pins=1.
+// Caller must call Unpin when done. Used by allocNode.
+func (c *LRUCache) PutPinned(n *pnode) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.items[n.pageID]; ok {
 		return
 	}
 
@@ -51,48 +96,61 @@ func (c *LRUCache) Put(n *pnode) {
 		c.evict()
 	}
 
-	entry := &cacheEntry{pageID: n.pageID, node: n}
+	entry := &cacheEntry{pageID: n.pageID, node: n, pins: 1}
 	elem := c.order.PushFront(entry)
 	c.items[n.pageID] = elem
 }
 
-// Remove drops a node from the cache without writing it to disk.
-func (c *LRUCache) Remove(pageID int64) {
+// Unpin decrements the pin counter for the given page.
+func (c *LRUCache) Unpin(pageID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if elem, ok := c.items[pageID]; ok {
-		c.order.Remove(elem)
-		delete(c.items, pageID)
+		ent := elem.Value.(*cacheEntry)
+		ent.pins--
 	}
 }
 
-// Flush writes every dirty node in the cache to disk.
 func (c *LRUCache) Flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, elem := range c.items {
 		ent := elem.Value.(*cacheEntry)
 		if ent.node.dirty {
-			data := serializeNode(ent.node)
+			data := serializeNode(ent.node, c.formatVersion)
+			if c.compressor != nil {
+				data = c.compressor.Compress(data)
+			}
 			c.pager.Write(ent.node.pageID, data)
 			ent.node.dirty = false
 		}
 	}
 }
 
-// Len returns the number of entries currently in the cache.
 func (c *LRUCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return len(c.items)
 }
 
 func (c *LRUCache) evict() {
 	elem := c.order.Back()
-	if elem == nil {
+	for elem != nil {
+		ent := elem.Value.(*cacheEntry)
+		if ent.pins > 0 {
+			elem = elem.Prev()
+			continue
+		}
+		c.order.Remove(elem)
+		delete(c.items, ent.pageID)
+		if ent.node.dirty {
+			data := serializeNode(ent.node, c.formatVersion)
+			if c.compressor != nil {
+				data = c.compressor.Compress(data)
+			}
+			c.pager.Write(ent.node.pageID, data)
+			ent.node.dirty = false
+		}
 		return
-	}
-	c.order.Remove(elem)
-	ent := elem.Value.(*cacheEntry)
-	delete(c.items, ent.pageID)
-
-	if ent.node.dirty {
-		data := serializeNode(ent.node)
-		c.pager.Write(ent.node.pageID, data)
-		ent.node.dirty = false
 	}
 }
