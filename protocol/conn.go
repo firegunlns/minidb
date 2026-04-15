@@ -55,7 +55,7 @@ func (s *Server) Accept() error {
 		}()
 
 		// Per-connection handler — fully independent executor/txn state.
-		handler := NewLnsHandler(s.engine, s.mgr, s.cat)
+		handler := NewSvrHandler(s.engine, s.mgr, s.cat)
 		defer handler.CloseConn()
 
 		c, err := server.NewCustomizedConn(conn, s.svr, auth, handler)

@@ -14,7 +14,7 @@ import (
 type (
 	SelectResult struct {
 		Columns []string
-		Rows    [][]interface{}
+		Rows    [][]any
 	}
 	OKResult struct {
 		AffectedRows int
@@ -53,7 +53,7 @@ func (e *Executor) Database() string {
 }
 
 // Execute parses and executes a SQL statement.
-func (e *Executor) Execute(sql string) (interface{}, error) {
+func (e *Executor) Execute(sql string) (any, error) {
 	p := NewParser()
 	stmt, err := p.Parse(sql)
 	if err != nil {
@@ -63,11 +63,11 @@ func (e *Executor) Execute(sql string) (interface{}, error) {
 }
 
 // ExecuteStmt executes a pre-parsed statement.
-func (e *Executor) ExecuteStmt(stmt Stmt) (interface{}, error) {
+func (e *Executor) ExecuteStmt(stmt Stmt) (any, error) {
 	return e.executeStmt(stmt)
 }
 
-func (e *Executor) executeStmt(stmt Stmt) (interface{}, error) {
+func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 	switch s := stmt.(type) {
 	case *CreateDatabaseStmt:
 		return e.execCreateDatabase(s)
@@ -84,19 +84,19 @@ func (e *Executor) executeStmt(stmt Stmt) (interface{}, error) {
 	case *ShowDatabasesStmt:
 		return e.execShowDatabases()
 	case *InsertStmt:
-		return e.execDML(func(txn *txn.Txn) (interface{}, error) {
+		return e.execDML(func(txn *txn.Txn) (any, error) {
 			return e.execInsert(txn, s)
 		})
 	case *SelectStmt:
-		return e.execDMLRead(func(txn *txn.Txn) (interface{}, error) {
+		return e.execDMLRead(func(txn *txn.Txn) (any, error) {
 			return e.execSelect(txn, s)
 		})
 	case *UpdateStmt:
-		return e.execDML(func(txn *txn.Txn) (interface{}, error) {
+		return e.execDML(func(txn *txn.Txn) (any, error) {
 			return e.execUpdate(txn, s)
 		})
 	case *DeleteStmt:
-		return e.execDML(func(txn *txn.Txn) (interface{}, error) {
+		return e.execDML(func(txn *txn.Txn) (any, error) {
 			return e.execDelete(txn, s)
 		})
 	case *BeginStmt:
@@ -112,23 +112,23 @@ func (e *Executor) executeStmt(stmt Stmt) (interface{}, error) {
 
 // --- DDL ---
 
-func (e *Executor) execCreateDatabase(s *CreateDatabaseStmt) (interface{}, error) {
+func (e *Executor) execCreateDatabase(s *CreateDatabaseStmt) (any, error) {
 	if err := e.cat.CreateDatabase(s.Name); err != nil {
 		return nil, err
 	}
 	return &OKResult{}, nil
 }
 
-func (e *Executor) execDropDatabase(s *DropDatabaseStmt) (interface{}, error) {
+func (e *Executor) execDropDatabase(s *DropDatabaseStmt) (any, error) {
 	return &OKResult{}, e.cat.DropDatabase(s.Name)
 }
 
-func (e *Executor) execUse(s *UseStmt) (interface{}, error) {
+func (e *Executor) execUse(s *UseStmt) (any, error) {
 	e.dbName = s.DBName
 	return &OKResult{}, nil
 }
 
-func (e *Executor) execCreateTable(s *CreateTableStmt) (interface{}, error) {
+func (e *Executor) execCreateTable(s *CreateTableStmt) (any, error) {
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
@@ -173,14 +173,14 @@ func (e *Executor) execCreateTable(s *CreateTableStmt) (interface{}, error) {
 	return &OKResult{}, nil
 }
 
-func (e *Executor) execDropTable(s *DropTableStmt) (interface{}, error) {
+func (e *Executor) execDropTable(s *DropTableStmt) (any, error) {
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
 	return &OKResult{}, e.cat.DropTable(e.dbName, s.Table)
 }
 
-func (e *Executor) execShowTables() (interface{}, error) {
+func (e *Executor) execShowTables() (any, error) {
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
@@ -190,26 +190,26 @@ func (e *Executor) execShowTables() (interface{}, error) {
 	}
 	result := &SelectResult{Columns: []string{"Tables"}}
 	for _, t := range tables {
-		result.Rows = append(result.Rows, []interface{}{t})
+		result.Rows = append(result.Rows, []any{t})
 	}
 	return result, nil
 }
 
-func (e *Executor) execShowDatabases() (interface{}, error) {
+func (e *Executor) execShowDatabases() (any, error) {
 	dbs, err := e.cat.ListDatabases()
 	if err != nil {
 		return nil, err
 	}
 	result := &SelectResult{Columns: []string{"Database"}}
 	for _, db := range dbs {
-		result.Rows = append(result.Rows, []interface{}{db})
+		result.Rows = append(result.Rows, []any{db})
 	}
 	return result, nil
 }
 
 // --- DML ---
 
-func (e *Executor) execDML(fn func(*txn.Txn) (interface{}, error)) (interface{}, error) {
+func (e *Executor) execDML(fn func(*txn.Txn) (any, error)) (any, error) {
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
@@ -245,7 +245,7 @@ func (e *Executor) execDML(fn func(*txn.Txn) (interface{}, error)) (interface{},
 	return result, nil
 }
 
-func (e *Executor) execDMLRead(fn func(*txn.Txn) (interface{}, error)) (interface{}, error) {
+func (e *Executor) execDMLRead(fn func(*txn.Txn) (any, error)) (any, error) {
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
@@ -257,7 +257,7 @@ func (e *Executor) execDMLRead(fn func(*txn.Txn) (interface{}, error)) (interfac
 	return fn(txn)
 }
 
-func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (interface{}, error) {
+func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 	td, err := e.cat.GetTable(e.dbName, s.Table)
 	if err != nil {
 		return nil, err
@@ -272,7 +272,7 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (interface{}, error) {
 		}
 
 		// Coerce values.
-		coerced := make([]interface{}, len(td.Columns))
+		coerced := make([]any, len(td.Columns))
 		for i, val := range rowVals {
 			c, err := storage.CoerceValue(td.Columns[i], val)
 			if err != nil {
@@ -291,7 +291,7 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (interface{}, error) {
 		}
 
 		pkCols := td.PrimaryKeyColumns()
-		pkVals := make([]interface{}, len(pkCols))
+		pkVals := make([]any, len(pkCols))
 		for i, colIdx := range td.PKCols {
 			pkVals[i] = coerced[colIdx]
 		}
@@ -307,7 +307,7 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (interface{}, error) {
 	return &OKResult{AffectedRows: len(s.Values), InsertID: lastID}, nil
 }
 
-func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (interface{}, error) {
+func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 	td, err := e.cat.GetTable(e.dbName, s.Table)
 	if err != nil {
 		return nil, err
@@ -349,7 +349,7 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (interface{}, error) {
 		end = []byte{0xFF}
 	}
 
-	var rows [][]interface{}
+	var rows [][]any
 	pkCols := td.PrimaryKeyColumns()
 
 	t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
@@ -360,7 +360,7 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (interface{}, error) {
 			return true
 		}
 
-		row := make([]interface{}, len(colIndices))
+		row := make([]any, len(colIndices))
 		for i, ci := range colIndices {
 			row[i] = vals[ci]
 		}
@@ -381,7 +381,7 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (interface{}, error) {
 	return &SelectResult{Columns: colNames, Rows: rows}, nil
 }
 
-func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (interface{}, error) {
+func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (any, error) {
 	td, err := e.cat.GetTable(e.dbName, s.Table)
 	if err != nil {
 		return nil, err
@@ -414,7 +414,7 @@ func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (interface{}, error) {
 		}
 
 		// Apply SET clauses.
-		newVals := make([]interface{}, len(vals))
+		newVals := make([]any, len(vals))
 		copy(newVals, vals)
 		for ci, expr := range setMap {
 			v := e.evalExpr(td, expr, vals)
@@ -437,7 +437,7 @@ func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (interface{}, error) {
 	return &OKResult{AffectedRows: affected}, nil
 }
 
-func (e *Executor) execDelete(t *txn.Txn, s *DeleteStmt) (interface{}, error) {
+func (e *Executor) execDelete(t *txn.Txn, s *DeleteStmt) (any, error) {
 	td, err := e.cat.GetTable(e.dbName, s.Table)
 	if err != nil {
 		return nil, err
@@ -471,7 +471,7 @@ func (e *Executor) execDelete(t *txn.Txn, s *DeleteStmt) (interface{}, error) {
 
 // --- Transaction ---
 
-func (e *Executor) execBegin() (interface{}, error) {
+func (e *Executor) execBegin() (any, error) {
 	if e.txn != nil {
 		return nil, fmt.Errorf("transaction already active")
 	}
@@ -479,7 +479,7 @@ func (e *Executor) execBegin() (interface{}, error) {
 	return &OKResult{}, nil
 }
 
-func (e *Executor) execCommit() (interface{}, error) {
+func (e *Executor) execCommit() (any, error) {
 	if e.txn == nil {
 		// No active transaction — return OK (compatible with MySQL behavior).
 		return &OKResult{}, nil
@@ -492,7 +492,7 @@ func (e *Executor) execCommit() (interface{}, error) {
 	return &OKResult{}, nil
 }
 
-func (e *Executor) execRollback() (interface{}, error) {
+func (e *Executor) execRollback() (any, error) {
 	if e.txn == nil {
 		return &OKResult{}, nil
 	}
@@ -508,7 +508,7 @@ func (e *Executor) ActiveTxn() *txn.Txn {
 
 // --- Expression evaluation ---
 
-func (e *Executor) evalWhere(td *catalog.TableDef, where Expr, vals []interface{}) bool {
+func (e *Executor) evalWhere(td *catalog.TableDef, where Expr, vals []any) bool {
 	result := e.evalExpr(td, where, vals)
 	if b, ok := result.(bool); ok {
 		return b
@@ -519,7 +519,7 @@ func (e *Executor) evalWhere(td *catalog.TableDef, where Expr, vals []interface{
 	return true
 }
 
-func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []interface{}) interface{} {
+func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 	switch ex := expr.(type) {
 	case *LiteralExpr:
 		return ex.Value
@@ -549,7 +549,7 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []interface{})
 	}
 }
 
-func (e *Executor) evalBinaryOp(op string, left, right interface{}) interface{} {
+func (e *Executor) evalBinaryOp(op string, left, right any) any {
 	switch op {
 	case "=":
 		return compareValues(left, right) == 0
@@ -578,7 +578,7 @@ func (e *Executor) evalBinaryOp(op string, left, right interface{}) interface{} 
 	}
 }
 
-func (e *Executor) evalUnaryOp(op string, operand interface{}) interface{} {
+func (e *Executor) evalUnaryOp(op string, operand any) any {
 	switch op {
 	case "-":
 		switch v := operand.(type) {
@@ -627,13 +627,13 @@ func (e *Executor) extractPKRange(td *catalog.TableDef, where Expr) ([]byte, []b
 }
 
 // collectEqualities extracts col=val pairs from AND-connected equalities.
-func (e *Executor) collectEqualities(expr Expr) map[string]interface{} {
-	result := make(map[string]interface{})
+func (e *Executor) collectEqualities(expr Expr) map[string]any {
+	result := make(map[string]any)
 	e.collectEqualitiesInto(expr, result)
 	return result
 }
 
-func (e *Executor) collectEqualitiesInto(expr Expr, m map[string]interface{}) {
+func (e *Executor) collectEqualitiesInto(expr Expr, m map[string]any) {
 	binExpr, ok := expr.(*BinaryExpr)
 	if !ok {
 		return
@@ -647,7 +647,7 @@ func (e *Executor) collectEqualitiesInto(expr Expr, m map[string]interface{}) {
 		return
 	}
 	var colName string
-	var val interface{}
+	var val any
 	if col, ok := binExpr.Left.(*ColumnRefExpr); ok {
 		colName = col.Name
 		val = e.extractLiteral(binExpr.Right)
@@ -660,14 +660,14 @@ func (e *Executor) collectEqualitiesInto(expr Expr, m map[string]interface{}) {
 	}
 }
 
-func (e *Executor) extractLiteral(expr Expr) interface{} {
+func (e *Executor) extractLiteral(expr Expr) any {
 	if lit, ok := expr.(*LiteralExpr); ok {
 		return lit.Value
 	}
 	return nil
 }
 
-func (e *Executor) sortRows(rows [][]interface{}, colNames []string, orderBy []OrderByClause) {
+func (e *Executor) sortRows(rows [][]any, colNames []string, orderBy []OrderByClause) {
 	if len(orderBy) == 0 || len(rows) <= 1 {
 		return
 	}
@@ -689,7 +689,7 @@ func (e *Executor) sortRows(rows [][]interface{}, colNames []string, orderBy []O
 	}
 }
 
-func (e *Executor) lessThan(a, b []interface{}, orderBy []OrderByClause, colIdx map[string]int) bool {
+func (e *Executor) lessThan(a, b []any, orderBy []OrderByClause, colIdx map[string]int) bool {
 	for _, ob := range orderBy {
 		idx := colIdx[ob.Column]
 		cmp := compareValues(a[idx], b[idx])
@@ -725,7 +725,7 @@ func colTypeFromString(s string) storage.ColumnType {
 	}
 }
 
-func compareValues(a, b interface{}) int {
+func compareValues(a, b any) int {
 	if a == nil && b == nil {
 		return 0
 	}
@@ -805,7 +805,7 @@ func compareValues(a, b interface{}) int {
 	return 0
 }
 
-func toBool(v interface{}) bool {
+func toBool(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -820,7 +820,7 @@ func toBool(v interface{}) bool {
 	return false
 }
 
-func arithOp(a, b interface{}, intFn func(int64, int64) int64, floatFn func(float64, float64) float64) interface{} {
+func arithOp(a, b any, intFn func(int64, int64) int64, floatFn func(float64, float64) float64) any {
 	switch av := a.(type) {
 	case int32:
 		switch bv := b.(type) {

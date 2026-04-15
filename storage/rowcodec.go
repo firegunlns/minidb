@@ -25,9 +25,9 @@ const (
 type ColumnDef struct {
 	Name      string
 	Type      ColumnType
-	Length    int  // VARCHAR max length
-	Precision int  // DECIMAL precision
-	Scale     int  // DECIMAL scale
+	Length    int // VARCHAR max length
+	Precision int // DECIMAL precision
+	Scale     int // DECIMAL scale
 	Nullable  bool
 	AutoInc   bool
 }
@@ -36,7 +36,7 @@ type ColumnDef struct {
 
 // EncodeColumnValue encodes a single column value to bytes.
 // Uses order-preserving encoding for sortable types (INT, BIGINT, VARCHAR).
-func EncodeColumnValue(col ColumnDef, val interface{}) []byte {
+func EncodeColumnValue(col ColumnDef, val any) []byte {
 	if val == nil {
 		return []byte{typeTagNull}
 	}
@@ -90,7 +90,7 @@ func EncodeColumnValue(col ColumnDef, val interface{}) []byte {
 
 // DecodeColumnValue decodes a single column value from bytes at offset.
 // Returns the decoded value and the next offset.
-func DecodeColumnValue(data []byte, offset int, col ColumnDef) (interface{}, int) {
+func DecodeColumnValue(data []byte, offset int, col ColumnDef) (any, int) {
 	if offset >= len(data) {
 		return nil, offset
 	}
@@ -132,7 +132,7 @@ func DecodeColumnValue(data []byte, offset int, col ColumnDef) (interface{}, int
 // --- Row encoding ---
 
 // EncodeRow encodes a full row into bytes.
-func EncodeRow(cols []ColumnDef, vals []interface{}) []byte {
+func EncodeRow(cols []ColumnDef, vals []any) []byte {
 	numCols := len(cols)
 	nullBitmap := make([]byte, (numCols+7)/8)
 
@@ -160,13 +160,13 @@ func EncodeRow(cols []ColumnDef, vals []interface{}) []byte {
 
 // DecodeRow decodes a full row from bytes.
 // Returns column values and a null bitmap.
-func DecodeRow(data []byte, cols []ColumnDef) ([]interface{}, []bool) {
+func DecodeRow(data []byte, cols []ColumnDef) ([]any, []bool) {
 	numCols := int(binary.BigEndian.Uint16(data))
 	bitmapSize := (numCols + 7) / 8
 	nullBitmap := data[2 : 2+bitmapSize]
 	off := 2 + bitmapSize
 
-	vals := make([]interface{}, numCols)
+	vals := make([]any, numCols)
 	nulls := make([]bool, numCols)
 
 	for i := 0; i < numCols; i++ {
@@ -179,7 +179,7 @@ func DecodeRow(data []byte, cols []ColumnDef) ([]interface{}, []bool) {
 // --- Primary key encoding ---
 
 // EncodePrimaryKey encodes a composite primary key from column values.
-func EncodePrimaryKey(cols []ColumnDef, pkVals ...interface{}) []byte {
+func EncodePrimaryKey(cols []ColumnDef, pkVals ...any) []byte {
 	var buf []byte
 	for i, col := range cols {
 		buf = append(buf, EncodeColumnValue(col, pkVals[i])...)
@@ -190,7 +190,7 @@ func EncodePrimaryKey(cols []ColumnDef, pkVals ...interface{}) []byte {
 // --- Helpers ---
 
 // CoerceValue converts a value to the expected Go type for the given column.
-func CoerceValue(col ColumnDef, val interface{}) (interface{}, error) {
+func CoerceValue(col ColumnDef, val any) (any, error) {
 	if val == nil {
 		return nil, nil
 	}

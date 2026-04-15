@@ -27,7 +27,7 @@ type (
 	InsertStmt struct {
 		Table   string
 		Columns []string
-		Values  [][]interface{}
+		Values  [][]any
 	}
 	SelectStmt struct {
 		Table     string
@@ -78,7 +78,7 @@ type OrderByClause struct {
 type (
 	Expr interface{ exprNode() }
 
-	LiteralExpr   struct{ Value interface{} }
+	LiteralExpr   struct{ Value any }
 	ColumnRefExpr struct{ Name string }
 	BinaryExpr    struct {
 		Op          string
@@ -92,10 +92,10 @@ type (
 		Name string
 		Args []Expr
 	}
-	ParamExpr    struct{}
-	NullExpr     struct{}
-	BetweenExpr  struct{ Expr, Low, High Expr }
-	InExpr       struct {
+	ParamExpr   struct{}
+	NullExpr    struct{}
+	BetweenExpr struct{ Expr, Low, High Expr }
+	InExpr      struct {
 		Expr   Expr
 		Values []Expr
 		Not    bool
@@ -117,7 +117,7 @@ func (BetweenExpr) exprNode()   {}
 func (InExpr) exprNode()        {}
 func (IsNullExpr) exprNode()    {}
 
-type Stmt interface{}
+type Stmt any
 
 // Parser wraps the TiDB parser.
 type Parser struct {
@@ -254,7 +254,7 @@ func convertInsert(n *ast.InsertStmt) (*InsertStmt, error) {
 		result.Columns = append(result.Columns, col.Name.O)
 	}
 	for _, row := range n.Lists {
-		var vals []interface{}
+		var vals []any
 		for _, expr := range row {
 			v, err := evalLiteral(expr)
 			if err != nil {
@@ -470,7 +470,7 @@ func unaryOpToString(op opcode.Op) string {
 	}
 }
 
-func evalLiteral(node ast.ExprNode) (interface{}, error) {
+func evalLiteral(node ast.ExprNode) (any, error) {
 	if v, ok := node.(ast.ValueExpr); ok {
 		return v.GetValue(), nil
 	}

@@ -56,7 +56,7 @@ func needsSpecialHandling(query string) bool {
 }
 
 // handleSpecialQuery handles queries that can't be processed by the SQL engine.
-func (h *LnsHandler) handleSpecialQuery(query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) handleSpecialQuery(query string, args []any) (*mysql.Result, error) {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 
 	// COUNT(*) queries — return 0, with proper alias.
@@ -85,7 +85,7 @@ func (h *LnsHandler) handleSpecialQuery(query string, args []any) (*mysql.Result
 	return mysql.NewResult(rs), nil
 }
 
-func (h *LnsHandler) handleJoinQuery(query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) handleJoinQuery(query string, args []any) (*mysql.Result, error) {
 	upper := strings.ToUpper(query)
 
 	// Customer + Warehouse JOIN in New-Order.
@@ -137,7 +137,7 @@ func (h *LnsHandler) handleJoinQuery(query string, args []any) (*mysql.Result, e
 	return mysql.NewResult(rs), nil
 }
 
-func (h *LnsHandler) handleTupleIn(query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) handleTupleIn(query string, args []any) (*mysql.Result, error) {
 	upper := strings.ToUpper(query)
 
 	if strings.Contains(upper, "DELETE") && strings.Contains(upper, "BMSQL_NEW_ORDER") {
@@ -153,7 +153,7 @@ func (h *LnsHandler) handleTupleIn(query string, args []any) (*mysql.Result, err
 	return mysql.NewResult(nil), nil
 }
 
-func (h *LnsHandler) handleBatchDeleteNewOrder(query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) handleBatchDeleteNewOrder(query string, args []any) (*mysql.Result, error) {
 	if len(args) == 0 {
 		args = extractTupleInValues(query)
 	}
@@ -172,7 +172,7 @@ func (h *LnsHandler) handleBatchDeleteNewOrder(query string, args []any) (*mysql
 	return res, nil
 }
 
-func (h *LnsHandler) handleBatchUpdateOOrder(query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) handleBatchUpdateOOrder(query string, args []any) (*mysql.Result, error) {
 	if len(args) == 0 {
 		args = extractSetAndTupleValues(query)
 	}
@@ -194,7 +194,7 @@ func (h *LnsHandler) handleBatchUpdateOOrder(query string, args []any) (*mysql.R
 	return res, nil
 }
 
-func (h *LnsHandler) handleBatchUpdateOrderLine(query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) handleBatchUpdateOrderLine(query string, args []any) (*mysql.Result, error) {
 	if len(args) == 0 {
 		args = extractSetAndTupleValues(query)
 	}
@@ -217,7 +217,7 @@ func (h *LnsHandler) handleBatchUpdateOrderLine(query string, args []any) (*mysq
 }
 
 // execDirect executes a query directly through the executor (bypasses rewrite/special-handling).
-func (h *LnsHandler) execDirect(query string) (*mysql.Result, error) {
+func (h *SvrHandler) execDirect(query string) (*mysql.Result, error) {
 	result, err := h.exec.Execute(query)
 	if err != nil {
 		return nil, err

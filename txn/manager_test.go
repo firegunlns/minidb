@@ -31,7 +31,7 @@ func TestTxnBeginCommit(t *testing.T) {
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 	treeKey := "testdb__t.db"
 	pk := storage.EncodePrimaryKey(cols[:1], int32(1))
-	row := storage.EncodeRow(cols, []interface{}{int32(1), int32(42)})
+	row := storage.EncodeRow(cols, []any{int32(1), int32(42)})
 
 	if err := txn.Insert(treeKey, pk, row); err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestTxnRollback(t *testing.T) {
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 	treeKey := "testdb__t.db"
 	pk := storage.EncodePrimaryKey(cols[:1], int32(1))
-	row := storage.EncodeRow(cols, []interface{}{int32(1), int32(42)})
+	row := storage.EncodeRow(cols, []any{int32(1), int32(42)})
 
 	txn.Insert(treeKey, pk, row)
 	txn.Rollback()
@@ -101,12 +101,12 @@ func TestTxnReadYourWrites(t *testing.T) {
 	// Insert a row first.
 	txn0 := mgr.Begin()
 	pk := storage.EncodePrimaryKey(cols[:1], int32(1))
-	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []interface{}{int32(1), int32(10)}))
+	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []any{int32(1), int32(10)}))
 	txn0.Commit()
 
 	// Update in a new txn and verify read-your-writes.
 	txn1 := mgr.Begin()
-	newRow := storage.EncodeRow(cols, []interface{}{int32(1), int32(99)})
+	newRow := storage.EncodeRow(cols, []any{int32(1), int32(99)})
 	txn1.Update(treeKey, cols, pk, newRow)
 
 	gotRow, _ := txn1.Get(treeKey, cols, pk)
@@ -131,7 +131,7 @@ func TestTxnDelete(t *testing.T) {
 	// Insert a row.
 	txn0 := mgr.Begin()
 	pk := storage.EncodePrimaryKey(cols[:1], int32(1))
-	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []interface{}{int32(1), int32(10)}))
+	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []any{int32(1), int32(10)}))
 	txn0.Commit()
 
 	// Delete in a new txn.
@@ -165,7 +165,7 @@ func TestTxnSnapshotIsolation(t *testing.T) {
 	// Insert a row.
 	txn0 := mgr.Begin()
 	pk := storage.EncodePrimaryKey(cols[:1], int32(1))
-	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []interface{}{int32(1), int32(10)}))
+	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []any{int32(1), int32(10)}))
 	txn0.Commit()
 
 	// Start txn1, then update the row in txn2 and commit.
@@ -173,7 +173,7 @@ func TestTxnSnapshotIsolation(t *testing.T) {
 	defer txn1.Rollback()
 
 	txn2 := mgr.Begin()
-	newRow := storage.EncodeRow(cols, []interface{}{int32(1), int32(99)})
+	newRow := storage.EncodeRow(cols, []any{int32(1), int32(99)})
 	txn2.Update(treeKey, cols, pk, newRow)
 	txn2.Commit()
 
@@ -199,7 +199,7 @@ func TestTxnConflictDetection(t *testing.T) {
 	// Insert a row.
 	txn0 := mgr.Begin()
 	pk := storage.EncodePrimaryKey(cols[:1], int32(1))
-	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []interface{}{int32(1), int32(10)}))
+	txn0.Insert(treeKey, pk, storage.EncodeRow(cols, []any{int32(1), int32(10)}))
 	txn0.Commit()
 
 	// txn1 reads the row.
@@ -208,7 +208,7 @@ func TestTxnConflictDetection(t *testing.T) {
 
 	// txn2 updates and commits.
 	txn2 := mgr.Begin()
-	txn2.Update(treeKey, cols, pk, storage.EncodeRow(cols, []interface{}{int32(1), int32(99)}))
+	txn2.Update(treeKey, cols, pk, storage.EncodeRow(cols, []any{int32(1), int32(99)}))
 	txn2.Commit()
 
 	// txn1 commit should fail due to conflict.
@@ -230,7 +230,7 @@ func TestTxnScan(t *testing.T) {
 	txn0 := mgr.Begin()
 	for i := int32(1); i <= 5; i++ {
 		pk := storage.EncodePrimaryKey(cols[:1], i)
-		row := storage.EncodeRow(cols, []interface{}{i, i * 10})
+		row := storage.EncodeRow(cols, []any{i, i * 10})
 		txn0.Insert(treeKey, pk, row)
 	}
 	txn0.Commit()

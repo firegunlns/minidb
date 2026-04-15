@@ -114,7 +114,7 @@ func TestEncodeRow(t *testing.T) {
 		{Name: "name", Type: ColTypeVarchar, Length: 20},
 		{Name: "balance", Type: ColTypeDecimal, Precision: 12, Scale: 2},
 	}
-	vals := []interface{}{
+	vals := []any{
 		int32(1),
 		"Alice",
 		"99.99",
@@ -137,7 +137,7 @@ func TestEncodeRowWithNull(t *testing.T) {
 		{Name: "name", Type: ColTypeVarchar, Length: 20, Nullable: true},
 		{Name: "ts", Type: ColTypeTimestamp, Nullable: true},
 	}
-	vals := []interface{}{
+	vals := []any{
 		int32(42),
 		nil,
 		nil,
@@ -161,7 +161,7 @@ func TestEncodeRowAllTypes(t *testing.T) {
 		{Name: "ts", Type: ColTypeTimestamp},
 	}
 	ts := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
-	vals := []interface{}{
+	vals := []any{
 		int32(100),
 		int64(999999),
 		"test string",

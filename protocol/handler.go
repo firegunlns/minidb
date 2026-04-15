@@ -17,7 +17,7 @@ import (
 // LnsHandler implements go-mysql Handler.
 // One instance per connection — no shared mutable state, no mutex needed.
 // Each connection's HandleCommand loop is single-goroutine, sequential.
-type LnsHandler struct {
+type SvrHandler struct {
 	exec       *sql.Executor
 	engine     *storage.StorageEngine // shared, read-only
 	mgr        *txn.Manager           // shared, read-only
@@ -25,8 +25,8 @@ type LnsHandler struct {
 	autocommit bool
 }
 
-func NewLnsHandler(engine *storage.StorageEngine, mgr *txn.Manager, cat *catalog.Catalog) *LnsHandler {
-	return &LnsHandler{
+func NewSvrHandler(engine *storage.StorageEngine, mgr *txn.Manager, cat *catalog.Catalog) *SvrHandler {
+	return &SvrHandler{
 		exec:       sql.NewExecutor(engine, mgr, cat, ""),
 		engine:     engine,
 		mgr:        mgr,
@@ -35,14 +35,14 @@ func NewLnsHandler(engine *storage.StorageEngine, mgr *txn.Manager, cat *catalog
 	}
 }
 
-func (h *LnsHandler) UseDB(dbName string) error {
+func (h *SvrHandler) UseDB(dbName string) error {
 	// Ensure the database exists; ignore "already exists" error.
 	h.exec.Execute(fmt.Sprintf("CREATE DATABASE %s", dbName))
 	h.exec.SetDatabase(dbName)
 	return nil
 }
 
-func (h *LnsHandler) HandleQuery(query string) (result *mysql.Result, err error) {
+func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error) {
 	log.Printf("HandleQuery: %s", query[:min(len(query), 200)])
 	defer func() {
 		if r := recover(); r != nil {
@@ -80,16 +80,16 @@ func (h *LnsHandler) HandleQuery(query string) (result *mysql.Result, err error)
 	return convertResult(res)
 }
 
-func (h *LnsHandler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {
+func (h *SvrHandler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {
 	return nil, nil
 }
 
-func (h *LnsHandler) HandleStmtPrepare(query string) (params int, columns int, context any, err error) {
+func (h *SvrHandler) HandleStmtPrepare(query string) (params int, columns int, context any, err error) {
 	params = strings.Count(query, "?")
 	return params, 0, query, nil
 }
 
-func (h *LnsHandler) HandleStmtExecute(context any, query string, args []any) (*mysql.Result, error) {
+func (h *SvrHandler) HandleStmtExecute(context any, query string, args []any) (*mysql.Result, error) {
 	actualQuery := replacePlaceholders(query, args)
 	q := rewriteSQL(actualQuery)
 	upper := strings.ToUpper(strings.TrimSpace(q))
@@ -120,15 +120,15 @@ func (h *LnsHandler) HandleStmtExecute(context any, query string, args []any) (*
 	return convertResult(result)
 }
 
-func (h *LnsHandler) HandleStmtClose(context any) error {
+func (h *SvrHandler) HandleStmtClose(context any) error {
 	return nil
 }
 
-func (h *LnsHandler) HandleOtherCommand(cmd byte, data []byte) error {
+func (h *SvrHandler) HandleOtherCommand(cmd byte, data []byte) error {
 	return nil
 }
 
-func (h *LnsHandler) handleSet(upper string) {
+func (h *SvrHandler) handleSet(upper string) {
 	if strings.Contains(upper, "AUTOCOMMIT") {
 		if strings.Contains(upper, "=0") {
 			h.autocommit = false
@@ -141,7 +141,7 @@ func (h *LnsHandler) handleSet(upper string) {
 	}
 }
 
-func (h *LnsHandler) autoBegin(upper string) {
+func (h *SvrHandler) autoBegin(upper string) {
 	if h.autocommit {
 		return
 	}
@@ -153,7 +153,7 @@ func (h *LnsHandler) autoBegin(upper string) {
 	}
 }
 
-func (h *LnsHandler) CloseConn() {
+func (h *SvrHandler) CloseConn() {
 	if h.exec.ActiveTxn() != nil {
 		h.exec.Execute("ROLLBACK")
 	}
@@ -230,7 +230,7 @@ func handleMultiSysVariable(query string) (*mysql.Result, error) {
 
 // --- Result conversion (stateless) ---
 
-func convertResult(result interface{}) (*mysql.Result, error) {
+func convertResult(result any) (*mysql.Result, error) {
 	switch r := result.(type) {
 	case *sql.SelectResult:
 		return buildSelectResult(r)
@@ -264,7 +264,7 @@ func buildOKResult(r *sql.OKResult) (*mysql.Result, error) {
 	return res, nil
 }
 
-func convertValue(v interface{}) interface{} {
+func convertValue(v any) any {
 	if v == nil {
 		return nil
 	}
@@ -290,7 +290,7 @@ func replacePlaceholders(query string, args []any) string {
 	return buf.String()
 }
 
-func formatValue(v interface{}) string {
+func formatValue(v any) string {
 	if v == nil {
 		return "NULL"
 	}

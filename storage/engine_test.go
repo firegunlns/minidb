@@ -22,7 +22,7 @@ func TestEngineInsertAndGet(t *testing.T) {
 		{Name: "id", Type: ColTypeInt},
 		{Name: "name", Type: ColTypeVarchar, Length: 20},
 	}
-	rowData := EncodeRow(cols, []interface{}{int32(1), "Alice"})
+	rowData := EncodeRow(cols, []any{int32(1), "Alice"})
 	pk := EncodePrimaryKey(cols[:1], int32(1))
 
 	if err := e.InsertRow(treeKey, pk, 100, rowData); err != nil {
@@ -60,11 +60,11 @@ func TestEngineMultiVersion(t *testing.T) {
 	pk := EncodePrimaryKey(cols[:1], int32(1))
 
 	// Insert at ts=10
-	row1 := EncodeRow(cols, []interface{}{int32(1), int32(100)})
+	row1 := EncodeRow(cols, []any{int32(1), int32(100)})
 	e.InsertRow(treeKey, pk, 10, row1)
 
 	// Update at ts=20
-	row2 := EncodeRow(cols, []interface{}{int32(1), int32(200)})
+	row2 := EncodeRow(cols, []any{int32(1), int32(200)})
 	e.UpdateRow(treeKey, pk, 20, row2)
 
 	// Read at ts=5 → not found
@@ -110,7 +110,7 @@ func TestEngineDelete(t *testing.T) {
 
 	cols := []ColumnDef{{Name: "id", Type: ColTypeInt}, {Name: "v", Type: ColTypeInt}}
 	pk := EncodePrimaryKey(cols[:1], int32(1))
-	row := EncodeRow(cols, []interface{}{int32(1), int32(42)})
+	row := EncodeRow(cols, []any{int32(1), int32(42)})
 
 	e.InsertRow(treeKey, pk, 10, row)
 
@@ -149,7 +149,7 @@ func TestEngineScanRange(t *testing.T) {
 	// Insert 10 rows
 	for i := int32(1); i <= 10; i++ {
 		pk := EncodePrimaryKey(cols[:1], i)
-		row := EncodeRow(cols, []interface{}{i, i * 10})
+		row := EncodeRow(cols, []any{i, i * 10})
 		e.InsertRow(treeKey, pk, 100, row)
 	}
 
@@ -174,7 +174,7 @@ func TestEnginePersistence(t *testing.T) {
 	e1.OpenTree(treeKey)
 	cols := []ColumnDef{{Name: "id", Type: ColTypeInt}, {Name: "v", Type: ColTypeInt}}
 	pk := EncodePrimaryKey(cols[:1], int32(1))
-	e1.InsertRow(treeKey, pk, 10, EncodeRow(cols, []interface{}{int32(1), int32(99)}))
+	e1.InsertRow(treeKey, pk, 10, EncodeRow(cols, []any{int32(1), int32(99)}))
 	e1.Close()
 
 	e2, _ := OpenEngine(dir, 64, 256)
@@ -216,7 +216,7 @@ func TestEngineSecondaryIndex(t *testing.T) {
 	for i := int32(1); i <= 5; i++ {
 		name := fmt.Sprintf("user_%d", i)
 		pk := EncodePrimaryKey(cols[:1], i)
-		row := EncodeRow(cols, []interface{}{i, name})
+		row := EncodeRow(cols, []any{i, name})
 		e.InsertRow(dataTree, pk, 100, row)
 
 		// Insert into secondary index: key = (name, pk)
