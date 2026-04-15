@@ -167,7 +167,7 @@ func handleSysVariable(query string) (*mysql.Result, error) {
 		return handleMultiSysVariable(query)
 	}
 	if strings.Contains(upper, "@@VERSION_COMMENT") {
-		rs, _ := mysql.BuildSimpleTextResultset([]string{"@@version_comment"}, [][]any{{"LnsDB"}})
+		rs, _ := mysql.BuildSimpleTextResultset([]string{"@@version_comment"}, [][]any{{"minidb"}})
 		return mysql.NewResult(rs), nil
 	}
 	if strings.Contains(upper, "@@AUTOCOMMIT") {
@@ -175,7 +175,7 @@ func handleSysVariable(query string) (*mysql.Result, error) {
 		return mysql.NewResult(rs), nil
 	}
 	if strings.Contains(upper, "@@VERSION") {
-		rs, _ := mysql.BuildSimpleTextResultset([]string{"@@version"}, [][]any{{"8.0.0-lnsdb"}})
+		rs, _ := mysql.BuildSimpleTextResultset([]string{"@@version"}, [][]any{{"8.0.0-minidb"}})
 		return mysql.NewResult(rs), nil
 	}
 	rs, _ := mysql.BuildSimpleTextResultset([]string{"value"}, [][]any{{""}})
@@ -205,7 +205,7 @@ func handleMultiSysVariable(query string) (*mysql.Result, error) {
 		"TIME_ZONE":                "SYSTEM",
 		"TRANSACTION_ISOLATION":    "REPEATABLE-READ",
 		"WAIT_TIMEOUT":             "28800",
-		"VERSION":                  "8.0.0-lnsdb",
+		"VERSION":                  "8.0.0-minidb",
 		"TX_ISOLATION":             "REPEATABLE-READ",
 	}
 	var cols []string
