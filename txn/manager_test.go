@@ -3,7 +3,7 @@ package txn
 import (
 	"testing"
 
-	"lns.com/bptree/storage"
+	"lns.com/minidb/storage"
 )
 
 func setupEngine(t *testing.T) (*storage.StorageEngine, *TimestampOracle, func()) {

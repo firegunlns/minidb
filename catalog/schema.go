@@ -1,6 +1,6 @@
 package catalog
 
-import "lns.com/bptree/storage"
+import "lns.com/minidb/storage"
 
 type DatabaseDef struct {
 	Name string
@@ -10,7 +10,7 @@ type TableDef struct {
 	Database string
 	Name     string
 	Columns  []storage.ColumnDef
-	PKCols   []int    // indices into Columns that form the primary key
+	PKCols   []int // indices into Columns that form the primary key
 	Indexes  []IndexDef
 }
 

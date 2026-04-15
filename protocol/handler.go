@@ -8,10 +8,10 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
-	"lns.com/bptree/catalog"
-	"lns.com/bptree/sql"
-	"lns.com/bptree/storage"
-	"lns.com/bptree/txn"
+	"lns.com/minidb/catalog"
+	"lns.com/minidb/sql"
+	"lns.com/minidb/storage"
+	"lns.com/minidb/txn"
 )
 
 // LnsHandler implements go-mysql Handler.
@@ -20,8 +20,8 @@ import (
 type LnsHandler struct {
 	exec       *sql.Executor
 	engine     *storage.StorageEngine // shared, read-only
-	mgr        *txn.Manager          // shared, read-only
-	cat        *catalog.Catalog      // shared, read-only
+	mgr        *txn.Manager           // shared, read-only
+	cat        *catalog.Catalog       // shared, read-only
 	autocommit bool
 }
 

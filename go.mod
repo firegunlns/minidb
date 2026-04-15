@@ -1,4 +1,4 @@
-module lns.com/bptree
+module lns.com/minidb
 
 go 1.25
 

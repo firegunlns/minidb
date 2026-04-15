@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"lns.com/bptree/bptree"
-	"lns.com/bptree/storage"
+	"lns.com/minidb/bptree"
+	"lns.com/minidb/storage"
 )
 
 const (
@@ -19,12 +19,12 @@ const (
 )
 
 type Catalog struct {
-	mu       sync.RWMutex
-	dataDir  string
-	dbTree   *bptree.PersistentBPTree
-	tblTree  *bptree.PersistentBPTree
-	incTree  *bptree.PersistentBPTree
-	cache    map[string]*TableDef // "db.table" -> def
+	mu      sync.RWMutex
+	dataDir string
+	dbTree  *bptree.PersistentBPTree
+	tblTree *bptree.PersistentBPTree
+	incTree *bptree.PersistentBPTree
+	cache   map[string]*TableDef // "db.table" -> def
 }
 
 func Open(dataDir string) (*Catalog, error) {

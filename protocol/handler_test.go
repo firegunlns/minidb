@@ -8,9 +8,9 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"lns.com/bptree/catalog"
-	"lns.com/bptree/storage"
-	"lns.com/bptree/txn"
+	"lns.com/minidb/catalog"
+	"lns.com/minidb/storage"
+	"lns.com/minidb/txn"
 )
 
 func startTestServer(t *testing.T) (*Server, string) {

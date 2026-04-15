@@ -3,7 +3,7 @@ package catalog
 import (
 	"testing"
 
-	"lns.com/bptree/storage"
+	"lns.com/minidb/storage"
 )
 
 func tempDir(t *testing.T) string {

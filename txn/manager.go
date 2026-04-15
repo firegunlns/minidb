@@ -4,7 +4,7 @@ import (
 	"errors"
 	"log"
 
-	"lns.com/bptree/storage"
+	"lns.com/minidb/storage"
 )
 
 var ErrConflict = errors.New("transaction conflict: read set modified by another transaction")

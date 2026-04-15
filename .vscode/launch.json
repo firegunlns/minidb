@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch DBServer",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}",
+            "env": {},
+            "args": ["--data", "./test.db", "-port", "3307"] // 自定义参数
+        }
+    ]
+}

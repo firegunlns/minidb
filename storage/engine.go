@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"lns.com/bptree/bptree"
+	"lns.com/minidb/bptree"
 )
 
 // StorageEngine manages multiple B+ tree instances for tables and indexes.

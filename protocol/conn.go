@@ -7,9 +7,9 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/server"
 
-	"lns.com/bptree/catalog"
-	"lns.com/bptree/storage"
-	"lns.com/bptree/txn"
+	"lns.com/minidb/catalog"
+	"lns.com/minidb/storage"
+	"lns.com/minidb/txn"
 )
 
 // Server wraps the go-mysql server.

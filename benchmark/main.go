@@ -14,23 +14,23 @@ import (
 	"sync/atomic"
 	"time"
 
-	"lns.com/bptree/bptree"
+	"lns.com/minidb/bptree"
 )
 
 var (
-	flagNumKeys    = flag.Int("num_keys", 10000000, "Number of keys to load")
-	flagKeySize    = flag.Int("key_size", 16, "Key size in bytes")
-	flagValueSize  = flag.Int("value_size", 100, "Value size in bytes")
-	flagOrder      = flag.Int("order", 0, "B+ tree order (0=auto-calculate for 32KB page)")
-	flagCacheSize  = flag.Int("cache", 1024, "LRU cache size (pages)")
-	flagDBPath     = flag.String("db", "", "Database file path (default: temp)")
-	flagReadOps    = flag.Int("read_ops", 1000000, "Number of read operations per test")
-	flagWriteOps   = flag.Int("write_ops", 1000000, "Number of write operations per test")
-	flagSkipLoad   = flag.Bool("skip_load", false, "Skip bulk load, use existing DB")
-	flagTests      = flag.String("tests", "all", "Comma-separated list of tests to run (or 'all')")
-	flagBloom      = flag.Bool("bloom", false, "Enable per-leaf bloom filters")
-	flagBloomBits  = flag.Int("bloom_bits", 10, "Bloom filter bits per key")
-	flagCompress   = flag.Bool("compress", false, "Enable snappy compression")
+	flagNumKeys   = flag.Int("num_keys", 10000000, "Number of keys to load")
+	flagKeySize   = flag.Int("key_size", 16, "Key size in bytes")
+	flagValueSize = flag.Int("value_size", 100, "Value size in bytes")
+	flagOrder     = flag.Int("order", 0, "B+ tree order (0=auto-calculate for 32KB page)")
+	flagCacheSize = flag.Int("cache", 1024, "LRU cache size (pages)")
+	flagDBPath    = flag.String("db", "", "Database file path (default: temp)")
+	flagReadOps   = flag.Int("read_ops", 1000000, "Number of read operations per test")
+	flagWriteOps  = flag.Int("write_ops", 1000000, "Number of write operations per test")
+	flagSkipLoad  = flag.Bool("skip_load", false, "Skip bulk load, use existing DB")
+	flagTests     = flag.String("tests", "all", "Comma-separated list of tests to run (or 'all')")
+	flagBloom     = flag.Bool("bloom", false, "Enable per-leaf bloom filters")
+	flagBloomBits = flag.Int("bloom_bits", 10, "Bloom filter bits per key")
+	flagCompress  = flag.Bool("compress", false, "Enable snappy compression")
 )
 
 const pageSize = 32768

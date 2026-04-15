@@ -8,10 +8,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"lns.com/bptree/catalog"
-	"lns.com/bptree/protocol"
-	"lns.com/bptree/storage"
-	"lns.com/bptree/txn"
+	"lns.com/minidb/catalog"
+	"lns.com/minidb/protocol"
+	"lns.com/minidb/storage"
+	"lns.com/minidb/txn"
 )
 
 func main() {

@@ -5,9 +5,9 @@ import (
 	"log"
 	"strings"
 
-	"lns.com/bptree/catalog"
-	"lns.com/bptree/storage"
-	"lns.com/bptree/txn"
+	"lns.com/minidb/catalog"
+	"lns.com/minidb/storage"
+	"lns.com/minidb/txn"
 )
 
 // Result types.
@@ -27,8 +27,8 @@ type Executor struct {
 	engine *storage.StorageEngine
 	mgr    *txn.Manager
 	cat    *catalog.Catalog
-	dbName string          // current database
-	txn    *txn.Txn        // active transaction (nil = autocommit)
+	dbName string   // current database
+	txn    *txn.Txn // active transaction (nil = autocommit)
 	ts     *txn.TimestampOracle
 }
 
