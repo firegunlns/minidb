@@ -493,3 +493,121 @@ func TestNotExistsSubquery(t *testing.T) {
 		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
 	}
 }
+
+func TestLikeBasic(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(100))`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (1, 'hello world')`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (2, 'goodbye world')`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (3, 'hello there')`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (4, 'foo bar')`)
+
+	rs, err := env.exec.Execute("SELECT * FROM t WHERE name LIKE '%hello%'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+
+	rs, err = env.exec.Execute("SELECT * FROM t WHERE name LIKE 'hello%'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows for prefix match, got %d", len(rows.Rows))
+	}
+
+	rs, err = env.exec.Execute("SELECT * FROM t WHERE name LIKE '%world'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows for suffix match, got %d", len(rows.Rows))
+	}
+
+	rs, err = env.exec.Execute("SELECT * FROM t WHERE name LIKE 'hello world'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row for exact match, got %d", len(rows.Rows))
+	}
+
+	rs, err = env.exec.Execute("SELECT * FROM t WHERE name LIKE '___ bar'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row for _ wildcard, got %d", len(rows.Rows))
+	}
+}
+
+func TestNotLike(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(100))`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (1, 'hello world')`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (2, 'goodbye world')`)
+	env.exec.Execute(`INSERT INTO t (id, name) VALUES (3, 'foo bar')`)
+
+	rs, err := env.exec.Execute("SELECT * FROM t WHERE name NOT LIKE '%hello%'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows for NOT LIKE, got %d", len(rows.Rows))
+	}
+}
+
+func TestAggregateCount(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`INSERT INTO t (id, v) VALUES (1, 10)`)
+	env.exec.Execute(`INSERT INTO t (id, v) VALUES (2, 20)`)
+	env.exec.Execute(`INSERT INTO t (id, v) VALUES (3, 30)`)
+
+	rs, err := env.exec.Execute("SELECT COUNT(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0][0].(int64) != 3 {
+		t.Fatalf("expected count=3, got %v", rows.Rows[0][0])
+	}
+
+	rs, err = env.exec.Execute("SELECT COUNT(1) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if rows.Rows[0][0].(int64) != 3 {
+		t.Fatalf("expected count=3, got %v", rows.Rows[0][0])
+	}
+
+	rs, err = env.exec.Execute("SELECT COUNT(*) FROM t WHERE id > 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if rows.Rows[0][0].(int64) != 2 {
+		t.Fatalf("expected count=2, got %v", rows.Rows[0][0])
+	}
+}

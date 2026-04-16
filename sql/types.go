@@ -31,13 +31,14 @@ type (
 		Values  [][]any
 	}
 	SelectStmt struct {
-		TableRef  TableRef
-		Columns   []string
-		SelectAll bool
-		Where     Expr
-		OrderBy   []OrderByClause
-		Limit     *int
-		ForUpdate bool
+		TableRef    TableRef
+		Columns     []string
+		SelectExprs []Expr
+		SelectAll   bool
+		Where       Expr
+		OrderBy     []OrderByClause
+		Limit       *int
+		ForUpdate   bool
 	}
 
 	TableRef       interface{ tableRefNode() }
@@ -137,20 +138,32 @@ type (
 		Query *SelectStmt
 		Not   bool
 	}
+	LikeExpr struct {
+		Expr    Expr
+		Pattern Expr
+		Not     bool
+	}
+	AggregateFuncExpr struct {
+		Name     string
+		Args     []Expr
+		Distinct bool
+	}
 )
 
-func (LiteralExpr) exprNode()   {}
-func (ColumnRefExpr) exprNode() {}
-func (BinaryExpr) exprNode()    {}
-func (UnaryExpr) exprNode()     {}
-func (FuncCallExpr) exprNode()  {}
-func (ParamExpr) exprNode()     {}
-func (NullExpr) exprNode()      {}
-func (BetweenExpr) exprNode()   {}
-func (InExpr) exprNode()        {}
-func (IsNullExpr) exprNode()    {}
-func (SubqueryExpr) exprNode()  {}
-func (ExistsExpr) exprNode()    {}
+func (LiteralExpr) exprNode()       {}
+func (ColumnRefExpr) exprNode()     {}
+func (BinaryExpr) exprNode()        {}
+func (UnaryExpr) exprNode()         {}
+func (FuncCallExpr) exprNode()      {}
+func (ParamExpr) exprNode()         {}
+func (NullExpr) exprNode()          {}
+func (BetweenExpr) exprNode()       {}
+func (InExpr) exprNode()            {}
+func (IsNullExpr) exprNode()        {}
+func (SubqueryExpr) exprNode()      {}
+func (ExistsExpr) exprNode()        {}
+func (LikeExpr) exprNode()          {}
+func (AggregateFuncExpr) exprNode() {}
 
 type Stmt any
 
@@ -324,8 +337,14 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 		for _, field := range n.Fields.Fields {
 			if field.WildCard != nil {
 				result.SelectAll = true
+			} else if colName := getColumnName(field.Expr); colName != "" {
+				result.Columns = append(result.Columns, colName)
 			} else {
-				result.Columns = append(result.Columns, getColumnName(field.Expr))
+				expr, err := convertExpr(field.Expr)
+				if err != nil {
+					return nil, err
+				}
+				result.SelectExprs = append(result.SelectExprs, expr)
 			}
 		}
 	}
@@ -366,8 +385,14 @@ func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
 		for _, field := range n.Fields.Fields {
 			if field.WildCard != nil {
 				result.SelectAll = true
+			} else if colName := getColumnName(field.Expr); colName != "" {
+				result.Columns = append(result.Columns, colName)
 			} else {
-				result.Columns = append(result.Columns, getColumnName(field.Expr))
+				expr, err := convertExpr(field.Expr)
+				if err != nil {
+					return nil, err
+				}
+				result.SelectExprs = append(result.SelectExprs, expr)
 			}
 		}
 	}
@@ -501,6 +526,16 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 			args = append(args, e)
 		}
 		return &FuncCallExpr{Name: n.FnName.O, Args: args}, nil
+	case *ast.AggregateFuncExpr:
+		var args []Expr
+		for _, a := range n.Args {
+			e, err := convertExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, e)
+		}
+		return &AggregateFuncExpr{Name: n.F, Args: args, Distinct: n.Distinct}, nil
 	case *ast.SubqueryExpr:
 		subquery, err := convertSelectStmt(n.Query.(*ast.SelectStmt))
 		if err != nil {
@@ -516,6 +551,16 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 			return &ExistsExpr{Query: subquery, Not: n.Not}, nil
 		}
 		return nil, fmt.Errorf("EXISTS: unsupported subquery type: %T", n.Sel)
+	case *ast.PatternLikeOrIlikeExpr:
+		expr, err := convertExpr(n.Expr)
+		if err != nil {
+			return nil, err
+		}
+		pattern, err := convertExpr(n.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeExpr{Expr: expr, Pattern: pattern, Not: n.Not}, nil
 	default:
 		return nil, fmt.Errorf("unsupported expr type: %T", node)
 	}
@@ -559,6 +604,8 @@ func opToString(op opcode.Op) string {
 		return "%"
 	case opcode.In:
 		return "IN"
+	case opcode.Like:
+		return "LIKE"
 	default:
 		return fmt.Sprintf("%v", op)
 	}

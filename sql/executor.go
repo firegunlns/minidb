@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"lns.com/minidb/catalog"
@@ -407,6 +408,10 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 
 	treeKey := td.DataFile()
 
+	if len(s.SelectExprs) > 0 && len(s.Columns) == 0 && !s.SelectAll {
+		return e.execSelectAggregate(t, s, ref, td)
+	}
+
 	var colIndices []int
 	var colNames []string
 	if s.SelectAll {
@@ -462,6 +467,138 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 	}
 
 	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: tableName}, nil
+}
+
+func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, td *catalog.TableDef) (any, error) {
+	treeKey := td.DataFile()
+
+	var start, end []byte
+	if s.Where != nil {
+		start, end = e.extractPKRange(td, s.Where)
+	}
+	if start == nil {
+		start = []byte{0x00}
+		end = []byte{0xFF}
+	}
+
+	type aggState struct {
+		count   int64
+		sum     float64
+		minVal  any
+		maxVal  any
+		hasData bool
+	}
+
+	agg := &aggState{}
+	pkCols := td.PrimaryKeyColumns()
+
+	t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, td.Columns)
+		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+			return true
+		}
+		agg.count++
+		agg.hasData = true
+		for _, expr := range s.SelectExprs {
+			switch f := expr.(type) {
+			case *FuncCallExpr, *AggregateFuncExpr:
+				var name string
+				var args []Expr
+				if fc, ok := f.(*FuncCallExpr); ok {
+					name = fc.Name
+					args = fc.Args
+				} else if af, ok := f.(*AggregateFuncExpr); ok {
+					name = af.Name
+					args = af.Args
+				}
+				switch strings.ToUpper(name) {
+				case "COUNT":
+					agg.count = agg.count
+				case "SUM":
+					for _, arg := range args {
+						v := e.evalExpr(td, arg, vals)
+						if v != nil {
+							switch n := v.(type) {
+							case int64:
+								agg.sum += float64(n)
+							case int32:
+								agg.sum += float64(n)
+							case float64:
+								agg.sum += n
+							}
+						}
+					}
+				case "AVG":
+					for _, arg := range args {
+						v := e.evalExpr(td, arg, vals)
+						if v != nil {
+							switch n := v.(type) {
+							case int64:
+								agg.sum += float64(n)
+							case int32:
+								agg.sum += float64(n)
+							case float64:
+								agg.sum += n
+							}
+						}
+					}
+				case "MIN":
+					for _, arg := range args {
+						v := e.evalExpr(td, arg, vals)
+						if v != nil {
+							if agg.minVal == nil || compareValues(v, agg.minVal) < 0 {
+								agg.minVal = v
+							}
+						}
+					}
+				case "MAX":
+					for _, arg := range args {
+						v := e.evalExpr(td, arg, vals)
+						if v != nil {
+							if agg.maxVal == nil || compareValues(v, agg.maxVal) > 0 {
+								agg.maxVal = v
+							}
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	colNames := make([]string, len(s.SelectExprs))
+	row := make([]any, len(s.SelectExprs))
+	for i, expr := range s.SelectExprs {
+		var name string
+		if f, ok := expr.(*FuncCallExpr); ok {
+			name = f.Name
+		} else if f, ok := expr.(*AggregateFuncExpr); ok {
+			name = f.Name
+		}
+		switch strings.ToUpper(name) {
+		case "COUNT":
+			row[i] = agg.count
+			colNames[i] = "count(1)"
+		case "SUM":
+			row[i] = agg.sum
+			colNames[i] = "sum"
+		case "AVG":
+			if agg.count > 0 {
+				row[i] = agg.sum / float64(agg.count)
+			} else {
+				row[i] = nil
+			}
+			colNames[i] = "avg"
+		case "MIN":
+			row[i] = agg.minVal
+			colNames[i] = "min"
+		case "MAX":
+			row[i] = agg.maxVal
+			colNames[i] = "max"
+		}
+	}
+
+	return &SelectResult{Columns: colNames, Rows: [][]any{row}}, nil
 }
 
 func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
@@ -987,6 +1124,8 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 		return e.evalInExpr(td, ex, vals)
 	case *ExistsExpr:
 		return e.evalExistsExpr(td, ex, vals)
+	case *LikeExpr:
+		return e.evalLikeExpr(td, ex, vals)
 	default:
 		return nil
 	}
@@ -1212,6 +1351,8 @@ func (e *Executor) evalExprWithOuter(td *catalog.TableDef, vals []any, expr Expr
 		return e.evalInExprWithOuter(td, vals, ex, outerTd, outerVals)
 	case *ExistsExpr:
 		return e.evalExistsExprWithOuter(td, vals, ex, outerTd, outerVals)
+	case *LikeExpr:
+		return e.evalLikeExprWithOuter(td, vals, ex, outerTd, outerVals)
 	default:
 		return nil
 	}
@@ -1253,6 +1394,16 @@ func (e *Executor) evalExistsExprWithOuter(td *catalog.TableDef, vals []any, exp
 	return exists
 }
 
+func (e *Executor) evalLikeExprWithOuter(td *catalog.TableDef, vals []any, expr *LikeExpr, outerTd *catalog.TableDef, outerVals []any) bool {
+	val := e.evalExprWithOuter(td, vals, expr.Expr, outerTd, outerVals)
+	pattern := e.evalExprWithOuter(td, vals, expr.Pattern, outerTd, outerVals)
+	result := e.evalLike(val, pattern)
+	if expr.Not {
+		return !result
+	}
+	return result
+}
+
 func (e *Executor) evalBinaryOp(op string, left, right any) any {
 	switch op {
 	case "=":
@@ -1273,6 +1424,8 @@ func (e *Executor) evalBinaryOp(op string, left, right any) any {
 		return toBool(left) || toBool(right)
 	case "IN":
 		return e.evalIn(left, right)
+	case "LIKE":
+		return e.evalLike(left, right)
 	case "+":
 		return arithOp(left, right, func(a, b int64) int64 { return a + b }, func(a, b float64) float64 { return a + b })
 	case "-":
@@ -1297,6 +1450,60 @@ func (e *Executor) evalIn(left, right any) bool {
 		return false
 	}
 	return compareValues(left, right) == 0
+}
+
+func (e *Executor) evalLike(val, pattern any) bool {
+	if val == nil || pattern == nil {
+		return false
+	}
+	s, ok := val.(string)
+	if !ok {
+		s = fmt.Sprintf("%v", val)
+	}
+	p, ok := pattern.(string)
+	if !ok {
+		p = fmt.Sprintf("%v", pattern)
+	}
+	return matchLike(s, p)
+}
+
+func (e *Executor) evalLikeExpr(td *catalog.TableDef, expr *LikeExpr, vals []any) bool {
+	val := e.evalExpr(td, expr.Expr, vals)
+	pattern := e.evalExpr(td, expr.Pattern, vals)
+	result := e.evalLike(val, pattern)
+	if expr.Not {
+		return !result
+	}
+	return result
+}
+
+func matchLike(s, pattern string) bool {
+	regex := likeToRegex(pattern)
+	matched, _ := regexp.MatchString("^"+regex+"$", s)
+	return matched
+}
+
+func likeToRegex(pattern string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(pattern) {
+		c := pattern[i]
+		if c == '\\' && i+1 < len(pattern) {
+			result.WriteString(regexp.QuoteMeta(string(pattern[i+1])))
+			i += 2
+			continue
+		}
+		switch c {
+		case '%':
+			result.WriteString(".*")
+		case '_':
+			result.WriteString(".")
+		default:
+			result.WriteString(regexp.QuoteMeta(string(c)))
+		}
+		i++
+	}
+	return result.String()
 }
 
 func (e *Executor) evalUnaryOp(op string, operand any) any {
