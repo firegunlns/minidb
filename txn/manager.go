@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"lns.com/minidb/storage"
+	"lns.com/minidb/wal"
 )
 
 var ErrConflict = errors.New("transaction conflict: read set modified by another transaction")
@@ -22,10 +23,11 @@ type Txn struct {
 type Manager struct {
 	engine *storage.StorageEngine
 	ts     *TimestampOracle
+	wal    *wal.WAL
 }
 
-func NewManager(engine *storage.StorageEngine, ts *TimestampOracle) *Manager {
-	return &Manager{engine: engine, ts: ts}
+func NewManager(engine *storage.StorageEngine, ts *TimestampOracle, w *wal.WAL) *Manager {
+	return &Manager{engine: engine, ts: ts, wal: w}
 }
 
 // Begin starts a new transaction with a snapshot timestamp.
@@ -163,7 +165,7 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 	}
 }
 
-// Commit validates the read set and applies writes.
+// Commit validates the read set, writes to WAL, and applies writes.
 func (t *Txn) Commit() error {
 	if t.finalized {
 		return errors.New("transaction is finalized")
@@ -174,9 +176,8 @@ func (t *Txn) Commit() error {
 	readSet := t.ws.ReadSet()
 	for key, origTS := range readSet {
 		pk := t.ws.readPKs[key]
-		// Extract treeKey from the wsKey.
 		treeKey := wsKeyToTree(key)
-		_, curTS, err := t.mgr.engine.GetRow(treeKey, pk, ^uint64(0)) // read at max ts
+		_, curTS, err := t.mgr.engine.GetRow(treeKey, pk, ^uint64(0))
 		if err != nil {
 			return err
 		}
@@ -188,27 +189,42 @@ func (t *Txn) Commit() error {
 	// Allocate commit timestamp.
 	t.commitTS = t.mgr.ts.Next()
 
-	// Apply writes to the engine.
+	// Write all operations to WAL, then apply to engine.
 	writeSet := t.ws.WriteSet()
 	for key, rowData := range writeSet {
 		treeKey, pk := wsKeyToParts(key)
+		var rec wal.Record
 		if rowData == nil {
-			// Delete.
+			rec = wal.DeleteRecord(treeKey, pk, nil)
+		} else if t.ws.IsInserted(treeKey, pk) {
+			rec = wal.InsertRecord(treeKey, pk, rowData)
+		} else {
+			rec = wal.UpdateRecord(treeKey, pk, nil, rowData)
+		}
+		rec.TxnTS = t.startTS
+		rec.CommitTS = t.commitTS
+		t.mgr.wal.Append(rec)
+
+		// Apply to engine.
+		if rowData == nil {
 			if err := t.mgr.engine.DeleteRow(treeKey, pk, t.commitTS); err != nil {
 				return err
 			}
 		} else if t.ws.IsInserted(treeKey, pk) {
-			// Insert.
 			if err := t.mgr.engine.InsertRow(treeKey, pk, t.commitTS, rowData); err != nil {
 				return err
 			}
 		} else {
-			// Update.
 			if err := t.mgr.engine.UpdateRow(treeKey, pk, t.commitTS, rowData); err != nil {
 				return err
 			}
 		}
 	}
+
+	// Write commit record to WAL.
+	commitRec := wal.CommitRecord(t.startTS)
+	commitRec.CommitTS = t.commitTS
+	t.mgr.wal.Append(commitRec)
 
 	return nil
 }

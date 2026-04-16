@@ -4,9 +4,10 @@ import (
 	"testing"
 
 	"lns.com/minidb/storage"
+	"lns.com/minidb/wal"
 )
 
-func setupEngine(t *testing.T) (*storage.StorageEngine, *TimestampOracle, func()) {
+func setupEngine(t *testing.T) (*storage.StorageEngine, *TimestampOracle, *wal.WAL, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	e, err := storage.OpenEngine(dir, 64, 256)
@@ -14,18 +15,22 @@ func setupEngine(t *testing.T) (*storage.StorageEngine, *TimestampOracle, func()
 		t.Fatal(err)
 	}
 	ts := NewTimestampOracle()
+	w, err := wal.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	treeKey := "testdb__t.db"
 	if err := e.OpenTree(treeKey); err != nil {
 		t.Fatal(err)
 	}
-	return e, ts, func() { e.Close() }
+	return e, ts, w, func() { w.Close(); e.Close() }
 }
 
 func TestTxnBeginCommit(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	txn := mgr.Begin()
 
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
@@ -67,10 +72,10 @@ func TestTxnBeginCommit(t *testing.T) {
 }
 
 func TestTxnRollback(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	txn := mgr.Begin()
 
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
@@ -91,10 +96,10 @@ func TestTxnRollback(t *testing.T) {
 }
 
 func TestTxnReadYourWrites(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -121,10 +126,10 @@ func TestTxnReadYourWrites(t *testing.T) {
 }
 
 func TestTxnDelete(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -155,10 +160,10 @@ func TestTxnDelete(t *testing.T) {
 }
 
 func TestTxnSnapshotIsolation(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -189,10 +194,10 @@ func TestTxnSnapshotIsolation(t *testing.T) {
 }
 
 func TestTxnConflictDetection(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -219,10 +224,10 @@ func TestTxnConflictDetection(t *testing.T) {
 }
 
 func TestTxnScan(t *testing.T) {
-	e, ts, cleanup := setupEngine(t)
+	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts)
+	mgr := NewManager(e, ts, w)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 

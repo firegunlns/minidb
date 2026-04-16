@@ -12,22 +12,69 @@ import (
 	"lns.com/minidb/protocol"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
+	"lns.com/minidb/wal"
 )
 
+var (
+	port    = flag.Int("port", 3307, "listen port")
+	dataDir = flag.String("data", "./test/testdb", "data directory")
+)
+
+func printUsage() {
+	fmt.Println("minidb - A lightweight relational database engine")
+	fmt.Println()
+	fmt.Println("Usage: minidb [options]")
+	fmt.Println()
+	fmt.Println("Options:")
+	flag.VisitAll(func(f *flag.Flag) {
+		fmt.Printf("  --%s", f.Name)
+		if len(f.DefValue) > 0 {
+			fmt.Printf(" %s", f.DefValue)
+		}
+		fmt.Printf("\n      %s\n", f.Usage)
+	})
+	fmt.Println()
+	fmt.Println("Example:")
+	fmt.Println("  minidb --port 3307 --data /var/db/minidb")
+}
+
 func main() {
-	port := flag.Int("port", 3307, "listen port")
-	dataDir := flag.String("data", "./test/testdb", "data directory")
+	flag.Usage = printUsage
 	flag.Parse()
+
+	if flag.NFlag() == 0 && len(flag.Args()) == 0 {
+		flag.Usage()
+		return
+	}
+
+	if flag.Parsed() {
+		if flag.Lookup("h") != nil || flag.Lookup("help") != nil {
+			flag.Usage()
+			return
+		}
+	}
 
 	// Create data directory.
 	if err := os.MkdirAll(*dataDir, 0755); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
 
+	// Open WAL.
+	w, err := wal.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("open WAL: %v", err)
+	}
+	defer w.Close()
+
 	// Open storage engine.
 	engine, err := storage.OpenEngine(*dataDir, 64, 256)
 	if err != nil {
 		log.Fatalf("open engine: %v", err)
+	}
+
+	// Recover from WAL if needed.
+	if err := engine.RecoverFromWAL(w); err != nil {
+		log.Fatalf("recover from WAL: %v", err)
 	}
 
 	// Open catalog.
@@ -38,7 +85,7 @@ func main() {
 
 	// Create transaction manager.
 	ts := txn.OpenTimestampOracle(*dataDir)
-	mgr := txn.NewManager(engine, ts)
+	mgr := txn.NewManager(engine, ts, w)
 
 	// Start server.
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)

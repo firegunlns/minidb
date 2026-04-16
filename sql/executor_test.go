@@ -6,6 +6,7 @@ import (
 	"lns.com/minidb/catalog"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
+	"lns.com/minidb/wal"
 )
 
 type testEnv struct {
@@ -14,6 +15,7 @@ type testEnv struct {
 	mgr    *txn.Manager
 	cat    *catalog.Catalog
 	exec   *Executor
+	wal    *wal.WAL
 	dir    string
 }
 
@@ -25,16 +27,18 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	ts := txn.NewTimestampOracle()
-	mgr := txn.NewManager(e, ts)
+	w, _ := wal.Open(dir)
+	mgr := txn.NewManager(e, ts, w)
 	cat, err := catalog.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(e, mgr, cat, "testdb")
-	return &testEnv{engine: e, ts: ts, mgr: mgr, cat: cat, exec: exec, dir: dir}
+	return &testEnv{engine: e, ts: ts, mgr: mgr, cat: cat, exec: exec, wal: w, dir: dir}
 }
 
 func (env *testEnv) close() {
+	env.wal.Close()
 	env.cat.Close()
 	env.engine.Close()
 }

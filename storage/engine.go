@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"lns.com/minidb/bptree"
+	"lns.com/minidb/wal"
 )
 
 // StorageEngine manages multiple B+ tree instances for tables and indexes.
@@ -28,6 +29,56 @@ func OpenEngine(dataDir string, order, cacheSize int) (*StorageEngine, error) {
 		cacheSize: cacheSize,
 		trees:     make(map[string]*bptree.PersistentBPTree),
 	}, nil
+}
+
+// RecoverFromWAL replays committed transactions from the WAL.
+func (e *StorageEngine) RecoverFromWAL(w *wal.WAL) error {
+	records, err := w.ReadAll()
+	if err != nil {
+		return fmt.Errorf("read WAL: %w", err)
+	}
+
+	committed := make(map[uint64]bool)
+	commitTSMap := make(map[uint64]uint64)
+	for _, r := range records {
+		if r.Type == wal.RecCommit {
+			committed[r.TxnTS] = true
+			commitTSMap[r.TxnTS] = r.CommitTS
+		} else if r.Type == wal.RecAbort {
+			delete(committed, r.TxnTS)
+		}
+	}
+
+	for _, r := range records {
+		if r.Type == wal.RecCommit || r.Type == wal.RecAbort || r.Type == wal.RecCheckpoint {
+			continue
+		}
+		if !committed[r.TxnTS] {
+			continue
+		}
+
+		if err := e.OpenTree(r.TreeKey); err != nil {
+			return err
+		}
+
+		commitTS := commitTSMap[r.TxnTS]
+		switch r.Type {
+		case wal.RecInsert:
+			if err := e.InsertRow(r.TreeKey, r.PK, commitTS, r.RowData); err != nil {
+				return err
+			}
+		case wal.RecUpdate:
+			if err := e.UpdateRow(r.TreeKey, r.PK, commitTS, r.RowData); err != nil {
+				return err
+			}
+		case wal.RecDelete:
+			if err := e.DeleteRow(r.TreeKey, r.PK, commitTS); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // Close closes all open B+ trees.

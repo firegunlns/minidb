@@ -11,6 +11,7 @@ import (
 	"lns.com/minidb/catalog"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
+	"lns.com/minidb/wal"
 )
 
 func startTestServer(t *testing.T) (*Server, string) {
@@ -22,7 +23,8 @@ func startTestServer(t *testing.T) (*Server, string) {
 		t.Fatal(err)
 	}
 	ts := txn.NewTimestampOracle()
-	mgr := txn.NewManager(engine, ts)
+	w, _ := wal.Open(dir)
+	mgr := txn.NewManager(engine, ts, w)
 	cat, err := catalog.Open(dir)
 	if err != nil {
 		t.Fatal(err)

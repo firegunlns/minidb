@@ -6,6 +6,7 @@ import (
 	"lns.com/minidb/catalog"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
+	"lns.com/minidb/wal"
 )
 
 func newTPCCTestEnv(t *testing.T) (*Executor, func()) {
@@ -13,11 +14,13 @@ func newTPCCTestEnv(t *testing.T) (*Executor, func()) {
 	dir := t.TempDir()
 	e, _ := storage.OpenEngine(dir, 64, 256)
 	ts := txn.NewTimestampOracle()
-	mgr := txn.NewManager(e, ts)
+	w, _ := wal.Open(dir)
+	mgr := txn.NewManager(e, ts, w)
 	cat, _ := catalog.Open(dir)
 	exec := NewExecutor(e, mgr, cat, "")
 
 	return exec, func() {
+		w.Close()
 		cat.Close()
 		e.Close()
 	}
