@@ -490,9 +490,8 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 	}
 
 	agg := &aggState{}
-	pkCols := td.PrimaryKeyColumns()
 
-	t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
+	e.engine.ScanAll(treeKey, start, end, func(pk, rowData []byte) bool {
 		vals, _ := storage.DecodeRow(rowData, td.Columns)
 		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
 			return true

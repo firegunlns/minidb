@@ -43,12 +43,7 @@ func needsSpecialHandling(query string) bool {
 	}
 
 	// Subqueries.
-	if strings.Contains(upper, "SELECT") && strings.Count(upper, "SELECT") > 1 {
-		return true
-	}
-
-	// COUNT(*).
-	if strings.Contains(upper, "COUNT(") {
+	if strings.Count(upper, "SELECT") > 1 {
 		return true
 	}
 
@@ -58,17 +53,6 @@ func needsSpecialHandling(query string) bool {
 // handleSpecialQuery handles queries that can't be processed by the SQL engine.
 func (h *SvrHandler) handleSpecialQuery(query string, args []any) (*mysql.Result, error) {
 	upper := strings.ToUpper(strings.TrimSpace(query))
-
-	// COUNT(*) queries — return 0, with proper alias.
-	if strings.Contains(upper, "COUNT(") {
-		colName := "count(*)"
-		asRe := regexp.MustCompile(`(?i)\bAS\s+(\w+)`)
-		if m := asRe.FindStringSubmatch(query); len(m) > 1 {
-			colName = m[1]
-		}
-		rs, _ := mysql.BuildSimpleTextResultset([]string{colName}, [][]any{{int64(0)}})
-		return mysql.NewResult(rs), nil
-	}
 
 	// JOIN queries.
 	if strings.Contains(upper, "JOIN") {

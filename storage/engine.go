@@ -291,3 +291,38 @@ func (e *StorageEngine) ScanRaw(treeKey string, start, end []byte, fn func(key, 
 		}
 	}
 }
+
+// ScanAll iterates over all rows in [start, end) range, returning the latest version of each row
+// regardless of MVCC visibility. This is used for aggregate queries that need to count all data.
+func (e *StorageEngine) ScanAll(treeKey string, start, end []byte, fn func(pk, rowData []byte) bool) {
+	tree := e.getTree(treeKey)
+	if tree == nil {
+		return
+	}
+
+	scanStart := make([]byte, len(start)+8)
+	copy(scanStart, start)
+	scanEnd := make([]byte, len(end)+8)
+	copy(scanEnd, end)
+	for i := len(end); i < len(scanEnd); i++ {
+		scanEnd[i] = 0xFF
+	}
+
+	kvs := tree.RangeScan(scanStart, scanEnd)
+
+	seen := make(map[string]bool)
+	for _, kv := range kvs {
+		pkPrefix := string(KeyPrefix(kv.Key))
+		if seen[pkPrefix] {
+			continue
+		}
+		_, _, _, rowData, err := DecodeMVCCValue(kv.Value)
+		if err != nil {
+			continue
+		}
+		seen[pkPrefix] = true
+		if !fn([]byte(pkPrefix), rowData) {
+			break
+		}
+	}
+}
