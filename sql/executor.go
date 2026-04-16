@@ -13,8 +13,9 @@ import (
 // Result types.
 type (
 	SelectResult struct {
-		Columns []string
-		Rows    [][]any
+		Columns    []string
+		Rows       [][]any
+		TableAlias string
 	}
 	OKResult struct {
 		AffectedRows int
@@ -153,7 +154,6 @@ func (e *Executor) execCreateTable(s *CreateTableStmt) (any, error) {
 			pkCols = append(pkCols, i)
 		}
 	}
-	// Default to first column as PK if none specified.
 	if len(pkCols) == 0 {
 		pkCols = []int{0}
 	}
@@ -165,7 +165,6 @@ func (e *Executor) execCreateTable(s *CreateTableStmt) (any, error) {
 		PKCols:   pkCols,
 	}
 
-	// Create the data tree.
 	treeKey := td.DataFile()
 	if err := e.engine.OpenTree(treeKey); err != nil {
 		return nil, err
@@ -384,15 +383,32 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 }
 
 func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
-	td, err := e.cat.GetTable(e.dbName, s.Table)
+	if s.TableRef == nil {
+		return nil, fmt.Errorf("no table specified")
+	}
+	switch ref := s.TableRef.(type) {
+	case *SimpleTableRef:
+		return e.execSelectSimple(t, s, ref)
+	case *JoinTableRef:
+		return e.execSelectJoin(t, s, ref)
+	default:
+		return nil, fmt.Errorf("unsupported table reference")
+	}
+}
+
+func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef) (any, error) {
+	tableName := ref.Table
+	if ref.Alias != "" {
+		tableName = ref.Alias
+	}
+	td, err := e.cat.GetTable(e.dbName, ref.Table)
 	if err != nil {
 		return nil, err
 	}
 
 	treeKey := td.DataFile()
-	log.Printf("execSelect db=%s table=%s treeKey=%s dbName=%q", e.dbName, s.Table, treeKey, e.dbName)
+	log.Printf("execSelect db=%s table=%s treeKey=%s", e.dbName, ref.Table, treeKey)
 
-	// Determine output columns.
 	var colIndices []int
 	var colNames []string
 	if s.SelectAll {
@@ -404,8 +420,9 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 		}
 	} else {
 		colIndices = make([]int, len(s.Columns))
-		colNames = s.Columns
+		colNames = make([]string, len(s.Columns))
 		for i, name := range s.Columns {
+			colNames[i] = name
 			idx := td.ColumnIndex(name)
 			if idx < 0 {
 				return nil, fmt.Errorf("unknown column %q", name)
@@ -414,13 +431,11 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 		}
 	}
 
-	// Determine scan range.
 	var start, end []byte
 	if s.Where != nil {
 		start, end = e.extractPKRange(td, s.Where)
 	}
 	if start == nil {
-		// Full table scan.
 		start = []byte{0x00}
 		end = []byte{0xFF}
 	}
@@ -430,12 +445,9 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 
 	t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
 		vals, _ := storage.DecodeRow(rowData, td.Columns)
-
-		// Apply WHERE filter (for conditions beyond PK).
 		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
 			return true
 		}
-
 		row := make([]any, len(colIndices))
 		for i, ci := range colIndices {
 			row[i] = vals[ci]
@@ -444,17 +456,196 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 		return true
 	})
 
-	// Apply ORDER BY.
 	if len(s.OrderBy) > 0 {
 		e.sortRows(rows, colNames, s.OrderBy)
 	}
-
-	// Apply LIMIT.
 	if s.Limit != nil && *s.Limit < len(rows) {
 		rows = rows[:*s.Limit]
 	}
 
-	return &SelectResult{Columns: colNames, Rows: rows}, nil
+	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: tableName}, nil
+}
+
+func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
+	leftRows, err := e.collectRows(t, ref.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightRows, err := e.collectRows(t, ref.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	leftTd, err := e.getTableDef(ref.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightTd, err := e.getTableDef(ref.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows [][]any
+	leftAlias := e.getTableAlias(ref.Left)
+	rightAlias := e.getTableAlias(ref.Right)
+
+	isLeftJoin := ref.Type == JoinTypeLeft
+	rightNullRow := make([]any, len(rightTd.Columns))
+
+	for _, leftRow := range leftRows {
+		matched := false
+		for _, rightRow := range rightRows {
+			if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
+				matched = true
+				joined := append(append([]any{}, leftRow...), rightRow...)
+				if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+					rows = append(rows, joined)
+				}
+			}
+		}
+		if !matched {
+			if isLeftJoin {
+				joined := append(append([]any{}, leftRow...), rightNullRow...)
+				if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+					rows = append(rows, joined)
+				}
+			}
+		}
+	}
+
+	colNames := make([]string, 0, len(leftTd.Columns)+len(rightTd.Columns))
+	for _, col := range leftTd.Columns {
+		colNames = append(colNames, leftAlias+"."+col.Name)
+	}
+	for _, col := range rightTd.Columns {
+		colNames = append(colNames, rightAlias+"."+col.Name)
+	}
+
+	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: leftAlias + " join " + rightAlias}, nil
+}
+
+func (e *Executor) collectRows(t *txn.Txn, ref TableRef) ([][]any, error) {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		td, err := e.cat.GetTable(e.dbName, r.Table)
+		if err != nil {
+			return nil, err
+		}
+		treeKey := td.DataFile()
+		var rows [][]any
+		pkCols := td.PrimaryKeyColumns()
+		t.Scan(treeKey, pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
+			vals, _ := storage.DecodeRow(rowData, td.Columns)
+			rows = append(rows, vals)
+			return true
+		})
+		return rows, nil
+	case *JoinTableRef:
+		var allRows [][]any
+		leftRows, err := e.collectRows(t, r.Left)
+		if err != nil {
+			return nil, err
+		}
+		rightRows, err := e.collectRows(t, r.Right)
+		if err != nil {
+			return nil, err
+		}
+		leftTd, _ := e.getTableDef(r.Left)
+		rightTd, _ := e.getTableDef(r.Right)
+		for _, lr := range leftRows {
+			for _, rr := range rightRows {
+				if e.evalJoinCondition(leftTd, rightTd, lr, rr, r.On) {
+					joined := append(append([]any{}, lr...), rr...)
+					allRows = append(allRows, joined)
+				}
+			}
+		}
+		return allRows, nil
+	}
+	return nil, fmt.Errorf("unsupported table ref")
+}
+
+func (e *Executor) getTableDef(ref TableRef) (*catalog.TableDef, error) {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		return e.cat.GetTable(e.dbName, r.Table)
+	case *JoinTableRef:
+		return e.getTableDef(r.Left)
+	}
+	return nil, fmt.Errorf("unsupported table ref")
+}
+
+func (e *Executor) getTableAlias(ref TableRef) string {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		if r.Alias != "" {
+			return r.Alias
+		}
+		return r.Table
+	case *JoinTableRef:
+		return e.getTableAlias(r.Left)
+	}
+	return ""
+}
+
+func (e *Executor) evalJoinCondition(leftTd, rightTd *catalog.TableDef, leftRow, rightRow []any, on Expr) bool {
+	if on == nil {
+		return true
+	}
+	leftVals := leftRow
+	rightVals := rightRow
+	return e.evalBinaryExprForJoin(on, leftTd, leftVals, rightTd, rightVals)
+}
+
+func (e *Executor) evalBinaryExprForJoin(expr Expr, leftTd *catalog.TableDef, leftVals []any, rightTd *catalog.TableDef, rightVals []any) bool {
+	if bin, ok := expr.(*BinaryExpr); ok {
+		if bin.Op == "AND" {
+			return e.evalBinaryExprForJoin(bin.Left, leftTd, leftVals, rightTd, rightVals) &&
+				e.evalBinaryExprForJoin(bin.Right, leftTd, leftVals, rightTd, rightVals)
+		}
+		lv := e.evalColumnRef(bin.Left, leftTd, leftVals, rightTd, rightVals)
+		rv := e.evalColumnRef(bin.Right, leftTd, leftVals, rightTd, rightVals)
+		cmp := compareValues(lv, rv)
+		switch bin.Op {
+		case "=":
+			return cmp == 0
+		case "!=":
+			return cmp != 0
+		case "<":
+			return cmp < 0
+		case "<=":
+			return cmp <= 0
+		case ">":
+			return cmp > 0
+		case ">=":
+			return cmp >= 0
+		}
+	}
+	return true
+}
+
+func (e *Executor) evalColumnRef(expr Expr, leftTd *catalog.TableDef, leftVals []any, rightTd *catalog.TableDef, rightVals []any) any {
+	switch ex := expr.(type) {
+	case *ColumnRefExpr:
+		idx := leftTd.ColumnIndex(ex.Name)
+		if idx >= 0 {
+			return leftVals[idx]
+		}
+		idx = rightTd.ColumnIndex(ex.Name)
+		if idx >= 0 {
+			return rightVals[idx]
+		}
+	case *LiteralExpr:
+		return ex.Value
+	}
+	return nil
+}
+
+func (e *Executor) evalJoinWhere(leftTd, rightTd *catalog.TableDef, joinedRow []any, where Expr) bool {
+	leftLen := len(leftTd.Columns)
+	leftVals := joinedRow[:leftLen]
+	rightVals := joinedRow[leftLen:]
+	return e.evalBinaryExprForJoin(where, leftTd, leftVals, rightTd, rightVals)
 }
 
 func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (any, error) {
@@ -599,10 +790,18 @@ func (e *Executor) execExplain(s *ExplainStmt) (any, error) {
 }
 
 func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
+	tableName := e.getTableAlias(s.TableRef)
+	if tableName == "" {
+		tableName = "unknown"
+	}
+	selectType := "SIMPLE"
+	if _, ok := s.TableRef.(*JoinTableRef); ok {
+		selectType = "JOIN"
+	}
 	r.Rows = append(r.Rows, []any{
 		1,
-		"SIMPLE",
-		s.Table,
+		selectType,
+		tableName,
 		e.getAccessType(s),
 		nil,
 		e.getUsedKey(s),

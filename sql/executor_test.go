@@ -311,3 +311,73 @@ func TestExplainUpdate(t *testing.T) {
 		t.Fatalf("expected type range, got %v", rows.Rows[0][3])
 	}
 }
+
+func TestJoinSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(100))`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, value INT)`)
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (1, 'Alice')")
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (2, 'Bob')")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (1, 1, 100)")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (2, 1, 200)")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (3, 2, 300)")
+
+	rs, err := env.exec.Execute("SELECT * FROM a JOIN b ON a.id = b.a_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows.Rows))
+	}
+	if len(rows.Columns) != 5 {
+		t.Fatalf("expected 5 columns, got %d", len(rows.Columns))
+	}
+}
+
+func TestJoinSelectWithCondition(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(100))`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, value INT)`)
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (1, 'Alice')")
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (2, 'Bob')")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (1, 1, 100)")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (2, 1, 200)")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (3, 2, 300)")
+
+	rs, err := env.exec.Execute("SELECT a.name, b.value FROM a JOIN b ON a.id = b.a_id WHERE b.value > 100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+}
+
+func TestLeftJoinSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(100))`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, value INT)`)
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (1, 'Alice')")
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (2, 'Bob')")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (1, 1, 100)")
+
+	rs, err := env.exec.Execute("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows (including NULL row), got %d", len(rows.Rows))
+	}
+}

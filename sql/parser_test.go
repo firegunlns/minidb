@@ -93,8 +93,12 @@ func TestParseSelect(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *SelectStmt, got %T", stmt)
 	}
-	if sel.Table != "users" {
-		t.Errorf("expected table 'users', got %q", sel.Table)
+	ref, ok := sel.TableRef.(*SimpleTableRef)
+	if !ok {
+		t.Fatalf("expected *SimpleTableRef, got %T", sel.TableRef)
+	}
+	if ref.Table != "users" {
+		t.Errorf("expected table 'users', got %q", ref.Table)
 	}
 	if len(sel.Columns) != 2 {
 		t.Fatalf("expected 2 columns, got %d", len(sel.Columns))
@@ -110,7 +114,7 @@ func TestParseUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
- upd, ok := stmt.(*UpdateStmt)
+	upd, ok := stmt.(*UpdateStmt)
 	if !ok {
 		t.Fatalf("expected *UpdateStmt, got %T", stmt)
 	}

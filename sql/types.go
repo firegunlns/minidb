@@ -31,7 +31,7 @@ type (
 		Values  [][]any
 	}
 	SelectStmt struct {
-		Table     string
+		TableRef  TableRef
 		Columns   []string
 		SelectAll bool
 		Where     Expr
@@ -39,6 +39,20 @@ type (
 		Limit     *int
 		ForUpdate bool
 	}
+
+	TableRef       interface{ tableRefNode() }
+	SimpleTableRef struct {
+		Table string
+		Alias string
+	}
+	JoinTableRef struct {
+		Left  TableRef
+		Right TableRef
+		Type  JoinType
+		On    Expr
+	}
+
+	JoinType   int
 	UpdateStmt struct {
 		Table      string
 		SetClauses []SetClause
@@ -54,6 +68,15 @@ type (
 	RollbackStmt struct{}
 	ExplainStmt  struct{ Inner Stmt }
 )
+
+const (
+	JoinTypeCross JoinType = 1
+	JoinTypeLeft  JoinType = 2
+	JoinTypeRight JoinType = 3
+)
+
+func (SimpleTableRef) tableRefNode() {}
+func (JoinTableRef) tableRefNode()   {}
 
 type ColumnDef struct {
 	Name      string
@@ -281,7 +304,11 @@ func convertInsert(n *ast.InsertStmt) (*InsertStmt, error) {
 func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 	result := &SelectStmt{}
 	if n.From != nil && n.From.TableRefs != nil {
-		result.Table = extractTable(n.From.TableRefs)
+		ref, err := convertTableRef(n.From.TableRefs)
+		if err != nil {
+			return nil, err
+		}
+		result.TableRef = ref
 	}
 	if n.Fields != nil {
 		for _, field := range n.Fields.Fields {
@@ -553,6 +580,62 @@ func extractTable(node ast.ResultSetNode) string {
 		}
 	}
 	return ""
+}
+
+// convertTableRef converts TiDB AST table refs to our TableRef type.
+func convertTableRef(node ast.ResultSetNode) (TableRef, error) {
+	if node == nil {
+		return nil, fmt.Errorf("table reference is nil")
+	}
+	switch n := node.(type) {
+	case *ast.TableSource:
+		if name, ok := n.Source.(*ast.TableName); ok {
+			alias := ""
+			if n.AsName.O != "" {
+				alias = n.AsName.O
+			}
+			return &SimpleTableRef{Table: name.Name.O, Alias: alias}, nil
+		}
+		return nil, fmt.Errorf("unsupported table source: %T", n.Source)
+	case *ast.Join:
+		if n.Right == nil {
+			return convertTableRef(n.Left)
+		}
+		left, err := convertTableRef(n.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := convertTableRef(n.Right)
+		if err != nil {
+			return nil, err
+		}
+		var joinType JoinType
+		switch n.Tp {
+		case ast.CrossJoin:
+			joinType = JoinTypeCross
+		case ast.LeftJoin:
+			joinType = JoinTypeLeft
+		case ast.RightJoin:
+			joinType = JoinTypeRight
+		default:
+			joinType = JoinTypeCross
+		}
+		var onExpr Expr
+		if n.On != nil && n.On.Expr != nil {
+			expr, err := convertExpr(n.On.Expr)
+			if err != nil {
+				return nil, err
+			}
+			onExpr = expr
+		}
+		return &JoinTableRef{
+			Left:  left,
+			Right: right,
+			Type:  joinType,
+			On:    onExpr,
+		}, nil
+	}
+	return nil, fmt.Errorf("unsupported table reference: %T", node)
 }
 
 func getColumnName(expr ast.ExprNode) string {
