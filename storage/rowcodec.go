@@ -244,8 +244,9 @@ func CoerceValue(col ColumnDef, val any) (any, error) {
 		case time.Time:
 			return v, nil
 		case string:
-			t, err := time.Parse("2006-01-02 15:04:05", v)
-			return t, err
+			return parseTimestamp(v)
+		case []byte:
+			return parseTimestamp(string(v))
 		}
 	case ColTypeDouble:
 		switch v := val.(type) {
@@ -273,8 +274,24 @@ func CoerceValue(col ColumnDef, val any) (any, error) {
 			return f, err
 		case ColTypeVarchar:
 			return str, nil
+		case ColTypeTimestamp:
+			return parseTimestamp(str)
 		}
 	}
 
 	return nil, fmt.Errorf("cannot coerce %T to %v", val, col.Type)
+}
+
+func parseTimestamp(s string) (time.Time, error) {
+	for _, format := range []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(format, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse timestamp: %q", s)
 }

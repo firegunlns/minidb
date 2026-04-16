@@ -5,6 +5,7 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
@@ -271,6 +272,8 @@ func convertValue(v any) any {
 	switch val := v.(type) {
 	case int32:
 		return int64(val)
+	case time.Time:
+		return val.Format("2006-01-02 15:04:05")
 	default:
 		return val
 	}

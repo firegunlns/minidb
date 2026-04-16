@@ -626,7 +626,11 @@ func unaryOpToString(op opcode.Op) string {
 
 func evalLiteral(node ast.ExprNode) (any, error) {
 	if v, ok := node.(ast.ValueExpr); ok {
-		return v.GetValue(), nil
+		val := v.GetValue()
+		if bs, ok := val.([]byte); ok {
+			return string(bs), nil
+		}
+		return val, nil
 	}
 	// Handle unary minus for negative numbers.
 	if u, ok := node.(*ast.UnaryOperationExpr); ok {
