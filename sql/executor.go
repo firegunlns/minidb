@@ -107,6 +107,8 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execCommit()
 	case *RollbackStmt:
 		return e.execRollback()
+	case *ExplainStmt:
+		return e.execExplain(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement: %T", stmt)
 	}
@@ -573,6 +575,138 @@ func (e *Executor) execRollback() (any, error) {
 	e.txn.Rollback()
 	e.txn = nil
 	return &OKResult{}, nil
+}
+
+func (e *Executor) execExplain(s *ExplainStmt) (any, error) {
+	result := &SelectResult{
+		Columns: []string{"id", "select_type", "table", "type", "possible_keys", "key", "key_len", "ref", "rows", "Extra"},
+	}
+
+	switch inner := s.Inner.(type) {
+	case *SelectStmt:
+		e.explainSelect(result, inner)
+	case *InsertStmt:
+		e.explainInsert(result, inner)
+	case *UpdateStmt:
+		e.explainUpdate(result, inner)
+	case *DeleteStmt:
+		e.explainDelete(result, inner)
+	default:
+		result.Rows = append(result.Rows, []any{1, "SIMPLE", "", "ALL", nil, nil, nil, nil, 0, "unsupported"})
+	}
+
+	return result, nil
+}
+
+func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
+	r.Rows = append(r.Rows, []any{
+		1,
+		"SIMPLE",
+		s.Table,
+		e.getAccessType(s),
+		nil,
+		e.getUsedKey(s),
+		nil,
+		nil,
+		"estimate",
+		e.getExtra(s),
+	})
+}
+
+func (e *Executor) explainInsert(r *SelectResult, s *InsertStmt) {
+	r.Rows = append(r.Rows, []any{
+		1,
+		"INSERT",
+		s.Table,
+		"ALL",
+		nil,
+		nil,
+		nil,
+		nil,
+		0,
+		fmt.Sprintf("into %s", s.Table),
+	})
+}
+
+func (e *Executor) explainUpdate(r *SelectResult, s *UpdateStmt) {
+	r.Rows = append(r.Rows, []any{
+		1,
+		"UPDATE",
+		s.Table,
+		e.getAccessTypeFromWhere(s.Where),
+		nil,
+		e.getKeyFromWhere(s.Where),
+		nil,
+		nil,
+		"estimate",
+		e.getExtraFromWhere(s.Where),
+	})
+}
+
+func (e *Executor) explainDelete(r *SelectResult, s *DeleteStmt) {
+	r.Rows = append(r.Rows, []any{
+		1,
+		"DELETE",
+		s.Table,
+		e.getAccessTypeFromWhere(s.Where),
+		nil,
+		e.getKeyFromWhere(s.Where),
+		nil,
+		nil,
+		"estimate",
+		e.getExtraFromWhere(s.Where),
+	})
+}
+
+func (e *Executor) getAccessType(s *SelectStmt) string {
+	if s.Where != nil {
+		return "range"
+	}
+	return "ALL"
+}
+
+func (e *Executor) getUsedKey(s *SelectStmt) string {
+	if s.Where != nil {
+		return "PRIMARY"
+	}
+	return ""
+}
+
+func (e *Executor) getExtra(s *SelectStmt) string {
+	var extras []string
+	if s.SelectAll {
+		extras = append(extras, "select tables scan")
+	} else {
+		extras = append(extras, "select columns")
+	}
+	if len(s.OrderBy) > 0 {
+		extras = append(extras, "using filesort")
+	}
+	if s.Limit != nil {
+		extras = append(extras, fmt.Sprintf("limit %d", *s.Limit))
+	}
+	return strings.Join(extras, "; ")
+}
+
+func (e *Executor) getAccessTypeFromWhere(where Expr) string {
+	if where != nil {
+		return "range"
+	}
+	return "ALL"
+}
+
+func (e *Executor) getKeyFromWhere(where Expr) any {
+	if where != nil {
+		return "PRIMARY"
+	}
+	return nil
+}
+
+func (e *Executor) getExtraFromWhere(where Expr) string {
+	if where != nil {
+		return "using where"
+	}
+	return ""
 }
 
 // ActiveTxn returns the active transaction (for protocol layer).

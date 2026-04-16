@@ -225,3 +225,89 @@ func TestExecAutoCommit(t *testing.T) {
 		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
 	}
 }
+
+func TestExplainSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+
+	rs, err := env.exec.Execute("EXPLAIN SELECT * FROM t1 WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Columns) != 10 {
+		t.Fatalf("expected 10 columns, got %d", len(rows.Columns))
+	}
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0][1] != "SIMPLE" {
+		t.Fatalf("expected select_type SIMPLE, got %v", rows.Rows[0][1])
+	}
+	if rows.Rows[0][3] != "range" {
+		t.Fatalf("expected type range, got %v", rows.Rows[0][3])
+	}
+}
+
+func TestExplainInsert(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+
+	rs, err := env.exec.Execute("EXPLAIN INSERT INTO t1 (id, v) VALUES (1, 10)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if rows.Rows[0][1] != "INSERT" {
+		t.Fatalf("expected select_type INSERT, got %v", rows.Rows[0][1])
+	}
+}
+
+func TestExplainDelete(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+
+	rs, err := env.exec.Execute("EXPLAIN DELETE FROM t1 WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if rows.Rows[0][1] != "DELETE" {
+		t.Fatalf("expected select_type DELETE, got %v", rows.Rows[0][1])
+	}
+	if rows.Rows[0][3] != "range" {
+		t.Fatalf("expected type range, got %v", rows.Rows[0][3])
+	}
+}
+
+func TestExplainUpdate(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+
+	rs, err := env.exec.Execute("EXPLAIN UPDATE t1 SET v = 20 WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if rows.Rows[0][1] != "UPDATE" {
+		t.Fatalf("expected select_type UPDATE, got %v", rows.Rows[0][1])
+	}
+	if rows.Rows[0][3] != "range" {
+		t.Fatalf("expected type range, got %v", rows.Rows[0][3])
+	}
+}

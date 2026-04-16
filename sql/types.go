@@ -52,6 +52,7 @@ type (
 	BeginStmt    struct{}
 	CommitStmt   struct{}
 	RollbackStmt struct{}
+	ExplainStmt  struct{ Inner Stmt }
 )
 
 type ColumnDef struct {
@@ -181,7 +182,11 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		if show, ok := n.Stmt.(*ast.ShowStmt); ok {
 			return &DescTableStmt{Table: show.Table.Name.O}, nil
 		}
-		return nil, fmt.Errorf("unsupported EXPLAIN statement")
+		inner, err := convertStmt(n.Stmt)
+		if err != nil {
+			return nil, err
+		}
+		return &ExplainStmt{Inner: inner}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", node)
 	}
