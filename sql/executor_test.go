@@ -381,3 +381,24 @@ func TestLeftJoinSelect(t *testing.T) {
 		t.Fatalf("expected 2 rows (including NULL row), got %d", len(rows.Rows))
 	}
 }
+
+func TestRightJoinSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(100))`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, value INT)`)
+	env.exec.Execute("INSERT INTO a (id, name) VALUES (1, 'Alice')")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (1, 1, 100)")
+	env.exec.Execute("INSERT INTO b (id, a_id, value) VALUES (2, 3, 200)")
+
+	rs, err := env.exec.Execute("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows (including NULL row), got %d", len(rows.Rows))
+	}
+}

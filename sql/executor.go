@@ -490,21 +490,46 @@ func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) 
 	rightAlias := e.getTableAlias(ref.Right)
 
 	isLeftJoin := ref.Type == JoinTypeLeft
-	rightNullRow := make([]any, len(rightTd.Columns))
+	isRightJoin := ref.Type == JoinTypeRight
+	leftNullRow := make([]any, len(leftTd.Columns))
 
-	for _, leftRow := range leftRows {
-		matched := false
-		for _, rightRow := range rightRows {
-			if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
-				matched = true
-				joined := append(append([]any{}, leftRow...), rightRow...)
+	if isRightJoin {
+		rightMatched := make(map[int]bool)
+		for ri, rightRow := range rightRows {
+			matched := false
+			for li, leftRow := range leftRows {
+				if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
+					matched = true
+					rightMatched[ri] = true
+					joined := append(append([]any{}, leftRow...), rightRow...)
+					if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+						rows = append(rows, joined)
+					}
+					_ = li
+				}
+			}
+			if !matched {
+				joined := append(append([]any{}, leftNullRow...), rightRow...)
 				if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
 					rows = append(rows, joined)
 				}
 			}
 		}
-		if !matched {
-			if isLeftJoin {
+		_ = rightMatched
+	} else {
+		rightNullRow := make([]any, len(rightTd.Columns))
+		for _, leftRow := range leftRows {
+			matched := false
+			for _, rightRow := range rightRows {
+				if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
+					matched = true
+					joined := append(append([]any{}, leftRow...), rightRow...)
+					if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+						rows = append(rows, joined)
+					}
+				}
+			}
+			if !matched && isLeftJoin {
 				joined := append(append([]any{}, leftRow...), rightNullRow...)
 				if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
 					rows = append(rows, joined)
