@@ -23,6 +23,7 @@ type (
 	DropTableStmt     struct{ Table string }
 	ShowTablesStmt    struct{}
 	ShowDatabasesStmt struct{}
+	DescTableStmt     struct{ Table string }
 
 	InsertStmt struct {
 		Table   string
@@ -176,6 +177,11 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		return &CommitStmt{}, nil
 	case *ast.RollbackStmt:
 		return &RollbackStmt{}, nil
+	case *ast.ExplainStmt:
+		if show, ok := n.Stmt.(*ast.ShowStmt); ok {
+			return &DescTableStmt{Table: show.Table.Name.O}, nil
+		}
+		return nil, fmt.Errorf("unsupported EXPLAIN statement")
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", node)
 	}

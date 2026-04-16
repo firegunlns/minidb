@@ -83,6 +83,8 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execShowTables()
 	case *ShowDatabasesStmt:
 		return e.execShowDatabases()
+	case *DescTableStmt:
+		return e.execDescTable(s)
 	case *InsertStmt:
 		return e.execDML(func(txn *txn.Txn) (any, error) {
 			return e.execInsert(txn, s)
@@ -205,6 +207,78 @@ func (e *Executor) execShowDatabases() (any, error) {
 		result.Rows = append(result.Rows, []any{db})
 	}
 	return result, nil
+}
+
+func (e *Executor) execDescTable(s *DescTableStmt) (any, error) {
+	if e.dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	td, err := e.cat.GetTable(e.dbName, s.Table)
+	if err != nil {
+		return nil, err
+	}
+	result := &SelectResult{
+		Columns: []string{"Field", "Type", "Null", "Key", "Default", "Extra"},
+	}
+	for i, col := range td.Columns {
+		isPK := false
+		for _, pkIdx := range td.PKCols {
+			if pkIdx == i {
+				isPK = true
+				break
+			}
+		}
+		nullStr := "YES"
+		if !col.Nullable {
+			nullStr = "NO"
+		}
+		keyStr := ""
+		if isPK {
+			keyStr = "PRI"
+		}
+		defaultStr := ""
+		extraStr := ""
+		if col.AutoInc {
+			extraStr = "auto_increment"
+		}
+		typeStr := columnTypeName(col.Type, col.Length, col.Precision, col.Scale)
+		result.Rows = append(result.Rows, []any{
+			col.Name,
+			typeStr,
+			nullStr,
+			keyStr,
+			defaultStr,
+			extraStr,
+		})
+	}
+	return result, nil
+}
+
+func columnTypeName(ct storage.ColumnType, length, precision, scale int) string {
+	switch ct {
+	case storage.ColTypeInt:
+		return "int"
+	case storage.ColTypeBigInt:
+		return "bigint"
+	case storage.ColTypeVarchar:
+		if length > 0 {
+			return fmt.Sprintf("varchar(%d)", length)
+		}
+		return "varchar"
+	case storage.ColTypeDecimal:
+		if precision > 0 && scale > 0 {
+			return fmt.Sprintf("decimal(%d,%d)", precision, scale)
+		} else if precision > 0 {
+			return fmt.Sprintf("decimal(%d)", precision)
+		}
+		return "decimal"
+	case storage.ColTypeTimestamp:
+		return "timestamp"
+	case storage.ColTypeDouble:
+		return "double"
+	default:
+		return "unknown"
+	}
 }
 
 // --- DML ---
