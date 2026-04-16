@@ -23,8 +23,8 @@ const (
 //
 //	[1B type][8B txnTS][8B commitTS][...type-specific data...]
 type WAL struct {
-	mu       sync.Mutex
-	f        *os.File
+	mu        sync.Mutex
+	f         *os.File
 	tsCounter uint64
 }
 
@@ -53,6 +53,7 @@ func (w *WAL) Close() error {
 }
 
 // Append writes a record to the WAL and returns the allocated timestamp.
+// Note: Sync is NOT called here - callers should sync periodically if needed.
 func (w *WAL) Append(rec Record) uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -81,7 +82,7 @@ func (w *WAL) Append(rec Record) uint64 {
 	copy(buf[9:], payload)
 
 	w.f.Write(buf)
-	w.f.Sync()
+	// Removed: w.f.Sync() - too expensive for every write
 
 	return ts
 }

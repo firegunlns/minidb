@@ -2,9 +2,7 @@ package storage
 
 import (
 	"fmt"
-	"log"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"lns.com/minidb/bptree"
@@ -99,7 +97,6 @@ func (e *StorageEngine) OpenTree(treeKey string) error {
 	if _, ok := e.trees[treeKey]; ok {
 		return nil
 	}
-	log.Printf("OpenTree NEW treeKey=%s", treeKey)
 	path := filepath.Join(e.dataDir, treeKey)
 	tree, err := bptree.OpenPersistentBPTree(path, e.order, e.cacheSize)
 	if err != nil {
@@ -125,15 +122,7 @@ func (e *StorageEngine) InsertRow(treeKey string, pk []byte, commitTS uint64, ro
 	}
 	vkey := VersionKey(pk, commitTS)
 	mvccVal := EncodeMVCCValue(commitTS, 0, 0, rowData)
-	var err error
-	if strings.Contains(treeKey, "customer") {
-		log.Printf("InsertRow treeKey=%s pk=%x commitTS=%d vkey=%x", treeKey, pk, commitTS, vkey)
-	}
-	err = tree.Insert(vkey, mvccVal)
-	if err != nil {
-		log.Printf("InsertRow ERROR treeKey=%s err=%v", treeKey, err)
-	}
-	return err
+	return tree.Insert(vkey, mvccVal)
 }
 
 // GetRow retrieves the visible version of a row at the given read timestamp.
@@ -227,7 +216,6 @@ func (e *StorageEngine) DeleteRow(treeKey string, pk []byte, commitTS uint64) er
 func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint64, fn func(pk, row []byte) bool) {
 	tree := e.getTree(treeKey)
 	if tree == nil {
-		log.Printf("ScanRange treeKey=%s TREE NOT FOUND", treeKey)
 		return
 	}
 	// We need to scan the raw versioned keys and filter by visibility.
@@ -244,8 +232,6 @@ func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint
 	}
 
 	kvs := tree.RangeScan(scanStart, scanEnd)
-
-	log.Printf("ScanRange treeKey=%s start=%x end=%x scanStart=%x scanEnd=%x totalKVs=%d", treeKey, start, end, scanStart, scanEnd, len(kvs))
 
 	// Group by PK prefix, return first visible version for each.
 	seen := make(map[string]bool)

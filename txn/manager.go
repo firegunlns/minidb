@@ -2,7 +2,6 @@ package txn
 
 import (
 	"errors"
-	"log"
 
 	"lns.com/minidb/storage"
 	"lns.com/minidb/wal"
@@ -113,7 +112,6 @@ func (t *Txn) Delete(treeKey string, cols []storage.ColumnDef, pk []byte) error 
 
 // Scan iterates over rows in a key range, merging workspace writes with engine data.
 func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, fn func(pk, row []byte) bool) {
-	log.Printf("Txn.Scan finalized=%v treeKey=%s start=%x end=%x startTS=%d", t.finalized, treeKey, start, end, t.startTS)
 	if t.finalized {
 		return
 	}

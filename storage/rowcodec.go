@@ -283,6 +283,16 @@ func CoerceValue(col ColumnDef, val any) (any, error) {
 }
 
 func parseTimestamp(s string) (time.Time, error) {
+	// Handle TiDB's Go syntax representation: {12 [234 7 4 16 13 20 49 64 221 10 0]}
+	// This is a TiDB Datum with binary-encoded timestamp
+	if len(s) > 2 && s[0] == '{' {
+		// Try to decode TiDB binary timestamp format
+		// Format: {type [bytes...]}
+		if t, ok := parseTiDBTimestamp(s); ok {
+			return t, nil
+		}
+	}
+
 	for _, format := range []string{
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04:05.999999999",
@@ -294,4 +304,66 @@ func parseTimestamp(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("cannot parse timestamp: %q", s)
+}
+
+func parseTiDBTimestamp(s string) (time.Time, bool) {
+	// TiDB Datum binary format: {type [bytes]}
+	// Format: [type_flag][year_offset][month][day][hour][minute][second]...
+	start := -1
+	end := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] == '[' {
+			start = i + 1
+		}
+		if s[i] == ']' {
+			end = i
+			break
+		}
+	}
+	if start < 0 || end <= start {
+		return time.Time{}, false
+	}
+
+	// Extract bytes
+	var bytes []byte
+	for i := start; i < end; i++ {
+		if s[i] == ' ' {
+			continue
+		}
+		// Parse the byte value
+		j := i
+		for j < end && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j > i {
+			var val byte
+			for k := i; k < j; k++ {
+				val = val*10 + (s[k] - '0')
+			}
+			bytes = append(bytes, val)
+			i = j - 1
+		}
+	}
+
+	// TiDB binary timestamp format:
+	// bytes[1] = year offset from 2000
+	// bytes[2] = month
+	// bytes[3] = day
+	// bytes[4] = hour
+	// bytes[5] = minute
+	// bytes[6] = second
+	if len(bytes) >= 7 {
+		year := 2000 + int(bytes[1])
+		month := int(bytes[2])
+		day := int(bytes[3])
+		hour := int(bytes[4])
+		minute := int(bytes[5])
+		second := int(bytes[6])
+
+		if year >= 1900 && year <= 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+			return time.Date(year, time.Month(month), day, hour, minute, second, 0, time.UTC), true
+		}
+	}
+
+	return time.Time{}, false
 }

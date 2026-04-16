@@ -630,6 +630,11 @@ func evalLiteral(node ast.ExprNode) (any, error) {
 		if bs, ok := val.([]byte); ok {
 			return string(bs), nil
 		}
+		// Check if TiDB returned a special type that needs GetDatumString()
+		// The error format {12 [234 ...]} indicates TiDB's binary timestamp encoding
+		if s := v.GetDatumString(); s != "" {
+			return s, nil
+		}
 		return val, nil
 	}
 	// Handle unary minus for negative numbers.
