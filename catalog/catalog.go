@@ -179,6 +179,18 @@ func (c *Catalog) DropTable(db, name string) error {
 	return nil
 }
 
+func (c *Catalog) UpdateTable(db, name string, td *TableDef) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := tableKeyPrefix(db, name)
+	data := encodeTableDef(td)
+	if err := c.tblTree.Insert(key, data); err != nil {
+		return err
+	}
+	c.cache[db+"."+name] = td
+	return nil
+}
+
 // --- Auto-increment ---
 
 func (c *Catalog) NextAutoInc(db, table, col string) (int64, error) {
@@ -202,7 +214,7 @@ func (c *Catalog) NextAutoInc(db, table, col string) (int64, error) {
 
 func encodeTableDef(td *TableDef) []byte {
 	// Simple encoding: use a flat binary format.
-	// [2B numCols][columns...][2B numIndexes][indexes...][2B numPKCols][pkCols...]
+	// [2B numCols][columns...][2B numIndexes][indexes...][2B numPKCols][pkCols...][2B numFKs][fk...]
 	size := 2
 	for _, col := range td.Columns {
 		size += 2 + len(col.Name) + 1 + 2 + 1 + 1 + 1 + 1 // name + type + length + prec + scale + nullable + autoinc
@@ -215,6 +227,13 @@ func encodeTableDef(td *TableDef) []byte {
 		}
 	}
 	size += 2 + len(td.PKCols)*2
+	size += 2
+	for _, fk := range td.ForeignKeys {
+		size += 2 + len(fk.Name)
+		size += 2 + len(fk.RefTable)
+		size += 2 + len(fk.Columns)*2
+		size += 2 + len(fk.RefColumns)*2
+	}
 
 	buf := make([]byte, size)
 	off := 0
@@ -277,6 +296,31 @@ func encodeTableDef(td *TableDef) []byte {
 		off += 2
 	}
 
+	binary.BigEndian.PutUint16(buf[off:], uint16(len(td.ForeignKeys)))
+	off += 2
+	for _, fk := range td.ForeignKeys {
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(fk.Name)))
+		off += 2
+		copy(buf[off:], fk.Name)
+		off += len(fk.Name)
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(fk.RefTable)))
+		off += 2
+		copy(buf[off:], fk.RefTable)
+		off += len(fk.RefTable)
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(fk.Columns)))
+		off += 2
+		for _, c := range fk.Columns {
+			binary.BigEndian.PutUint16(buf[off:], uint16(c))
+			off += 2
+		}
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(fk.RefColumns)))
+		off += 2
+		for _, c := range fk.RefColumns {
+			binary.BigEndian.PutUint16(buf[off:], uint16(c))
+			off += 2
+		}
+	}
+
 	return buf[:off]
 }
 
@@ -336,9 +380,38 @@ func decodeTableDef(data []byte) *TableDef {
 		off += 2
 	}
 
+	numFK := int(binary.BigEndian.Uint16(data[off:]))
+	off += 2
+	fks := make([]ForeignKeyDef, numFK)
+	for i := range fks {
+		nameLen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		fks[i].Name = string(data[off : off+nameLen])
+		off += nameLen
+		refTableLen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		fks[i].RefTable = string(data[off : off+refTableLen])
+		off += refTableLen
+		numCols := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		fks[i].Columns = make([]int, numCols)
+		for j := range fks[i].Columns {
+			fks[i].Columns[j] = int(binary.BigEndian.Uint16(data[off:]))
+			off += 2
+		}
+		numRefCols := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		fks[i].RefColumns = make([]int, numRefCols)
+		for j := range fks[i].RefColumns {
+			fks[i].RefColumns[j] = int(binary.BigEndian.Uint16(data[off:]))
+			off += 2
+		}
+	}
+
 	return &TableDef{
-		Columns: cols,
-		Indexes: indexes,
-		PKCols:  pkCols,
+		Columns:     cols,
+		Indexes:     indexes,
+		PKCols:      pkCols,
+		ForeignKeys: fks,
 	}
 }

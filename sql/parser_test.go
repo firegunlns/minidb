@@ -229,3 +229,43 @@ func TestParseShowTables(t *testing.T) {
 		t.Fatalf("expected *ShowTablesStmt, got %T", stmt)
 	}
 }
+
+func TestParseAlterTableAddForeignKey(t *testing.T) {
+	p := NewParser()
+	stmt, err := p.Parse("alter table bmsql_district add constraint d_warehouse_fkey foreign key (d_w_id) references bmsql_warehouse (w_id)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at, ok := stmt.(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmt)
+	}
+	if at.Table != "bmsql_district" {
+		t.Errorf("expected table 'bmsql_district', got %q", at.Table)
+	}
+	if len(at.Specs) != 1 {
+		t.Fatalf("expected 1 spec, got %d", len(at.Specs))
+	}
+	spec := at.Specs[0]
+	if spec.Type != AlterAddConstraint {
+		t.Errorf("expected AlterAddConstraint, got %d", spec.Type)
+	}
+	if spec.Constraint == nil {
+		t.Fatal("expected constraint")
+	}
+	if spec.Constraint.Type != ConstraintTypeForeignKey {
+		t.Errorf("expected ConstraintTypeForeignKey, got %d", spec.Constraint.Type)
+	}
+	if spec.Constraint.Name != "d_warehouse_fkey" {
+		t.Errorf("expected constraint name 'd_warehouse_fkey', got %q", spec.Constraint.Name)
+	}
+	if len(spec.Constraint.Keys) != 1 || spec.Constraint.Keys[0] != "d_w_id" {
+		t.Errorf("expected key 'd_w_id', got %v", spec.Constraint.Keys)
+	}
+	if spec.Constraint.ReferTable != "bmsql_warehouse" {
+		t.Errorf("expected ref table 'bmsql_warehouse', got %q", spec.Constraint.ReferTable)
+	}
+	if len(spec.Constraint.ReferKeys) != 1 || spec.Constraint.ReferKeys[0] != "w_id" {
+		t.Errorf("expected ref key 'w_id', got %v", spec.Constraint.ReferKeys)
+	}
+}

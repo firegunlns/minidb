@@ -108,6 +108,8 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execCommit()
 	case *RollbackStmt:
 		return e.execRollback()
+	case *AlterTableStmt:
+		return e.execAlterTable(s)
 	case *ExplainStmt:
 		return e.execExplain(s)
 	default:
@@ -253,6 +255,134 @@ func (e *Executor) execDescTable(s *DescTableStmt) (any, error) {
 		})
 	}
 	return result, nil
+}
+
+func (e *Executor) execAlterTable(s *AlterTableStmt) (any, error) {
+	if e.dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+
+	td, err := e.cat.GetTable(e.dbName, s.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, spec := range s.Specs {
+		switch spec.Type {
+		case AlterAddColumn:
+			for _, col := range spec.Columns {
+				storageCol := storage.ColumnDef{
+					Name:      col.Name,
+					Type:      colTypeFromString(col.Type),
+					Length:    col.Length,
+					Precision: col.Precision,
+					Scale:     col.Scale,
+					Nullable:  col.Nullable,
+					AutoInc:   col.AutoInc,
+				}
+				td.Columns = append(td.Columns, storageCol)
+			}
+		case AlterDropColumn:
+			colIdx := td.ColumnIndex(spec.Name)
+			if colIdx < 0 {
+				return nil, fmt.Errorf("column %q not found", spec.Name)
+			}
+			td.Columns = append(td.Columns[:colIdx], td.Columns[colIdx+1:]...)
+			for i := range td.PKCols {
+				if td.PKCols[i] == colIdx {
+					td.PKCols = append(td.PKCols[:i], td.PKCols[i+1:]...)
+					break
+				}
+			}
+			for i := range td.PKCols {
+				if td.PKCols[i] > colIdx {
+					td.PKCols[i]--
+				}
+			}
+			var newFKs []catalog.ForeignKeyDef
+			for _, fk := range td.ForeignKeys {
+				var newCols []int
+				for _, idx := range fk.Columns {
+					if idx != colIdx {
+						if idx > colIdx {
+							newCols = append(newCols, idx-1)
+						} else {
+							newCols = append(newCols, idx)
+						}
+					}
+				}
+				if len(newCols) > 0 {
+					fk.Columns = newCols
+					newFKs = append(newFKs, fk)
+				}
+			}
+			td.ForeignKeys = newFKs
+		case AlterAddConstraint:
+			if spec.Constraint == nil {
+				continue
+			}
+			c := spec.Constraint
+			switch c.Type {
+			case ConstraintTypePrimaryKey:
+				var pkCols []int
+				for _, colName := range c.Keys {
+					idx := td.ColumnIndex(colName)
+					if idx < 0 {
+						return nil, fmt.Errorf("column %q not found for primary key", colName)
+					}
+					pkCols = append(pkCols, idx)
+				}
+				td.PKCols = pkCols
+			case ConstraintTypeForeignKey:
+				var colIndices []int
+				for _, colName := range c.Keys {
+					idx := td.ColumnIndex(colName)
+					if idx < 0 {
+						return nil, fmt.Errorf("column %q not found for foreign key", colName)
+					}
+					colIndices = append(colIndices, idx)
+				}
+				refTd, err := e.cat.GetTable(e.dbName, c.ReferTable)
+				if err != nil {
+					return nil, fmt.Errorf("referenced table %q not found: %w", c.ReferTable, err)
+				}
+				var refColIndices []int
+				for _, colName := range c.ReferKeys {
+					idx := refTd.ColumnIndex(colName)
+					if idx < 0 {
+						return nil, fmt.Errorf("referenced column %q not found in %s", colName, c.ReferTable)
+					}
+					refColIndices = append(refColIndices, idx)
+				}
+				fk := catalog.ForeignKeyDef{
+					Name:       c.Name,
+					Columns:    colIndices,
+					RefTable:   c.ReferTable,
+					RefColumns: refColIndices,
+				}
+				td.ForeignKeys = append(td.ForeignKeys, fk)
+			case ConstraintTypeUnique:
+			}
+		case AlterDropConstraint:
+			for i, idx := range td.Indexes {
+				if idx.Name == spec.Name {
+					td.Indexes = append(td.Indexes[:i], td.Indexes[i+1:]...)
+					break
+				}
+			}
+			for i, fk := range td.ForeignKeys {
+				if fk.Name == spec.Name {
+					td.ForeignKeys = append(td.ForeignKeys[:i], td.ForeignKeys[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	if err := e.cat.UpdateTable(e.dbName, s.Table, td); err != nil {
+		return nil, err
+	}
+	return &OKResult{}, nil
 }
 
 func columnTypeName(ct storage.ColumnType, length, precision, scale int) string {

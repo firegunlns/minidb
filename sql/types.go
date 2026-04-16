@@ -64,10 +64,42 @@ type (
 		Where Expr
 	}
 
-	BeginStmt    struct{}
-	CommitStmt   struct{}
-	RollbackStmt struct{}
-	ExplainStmt  struct{ Inner Stmt }
+	BeginStmt      struct{}
+	CommitStmt     struct{}
+	RollbackStmt   struct{}
+	ExplainStmt    struct{ Inner Stmt }
+	AlterTableStmt struct {
+		Table string
+		Specs []AlterSpec
+	}
+	AlterSpec struct {
+		Type       AlterSpecType
+		Name       string
+		Columns    []ColumnDef
+		Constraint *ConstraintDef
+	}
+	AlterSpecType int
+	ConstraintDef struct {
+		Type       ConstraintType
+		Name       string
+		Keys       []string
+		ReferTable string
+		ReferKeys  []string
+	}
+	ConstraintType int
+)
+
+const (
+	AlterAddColumn AlterSpecType = iota
+	AlterDropColumn
+	AlterAddConstraint
+	AlterDropConstraint
+)
+
+const (
+	ConstraintTypePrimaryKey ConstraintType = iota
+	ConstraintTypeForeignKey
+	ConstraintTypeUnique
 )
 
 const (
@@ -224,6 +256,8 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		return &CommitStmt{}, nil
 	case *ast.RollbackStmt:
 		return &RollbackStmt{}, nil
+	case *ast.AlterTableStmt:
+		return convertAlterTable(n)
 	case *ast.ExplainStmt:
 		if show, ok := n.Stmt.(*ast.ShowStmt); ok {
 			return &DescTableStmt{Table: show.Table.Name.O}, nil
@@ -282,6 +316,67 @@ func convertCreateTable(n *ast.CreateTableStmt) (*CreateTableStmt, error) {
 		}
 	}
 
+	return result, nil
+}
+
+func convertAlterTable(n *ast.AlterTableStmt) (*AlterTableStmt, error) {
+	result := &AlterTableStmt{Table: n.Table.Name.O}
+	for _, spec := range n.Specs {
+		as := AlterSpec{}
+		switch spec.Tp {
+		case ast.AlterTableAddColumns:
+			as.Type = AlterAddColumn
+			for _, col := range spec.NewColumns {
+				colDef := ColumnDef{Name: col.Name.Name.O}
+				if col.Tp != nil {
+					colDef.Type = getTypeName(col.Tp)
+					colDef.Length = col.Tp.GetFlen()
+					colDef.Nullable = !mysql.HasNotNullFlag(col.Tp.GetFlag())
+				}
+				as.Columns = append(as.Columns, colDef)
+			}
+		case ast.AlterTableDropColumn:
+			as.Type = AlterDropColumn
+			if spec.OldColumnName != nil {
+				as.Name = spec.OldColumnName.Name.O
+			}
+		case ast.AlterTableAddConstraint:
+			as.Type = AlterAddConstraint
+			if spec.Constraint != nil {
+				c := &ConstraintDef{Name: spec.Constraint.Name}
+				switch spec.Constraint.Tp {
+				case ast.ConstraintPrimaryKey:
+					c.Type = ConstraintTypePrimaryKey
+					for _, key := range spec.Constraint.Keys {
+						c.Keys = append(c.Keys, key.Column.Name.O)
+					}
+				case ast.ConstraintForeignKey:
+					c.Type = ConstraintTypeForeignKey
+					for _, key := range spec.Constraint.Keys {
+						c.Keys = append(c.Keys, key.Column.Name.O)
+					}
+					if spec.Constraint.Refer != nil {
+						c.ReferTable = spec.Constraint.Refer.Table.Name.O
+						for _, part := range spec.Constraint.Refer.IndexPartSpecifications {
+							if part.Column != nil {
+								c.ReferKeys = append(c.ReferKeys, part.Column.Name.O)
+							}
+						}
+					}
+				case ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
+					c.Type = ConstraintTypeUnique
+					for _, key := range spec.Constraint.Keys {
+						c.Keys = append(c.Keys, key.Column.Name.O)
+					}
+				}
+				as.Constraint = c
+			}
+		case ast.AlterTableDropIndex:
+			as.Type = AlterDropConstraint
+			as.Name = spec.IndexName.O
+		}
+		result.Specs = append(result.Specs, as)
+	}
 	return result, nil
 }
 

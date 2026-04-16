@@ -7,11 +7,19 @@ type DatabaseDef struct {
 }
 
 type TableDef struct {
-	Database string
-	Name     string
-	Columns  []storage.ColumnDef
-	PKCols   []int // indices into Columns that form the primary key
-	Indexes  []IndexDef
+	Database    string
+	Name        string
+	Columns     []storage.ColumnDef
+	PKCols      []int // indices into Columns that form the primary key
+	Indexes     []IndexDef
+	ForeignKeys []ForeignKeyDef
+}
+
+type ForeignKeyDef struct {
+	Name       string
+	Columns    []int  // column indices in this table
+	RefTable   string // referenced table name
+	RefColumns []int  // column indices in referenced table
 }
 
 func (td *TableDef) PrimaryKeyColumns() []storage.ColumnDef {
