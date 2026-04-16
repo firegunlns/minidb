@@ -104,7 +104,7 @@ type (
 	Expr interface{ exprNode() }
 
 	LiteralExpr   struct{ Value any }
-	ColumnRefExpr struct{ Name string }
+	ColumnRefExpr struct{ Table, Name string }
 	BinaryExpr    struct {
 		Op          string
 		Left, Right Expr
@@ -129,6 +129,14 @@ type (
 		Expr Expr
 		Not  bool
 	}
+	SubqueryExpr struct {
+		Query       *SelectStmt
+		HasSubquery bool
+	}
+	ExistsExpr struct {
+		Query *SelectStmt
+		Not   bool
+	}
 )
 
 func (LiteralExpr) exprNode()   {}
@@ -141,6 +149,8 @@ func (NullExpr) exprNode()      {}
 func (BetweenExpr) exprNode()   {}
 func (InExpr) exprNode()        {}
 func (IsNullExpr) exprNode()    {}
+func (SubqueryExpr) exprNode()  {}
+func (ExistsExpr) exprNode()    {}
 
 type Stmt any
 
@@ -343,6 +353,39 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 	return result, nil
 }
 
+func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
+	result := &SelectStmt{}
+	if n.From != nil && n.From.TableRefs != nil {
+		ref, err := convertTableRef(n.From.TableRefs)
+		if err != nil {
+			return nil, err
+		}
+		result.TableRef = ref
+	}
+	if n.Fields != nil {
+		for _, field := range n.Fields.Fields {
+			if field.WildCard != nil {
+				result.SelectAll = true
+			} else {
+				result.Columns = append(result.Columns, getColumnName(field.Expr))
+			}
+		}
+	}
+	if n.Where != nil {
+		expr, err := convertExpr(n.Where)
+		if err != nil {
+			return nil, err
+		}
+		result.Where = expr
+	}
+	if n.Limit != nil && n.Limit.Count != nil {
+		if count, err := evalLiteralInt(n.Limit.Count); err == nil {
+			result.Limit = &count
+		}
+	}
+	return result, nil
+}
+
 func convertUpdate(n *ast.UpdateStmt) (*UpdateStmt, error) {
 	result := &UpdateStmt{}
 	if n.TableRefs != nil && n.TableRefs.TableRefs != nil {
@@ -388,7 +431,7 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 	case ast.ParamMarkerExpr:
 		return &ParamExpr{}, nil
 	case *ast.ColumnNameExpr:
-		return &ColumnRefExpr{Name: n.Name.Name.O}, nil
+		return &ColumnRefExpr{Table: n.Name.Table.O, Name: n.Name.Name.O}, nil
 	case *ast.BinaryOperationExpr:
 		left, err := convertExpr(n.L)
 		if err != nil {
@@ -438,6 +481,15 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 			}
 			vals = append(vals, e)
 		}
+		if n.Sel != nil {
+			if subquery, ok := n.Sel.(*ast.SubqueryExpr); ok {
+				subq, err := convertSelectStmt(subquery.Query.(*ast.SelectStmt))
+				if err != nil {
+					return nil, err
+				}
+				return &InExpr{Expr: expr, Values: []Expr{&SubqueryExpr{Query: subq, HasSubquery: true}}, Not: n.Not}, nil
+			}
+		}
 		return &InExpr{Expr: expr, Values: vals, Not: n.Not}, nil
 	case *ast.FuncCallExpr:
 		var args []Expr
@@ -449,6 +501,21 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 			args = append(args, e)
 		}
 		return &FuncCallExpr{Name: n.FnName.O, Args: args}, nil
+	case *ast.SubqueryExpr:
+		subquery, err := convertSelectStmt(n.Query.(*ast.SelectStmt))
+		if err != nil {
+			return nil, err
+		}
+		return &SubqueryExpr{Query: subquery, HasSubquery: true}, nil
+	case *ast.ExistsSubqueryExpr:
+		if subqueryExpr, ok := n.Sel.(*ast.SubqueryExpr); ok {
+			subquery, err := convertSelectStmt(subqueryExpr.Query.(*ast.SelectStmt))
+			if err != nil {
+				return nil, err
+			}
+			return &ExistsExpr{Query: subquery, Not: n.Not}, nil
+		}
+		return nil, fmt.Errorf("EXISTS: unsupported subquery type: %T", n.Sel)
 	default:
 		return nil, fmt.Errorf("unsupported expr type: %T", node)
 	}
@@ -490,6 +557,8 @@ func opToString(op opcode.Op) string {
 		return "OR"
 	case opcode.Mod:
 		return "%"
+	case opcode.In:
+		return "IN"
 	default:
 		return fmt.Sprintf("%v", op)
 	}

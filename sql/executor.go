@@ -2,7 +2,6 @@ package sql
 
 import (
 	"fmt"
-	"log"
 	"strings"
 
 	"lns.com/minidb/catalog"
@@ -407,7 +406,6 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 	}
 
 	treeKey := td.DataFile()
-	log.Printf("execSelect db=%s table=%s treeKey=%s", e.dbName, ref.Table, treeKey)
 
 	var colIndices []int
 	var colNames []string
@@ -652,6 +650,13 @@ func (e *Executor) evalBinaryExprForJoin(expr Expr, leftTd *catalog.TableDef, le
 func (e *Executor) evalColumnRef(expr Expr, leftTd *catalog.TableDef, leftVals []any, rightTd *catalog.TableDef, rightVals []any) any {
 	switch ex := expr.(type) {
 	case *ColumnRefExpr:
+		if ex.Table != "" && ex.Table != leftTd.Name {
+			idx := rightTd.ColumnIndex(ex.Name)
+			if idx >= 0 {
+				return rightVals[idx]
+			}
+			return nil
+		}
 		idx := leftTd.ColumnIndex(ex.Name)
 		if idx >= 0 {
 			return leftVals[idx]
@@ -976,9 +981,276 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 			return v != nil
 		}
 		return v == nil
+	case *SubqueryExpr:
+		return e.execSubquery(ex.Query)
+	case *InExpr:
+		return e.evalInExpr(td, ex, vals)
+	case *ExistsExpr:
+		return e.evalExistsExpr(td, ex, vals)
 	default:
 		return nil
 	}
+}
+
+func (e *Executor) execSubquery(query *SelectStmt) any {
+	switch ref := query.TableRef.(type) {
+	case *SimpleTableRef:
+		txn := e.mgr.Begin()
+		defer txn.Rollback()
+		result, err := e.execSelectSimple(txn, query, ref)
+		if err != nil {
+			return nil
+		}
+		rs, ok := result.(*SelectResult)
+		if !ok || len(rs.Rows) == 0 {
+			return nil
+		}
+		if len(rs.Rows) == 1 && len(rs.Rows[0]) == 1 {
+			return rs.Rows[0][0]
+		}
+		return rs
+	case *JoinTableRef:
+		txn := e.mgr.Begin()
+		defer txn.Rollback()
+		result, err := e.execSelectJoin(txn, query, ref)
+		if err != nil {
+			return nil
+		}
+		rs, ok := result.(*SelectResult)
+		if !ok || len(rs.Rows) == 0 {
+			return nil
+		}
+		return rs
+	default:
+		return nil
+	}
+}
+
+func (e *Executor) evalInExpr(td *catalog.TableDef, expr *InExpr, vals []any) bool {
+	val := e.evalExpr(td, expr.Expr, vals)
+	for _, v := range expr.Values {
+		if sq, ok := v.(*SubqueryExpr); ok {
+			result := e.execSubquery(sq.Query)
+			if rs, ok := result.(*SelectResult); ok {
+				for _, row := range rs.Rows {
+					if len(row) > 0 && compareValues(val, row[0]) == 0 {
+						return !expr.Not
+					}
+				}
+				return expr.Not
+			}
+		} else {
+			v := e.evalExpr(td, v, vals)
+			if compareValues(val, v) == 0 {
+				return !expr.Not
+			}
+		}
+	}
+	return expr.Not
+}
+
+func (e *Executor) evalExistsExpr(td *catalog.TableDef, expr *ExistsExpr, vals []any) bool {
+	rs, err := e.execSubqueryWithOuter(expr.Query, td, vals)
+	if err != nil || rs == nil {
+		return expr.Not
+	}
+	exists := len(rs.Rows) > 0
+	if expr.Not {
+		return !exists
+	}
+	return exists
+}
+
+func (e *Executor) execSubqueryWithOuter(query *SelectStmt, outerTd *catalog.TableDef, outerVals []any) (*SelectResult, error) {
+	switch ref := query.TableRef.(type) {
+	case *SimpleTableRef:
+		txn := e.mgr.Begin()
+		defer txn.Rollback()
+		return e.execSelectSimpleWithOuter(txn, query, ref, outerTd, outerVals)
+	case *JoinTableRef:
+		txn := e.mgr.Begin()
+		defer txn.Rollback()
+		result, err := e.execSelectJoin(txn, query, ref)
+		if err != nil {
+			return nil, err
+		}
+		return result.(*SelectResult), nil
+	default:
+		return &SelectResult{}, nil
+	}
+}
+
+func (e *Executor) execSelectSimpleWithOuter(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, outerTd *catalog.TableDef, outerVals []any) (*SelectResult, error) {
+	td, err := e.cat.GetTable(e.dbName, ref.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	treeKey := td.DataFile()
+	var colIndices []int
+	var colNames []string
+	if s.SelectAll {
+		colNames = make([]string, len(td.Columns))
+		colIndices = make([]int, len(td.Columns))
+		for i, col := range td.Columns {
+			colNames[i] = col.Name
+			colIndices[i] = i
+		}
+	} else if len(s.Columns) > 0 {
+		colIndices = make([]int, len(s.Columns))
+		colNames = make([]string, len(s.Columns))
+		for i, name := range s.Columns {
+			colNames[i] = name
+			idx := td.ColumnIndex(name)
+			if idx < 0 {
+				idx = 0
+			}
+			colIndices[i] = idx
+		}
+	} else {
+		colIndices = []int{0}
+		colNames = []string{"id"}
+	}
+
+	start, end := []byte{0x00}, []byte{0xFF}
+
+	var rows [][]any
+	pkCols := td.PrimaryKeyColumns()
+
+	t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, td.Columns)
+		if s.Where != nil && !e.evalWhereWithOuter(td, vals, s.Where, outerTd, outerVals) {
+			return true
+		}
+		if len(colIndices) > 0 {
+			row := make([]any, len(colIndices))
+			for i, ci := range colIndices {
+				if ci < len(vals) {
+					row[i] = vals[ci]
+				}
+			}
+			rows = append(rows, row)
+		} else {
+			rows = append(rows, []any{1})
+		}
+		return true
+	})
+
+	if len(s.OrderBy) > 0 {
+		e.sortRows(rows, colNames, s.OrderBy)
+	}
+	if s.Limit != nil && *s.Limit < len(rows) {
+		rows = rows[:*s.Limit]
+	}
+
+	return &SelectResult{Columns: colNames, Rows: rows}, nil
+}
+
+func (e *Executor) evalWhereWithOuter(td *catalog.TableDef, vals []any, where Expr, outerTd *catalog.TableDef, outerVals []any) bool {
+	result := e.evalExprWithOuter(td, vals, where, outerTd, outerVals)
+	if b, ok := result.(bool); ok {
+		return b
+	}
+	if result == nil {
+		return false
+	}
+	return true
+}
+
+func (e *Executor) evalExprWithOuter(td *catalog.TableDef, vals []any, expr Expr, outerTd *catalog.TableDef, outerVals []any) any {
+	switch ex := expr.(type) {
+	case *LiteralExpr:
+		return ex.Value
+	case *ColumnRefExpr:
+		colName := ex.Name
+		tableName := ex.Table
+		if tableName != "" && tableName != td.Name {
+			if outerTd != nil && tableName == outerTd.Name {
+				idx := outerTd.ColumnIndex(colName)
+				if idx >= 0 {
+					return outerVals[idx]
+				}
+			}
+			return nil
+		}
+		idx := td.ColumnIndex(colName)
+		if idx >= 0 {
+			return vals[idx]
+		}
+		if outerTd != nil {
+			idx = outerTd.ColumnIndex(colName)
+			if idx >= 0 {
+				return outerVals[idx]
+			}
+		}
+		return nil
+	case *BinaryExpr:
+		left := e.evalExprWithOuter(td, vals, ex.Left, outerTd, outerVals)
+		right := e.evalExprWithOuter(td, vals, ex.Right, outerTd, outerVals)
+		return e.evalBinaryOp(ex.Op, left, right)
+	case *UnaryExpr:
+		operand := e.evalExprWithOuter(td, vals, ex.Operand, outerTd, outerVals)
+		return e.evalUnaryOp(ex.Op, operand)
+	case *NullExpr:
+		return nil
+	case *IsNullExpr:
+		v := e.evalExprWithOuter(td, vals, ex.Expr, outerTd, outerVals)
+		if ex.Not {
+			return v != nil
+		}
+		return v == nil
+	case *SubqueryExpr:
+		result, err := e.execSubqueryWithOuter(ex.Query, outerTd, outerVals)
+		if err != nil || result == nil {
+			return nil
+		}
+		if len(result.Rows) == 1 && len(result.Rows[0]) == 1 {
+			return result.Rows[0][0]
+		}
+		return result
+	case *InExpr:
+		return e.evalInExprWithOuter(td, vals, ex, outerTd, outerVals)
+	case *ExistsExpr:
+		return e.evalExistsExprWithOuter(td, vals, ex, outerTd, outerVals)
+	default:
+		return nil
+	}
+}
+
+func (e *Executor) evalInExprWithOuter(td *catalog.TableDef, vals []any, expr *InExpr, outerTd *catalog.TableDef, outerVals []any) bool {
+	val := e.evalExprWithOuter(td, vals, expr.Expr, outerTd, outerVals)
+	for _, v := range expr.Values {
+		if sq, ok := v.(*SubqueryExpr); ok {
+			result, err := e.execSubqueryWithOuter(sq.Query, outerTd, outerVals)
+			if err != nil || result == nil {
+				return expr.Not
+			}
+			for _, row := range result.Rows {
+				if len(row) > 0 && compareValues(val, row[0]) == 0 {
+					return !expr.Not
+				}
+			}
+			return expr.Not
+		} else {
+			v := e.evalExprWithOuter(td, vals, v, outerTd, outerVals)
+			if compareValues(val, v) == 0 {
+				return !expr.Not
+			}
+		}
+	}
+	return expr.Not
+}
+
+func (e *Executor) evalExistsExprWithOuter(td *catalog.TableDef, vals []any, expr *ExistsExpr, outerTd *catalog.TableDef, outerVals []any) bool {
+	rs, err := e.execSubqueryWithOuter(expr.Query, outerTd, outerVals)
+	if err != nil {
+		return expr.Not
+	}
+	exists := len(rs.Rows) > 0
+	if expr.Not {
+		return !exists
+	}
+	return exists
 }
 
 func (e *Executor) evalBinaryOp(op string, left, right any) any {
@@ -999,6 +1271,8 @@ func (e *Executor) evalBinaryOp(op string, left, right any) any {
 		return toBool(left) && toBool(right)
 	case "OR":
 		return toBool(left) || toBool(right)
+	case "IN":
+		return e.evalIn(left, right)
 	case "+":
 		return arithOp(left, right, func(a, b int64) int64 { return a + b }, func(a, b float64) float64 { return a + b })
 	case "-":
@@ -1008,6 +1282,21 @@ func (e *Executor) evalBinaryOp(op string, left, right any) any {
 	default:
 		return nil
 	}
+}
+
+func (e *Executor) evalIn(left, right any) bool {
+	if right == nil {
+		return false
+	}
+	if rs, ok := right.(*SelectResult); ok {
+		for _, row := range rs.Rows {
+			if len(row) > 0 && compareValues(left, row[0]) == 0 {
+				return true
+			}
+		}
+		return false
+	}
+	return compareValues(left, right) == 0
 }
 
 func (e *Executor) evalUnaryOp(op string, operand any) any {

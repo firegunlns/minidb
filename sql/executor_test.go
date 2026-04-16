@@ -402,3 +402,94 @@ func TestRightJoinSelect(t *testing.T) {
 		t.Fatalf("expected 2 rows (including NULL row), got %d", len(rows.Rows))
 	}
 }
+
+func TestSubqueryInSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO t2 (id, v) VALUES (1, 100)")
+
+	rs, err := env.exec.Execute("SELECT * FROM t1 WHERE id = (SELECT id FROM t2 WHERE v = 100)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0][0].(int32) != 1 {
+		t.Fatalf("expected id=1, got %v", rows.Rows[0][0])
+	}
+}
+
+func TestSubqueryInIn(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (3, 30)")
+	env.exec.Execute("INSERT INTO t2 (id, v) VALUES (1, 100)")
+	env.exec.Execute("INSERT INTO t2 (id, v) VALUES (2, 200)")
+
+	rs, err := env.exec.Execute("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+}
+
+func TestExistsSubquery(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (3, 30)")
+	env.exec.Execute("INSERT INTO t2 (id, v) VALUES (1, 100)")
+
+	rs, err := env.exec.Execute("SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+}
+
+func TestNotExistsSubquery(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (3, 30)")
+	env.exec.Execute("INSERT INTO t2 (id, v) VALUES (1, 100)")
+
+	rs, err := env.exec.Execute("SELECT * FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+}
