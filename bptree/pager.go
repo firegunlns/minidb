@@ -8,10 +8,10 @@ import (
 )
 
 const (
-	defaultSlotSize             = 32768 // 32KB
-	pagerHeaderSize       int64 = 4096
-	magicValue      uint32      = 0x42505452 // "BPTR"
-	currentVersion  uint32      = 2
+	defaultSlotSize        = 32768 // 32KB
+	pagerHeaderSize int64  = 4096
+	magicValue      uint32 = 0x42505452 // "BPTR"
+	currentVersion  uint32 = 2
 )
 
 var ErrCorrupted = errors.New("bptree: corrupted file")
@@ -42,6 +42,7 @@ type Pager struct {
 	file      *os.File
 	slotSize  int64
 	pageCount int64
+	freeList  []int64
 }
 
 // NewPager opens or creates a pager backed by filePath.
@@ -97,7 +98,13 @@ func NewPager(filePath string, slotSize int64) (*Pager, error) {
 		return nil, ErrCorrupted
 	}
 	p.slotSize = int64(h.SlotSize)
+	// Use the header's pageCount, but recalculate from file size if needed
+	// to handle cases where the header wasn't updated after crashes.
 	p.pageCount = h.PageCount
+	if p.pageCount == 0 && info != nil && info.Size() > pagerHeaderSize {
+		// Calculate pageCount from file size
+		p.pageCount = (info.Size() - pagerHeaderSize) / p.slotSize
+	}
 	return p, nil
 }
 
@@ -105,9 +112,21 @@ func NewPager(filePath string, slotSize int64) (*Pager, error) {
 func (p *Pager) Allocate() (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.freeList) > 0 {
+		id := p.freeList[len(p.freeList)-1]
+		p.freeList = p.freeList[:len(p.freeList)-1]
+		return id, nil
+	}
 	id := p.pageCount
 	p.pageCount++
 	return id, nil
+}
+
+// Free adds pageID to the free list for reuse by a subsequent Allocate.
+func (p *Pager) Free(pageID int64) {
+	p.mu.Lock()
+	p.freeList = append(p.freeList, pageID)
+	p.mu.Unlock()
 }
 
 // Read loads the data stored in the given page.
@@ -151,6 +170,11 @@ func (p *Pager) writePage(pageID int64, data []byte) error {
 	end := offset + p.slotSize
 	if fi, err := p.file.Stat(); err == nil && fi.Size() < end {
 		p.file.Truncate(end)
+		// Use max to avoid decreasing pageCount when pages are written
+		// out of order during eviction/flush.
+		if pageID+1 > p.pageCount {
+			p.pageCount = pageID + 1
+		}
 	}
 
 	buf := make([]byte, 4+len(data))

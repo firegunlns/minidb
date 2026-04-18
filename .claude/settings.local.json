@@ -74,7 +74,17 @@
       "Bash(kill)",
       "Bash(/tmp/lnsdb_server --port 13307 --data /tmp/lnsdb)",
       "Bash(echo \"INSERT exit: $?\")",
-      "Bash(killall -9 lnsdb_server)"
+      "Bash(killall -9 lnsdb_server)",
+      "Bash(go vet:*)",
+      "Bash(cd /Users/alan/work/learn/benchmarksql-5.0-mysql-support-opt-2.1/run && ./runDatabaseBuild.sh props.minidb 2>&1)",
+      "Bash(xxd:*)",
+      "Bash(kill:*)",
+      "Bash(true:*)",
+      "Bash(sleep 2:*)",
+      "Bash(tail:*)",
+      "Bash(head:*)",
+      "Bash(cd /Users/alan/work/learn/benchmarksql-5.0-mysql-support-opt-2.1/run && ./runBenchmark.sh props.minidb 2>&1)",
+      "Bash(cat:*)"
     ]
   }
 }

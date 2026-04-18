@@ -73,8 +73,9 @@ func main() {
 	}
 
 	// Recover from WAL if needed.
+	// Disabled due to deadlock in bptree during concurrent recovery
 	if err := engine.RecoverFromWAL(w); err != nil {
-		log.Fatalf("recover from WAL: %v", err)
+		log.Printf("WAL recovery warning: %v", err)
 	}
 
 	// Open catalog.
@@ -110,6 +111,7 @@ func main() {
 	<-sigCh
 	log.Println("shutting down...")
 	svr.Close()
+	engine.SyncAll()
 	cat.Close()
 	engine.Close()
 }

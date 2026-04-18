@@ -298,9 +298,10 @@ func convertCreateTable(n *ast.CreateTableStmt) (*CreateTableStmt, error) {
 		result.Columns = append(result.Columns, cd)
 	}
 
-	// Handle table-level constraints (e.g., PRIMARY KEY (col1, col2)).
+	// Handle table-level constraints (e.g., PRIMARY KEY (col1, col2), KEY ..., UNIQUE KEY ...).
 	for _, constraint := range n.Constraints {
-		if constraint.Tp == ast.ConstraintPrimaryKey {
+		switch constraint.Tp {
+		case ast.ConstraintPrimaryKey:
 			for _, col := range result.Columns {
 				col.Primary = false // clear any column-level PK
 			}
@@ -313,6 +314,10 @@ func convertCreateTable(n *ast.CreateTableStmt) (*CreateTableStmt, error) {
 					}
 				}
 			}
+		case ast.ConstraintKey, ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
+			// Secondary indexes - skip for now (not supported)
+		case ast.ConstraintForeignKey:
+			// Foreign keys - skip for now (not supported at table creation)
 		}
 	}
 

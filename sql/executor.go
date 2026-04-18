@@ -471,14 +471,36 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 	treeKey := td.DataFile()
 	var lastID int64
 
+	// Build column index map when explicit columns are specified.
+	var colIndexMap map[string]int
+	if len(s.Columns) > 0 {
+		colIndexMap = make(map[string]int, len(s.Columns))
+		for i, name := range s.Columns {
+			colIndexMap[name] = i
+		}
+	}
+
 	for _, rowVals := range s.Values {
-		if len(rowVals) != len(td.Columns) {
-			return nil, fmt.Errorf("column count mismatch: got %d, expected %d", len(rowVals), len(td.Columns))
+		// When columns are explicitly listed, map provided values to
+		// their positions in the table definition; missing columns get nil.
+		var fullVals []any
+		if colIndexMap != nil {
+			fullVals = make([]any, len(td.Columns))
+			for colIdx, col := range td.Columns {
+				if srcIdx, ok := colIndexMap[col.Name]; ok && srcIdx < len(rowVals) {
+					fullVals[colIdx] = rowVals[srcIdx]
+				}
+			}
+		} else {
+			if len(rowVals) != len(td.Columns) {
+				return nil, fmt.Errorf("column count mismatch: got %d, expected %d", len(rowVals), len(td.Columns))
+			}
+			fullVals = rowVals
 		}
 
 		// Coerce values.
 		coerced := make([]any, len(td.Columns))
-		for i, val := range rowVals {
+		for i, val := range fullVals {
 			c, err := storage.CoerceValue(td.Columns[i], val)
 			if err != nil {
 				return nil, fmt.Errorf("column %q: %w", td.Columns[i].Name, err)
@@ -489,7 +511,8 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 				if err != nil {
 					return nil, err
 				}
-				c = id
+				// Coerce auto-increment value to the column's native type.
+				c, _ = storage.CoerceValue(td.Columns[i], id)
 				lastID = id
 			}
 			coerced[i] = c

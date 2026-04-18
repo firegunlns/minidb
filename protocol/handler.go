@@ -87,7 +87,11 @@ func (h *SvrHandler) HandleFieldList(table string, fieldWildcard string) ([]*mys
 
 func (h *SvrHandler) HandleStmtPrepare(query string) (params int, columns int, context any, err error) {
 	params = strings.Count(query, "?")
-	return params, 0, query, nil
+	upper := strings.ToUpper(query)
+	if strings.Contains(upper, "SELECT") {
+		columns = 1
+	}
+	return params, columns, query, nil
 }
 
 func (h *SvrHandler) HandleStmtExecute(context any, query string, args []any) (*mysql.Result, error) {
@@ -305,6 +309,10 @@ func formatValue(v any) string {
 	case int64:
 		return fmt.Sprintf("%d", val)
 	case int:
+		return fmt.Sprintf("%d", val)
+	case uint32:
+		return fmt.Sprintf("%d", val)
+	case uint64:
 		return fmt.Sprintf("%d", val)
 	case float64:
 		return fmt.Sprintf("%f", val)

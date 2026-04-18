@@ -38,3 +38,14 @@ func (lc *lockChain) findAndPop(pageID int64) *pnode {
 	}
 	return nil
 }
+
+// find looks for the node with the given pageID in the chain.
+// Returns the node if found (still locked), nil otherwise.
+func (lc *lockChain) find(pageID int64) *pnode {
+	for i := len(lc.nodes) - 1; i >= 0; i-- {
+		if lc.nodes[i].pageID == pageID {
+			return lc.nodes[i]
+		}
+	}
+	return nil
+}

@@ -12,17 +12,18 @@ const nilPage int64 = -1
 // pnode is the persistent counterpart of the in-memory node.
 // Pointers (children, next, parent) are replaced by page IDs.
 type pnode struct {
-	mu       sync.RWMutex // node-level latch
-	pageID   int64
-	isLeaf   bool
-	keys     [][]byte
-	values   [][]byte // leaf only
-	indices  []int
-	children []int64  // page IDs, internal only
-	next     int64    // leaf linked-list pointer
-	parent   int64
-	dirty    bool
-	bloom    *BloomFilter // per-leaf bloom filter, nil for internal nodes
+	mu            sync.RWMutex // node-level latch
+	pageID        int64
+	isLeaf        bool
+	keys          [][]byte
+	values        [][]byte // leaf only
+	indices       []int
+	children      []int64 // page IDs, internal only
+	next          int64   // leaf linked-list pointer
+	parent        int64
+	dirty         bool
+	bloom         *BloomFilter // per-leaf bloom filter, nil for internal nodes
+	overflowPages []int64      // overflow page IDs associated with this node
 }
 
 func (n *pnode) numKeys() int       { return len(n.indices) }
@@ -107,6 +108,17 @@ func (t *PersistentBPTree) Close() error {
 	rootID := atomic.LoadInt64(&t.rootID)
 	t.pager.WriteHeader(rootID, t.order, t.formatVersion)
 	return t.pager.Close()
+}
+
+func (t *PersistentBPTree) Sync() error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	t.cache.Flush()
+	rootID := atomic.LoadInt64(&t.rootID)
+	if err := t.pager.WriteHeader(rootID, t.order, t.formatVersion); err != nil {
+		return err
+	}
+	return t.pager.Sync()
 }
 
 // ---------- helpers ----------
@@ -641,7 +653,11 @@ func (t *PersistentBPTree) splitLeafLocked(leaf *pnode, chain *lockChain) error 
 	}
 
 	upKey := right.keyAt(0)
-	return t.insertIntoParentLocked(leaf, upKey, right, chain)
+	if err := t.insertIntoParentLocked(leaf, upKey, right, chain); err != nil {
+		right.dirty = false
+		return err
+	}
+	return nil
 }
 
 func (t *PersistentBPTree) insertIntoParentLocked(left *pnode, key []byte, right *pnode, chain *lockChain) error {
@@ -651,6 +667,7 @@ func (t *PersistentBPTree) insertIntoParentLocked(left *pnode, key []byte, right
 		if err != nil {
 			left.mu.Unlock()
 			t.unpin(left.pageID)
+			right.dirty = false
 			right.mu.Unlock()
 			t.unpin(right.pageID)
 			chain.releaseAll(t)
@@ -686,6 +703,7 @@ func (t *PersistentBPTree) insertIntoParentLocked(left *pnode, key []byte, right
 		if err != nil {
 			left.mu.Unlock()
 			t.unpin(left.pageID)
+			right.dirty = false
 			right.mu.Unlock()
 			t.unpin(right.pageID)
 			chain.releaseAll(t)
@@ -715,7 +733,11 @@ func (t *PersistentBPTree) insertIntoParentLocked(left *pnode, key []byte, right
 	t.unpin(right.pageID)
 
 	if parent.numKeys() > t.maxKeys() {
-		return t.splitInternalLocked(parent, chain)
+		if err := t.splitInternalLocked(parent, chain); err != nil {
+			right.dirty = false
+			return err
+		}
+		return nil
 	}
 
 	parent.mu.Unlock()
@@ -767,20 +789,29 @@ func (t *PersistentBPTree) splitInternalLocked(n *pnode, chain *lockChain) error
 	right.parent = n.parent
 
 	for _, cid := range rChildren {
-		child, err := t.loadAndPin(cid)
-		if err != nil {
-			right.mu.Unlock()
-			t.unpin(right.pageID)
-			n.mu.Unlock()
-			t.unpin(n.pageID)
-			chain.releaseAll(t)
-			return err
+		// Check if this child is already locked in the chain
+		childNode := chain.find(cid)
+		if childNode != nil {
+			// Already locked, just update parent
+			childNode.parent = right.pageID
+			childNode.dirty = true
+		} else {
+			child, err := t.loadAndPin(cid)
+			if err != nil {
+				right.dirty = false
+				right.mu.Unlock()
+				t.unpin(right.pageID)
+				n.mu.Unlock()
+				t.unpin(n.pageID)
+				chain.releaseAll(t)
+				return err
+			}
+			child.mu.Lock()
+			child.parent = right.pageID
+			child.dirty = true
+			child.mu.Unlock()
+			t.unpin(cid)
 		}
-		child.mu.Lock()
-		child.parent = right.pageID
-		child.dirty = true
-		child.mu.Unlock()
-		t.unpin(cid)
 	}
 
 	n.keys = lKeys
@@ -962,12 +993,12 @@ func (t *PersistentBPTree) mergeLeavesLocked(left, right, p *pnode, ci int, chai
 
 	right.mu.Unlock()
 	t.unpin(right.pageID)
-	// Unlock left before recursive underflow handling to avoid deadlock:
-	// the recursive call may need to lock left (as a child of the node being merged).
+	// Unlock left but keep it pinned to prevent eviction. If left becomes
+	// the new root (p has 0 keys), we need to re-lock it safely.
 	left.mu.Unlock()
-	t.unpin(left.pageID)
 
 	if p.parent != nilPage && p.numKeys() < t.minKeys() {
+		t.unpin(left.pageID)
 		t.handleUnderflowLocked(p, chain)
 		return
 	}
@@ -978,6 +1009,7 @@ func (t *PersistentBPTree) mergeLeavesLocked(left, right, p *pnode, ci int, chai
 		left.dirty = true
 		left.mu.Unlock()
 	}
+	t.unpin(left.pageID)
 	p.mu.Unlock()
 	t.unpin(p.pageID)
 }
@@ -1081,11 +1113,12 @@ func (t *PersistentBPTree) mergeInternalLocked(left, right, p *pnode, ci int, ch
 
 	right.mu.Unlock()
 	t.unpin(right.pageID)
-	// Unlock left before recursive underflow handling to avoid deadlock.
+	// Unlock left but keep it pinned to prevent eviction. If left becomes
+	// the new root (p has 0 keys), we need to re-lock it safely.
 	left.mu.Unlock()
-	t.unpin(left.pageID)
 
 	if p.parent != nilPage && p.numKeys() < t.minKeys() {
+		t.unpin(left.pageID)
 		t.handleUnderflowLocked(p, chain)
 		return
 	}
@@ -1096,6 +1129,7 @@ func (t *PersistentBPTree) mergeInternalLocked(left, right, p *pnode, ci int, ch
 		left.dirty = true
 		left.mu.Unlock()
 	}
+	t.unpin(left.pageID)
 	p.mu.Unlock()
 	t.unpin(p.pageID)
 }
@@ -1388,4 +1422,3 @@ func deserializeNode(pageID int64, data []byte, formatVersion uint32) *pnode {
 		bloom:    bloom,
 	}
 }
-

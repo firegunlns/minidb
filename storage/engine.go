@@ -312,3 +312,23 @@ func (e *StorageEngine) ScanAll(treeKey string, start, end []byte, fn func(pk, r
 		}
 	}
 }
+
+func (e *StorageEngine) SyncTree(treeKey string) error {
+	tree := e.getTree(treeKey)
+	if tree == nil {
+		return fmt.Errorf("tree %q not open", treeKey)
+	}
+	return tree.Sync()
+}
+
+func (e *StorageEngine) SyncAll() {
+	e.mu.RLock()
+	trees := make([]*bptree.PersistentBPTree, 0, len(e.trees))
+	for _, tree := range e.trees {
+		trees = append(trees, tree)
+	}
+	e.mu.RUnlock()
+	for _, tree := range trees {
+		tree.Sync()
+	}
+}

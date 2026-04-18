@@ -176,6 +176,7 @@ func (c *Catalog) DropTable(db, name string) error {
 	key := tableKeyPrefix(db, name)
 	c.tblTree.Delete(key)
 	delete(c.cache, db+"."+name)
+	c.tblTree.Sync()
 	return nil
 }
 
@@ -188,6 +189,7 @@ func (c *Catalog) UpdateTable(db, name string, td *TableDef) error {
 		return err
 	}
 	c.cache[db+"."+name] = td
+	c.tblTree.Sync()
 	return nil
 }
 
@@ -207,6 +209,7 @@ func (c *Catalog) NextAutoInc(db, table, col string) (int64, error) {
 	if err := c.incTree.Insert(key, buf); err != nil {
 		return 0, err
 	}
+	c.incTree.Sync()
 	return cur, nil
 }
 

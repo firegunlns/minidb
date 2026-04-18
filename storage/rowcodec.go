@@ -203,6 +203,10 @@ func CoerceValue(col ColumnDef, val any) (any, error) {
 			return int32(v), nil
 		case int64:
 			return int32(v), nil
+		case uint32:
+			return int32(v), nil
+		case uint64:
+			return int32(v), nil
 		case float64:
 			return int32(v), nil
 		case string:
@@ -216,6 +220,10 @@ func CoerceValue(col ColumnDef, val any) (any, error) {
 		case int:
 			return int64(v), nil
 		case int32:
+			return int64(v), nil
+		case uint32:
+			return int64(v), nil
+		case uint64:
 			return int64(v), nil
 		case float64:
 			return int64(v), nil

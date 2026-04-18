@@ -2,11 +2,13 @@ package protocol
 
 import (
 	"fmt"
-	"log"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
+
+	"lns.com/minidb/sql"
 )
 
 // rewriteSQL transforms BenchmarkSQL queries into simpler forms our engine can handle.
@@ -50,6 +52,19 @@ func needsSpecialHandling(query string) bool {
 	return false
 }
 
+// parseVal attempts to parse a string as an integer, falling back to a trimmed string.
+func parseVal(s string) any {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "'\" ")
+	if s == "" {
+		return s
+	}
+	if intVal, err := strconv.Atoi(s); err == nil {
+		return int64(intVal)
+	}
+	return s
+}
+
 // handleSpecialQuery handles queries that can't be processed by the SQL engine.
 func (h *SvrHandler) handleSpecialQuery(query string, args []any) (*mysql.Result, error) {
 	upper := strings.ToUpper(strings.TrimSpace(query))
@@ -74,38 +89,36 @@ func (h *SvrHandler) handleJoinQuery(query string, args []any) (*mysql.Result, e
 
 	// Customer + Warehouse JOIN in New-Order.
 	if strings.Contains(upper, "BMSQL_CUSTOMER") && strings.Contains(upper, "BMSQL_WAREHOUSE") {
-		log.Printf("JOIN args=%v query=%s", args, query[:min(len(query), 200)])
 		whereVals := extractWhereValues(query, args)
-		log.Printf("JOIN whereVals=%v", whereVals)
 		if len(whereVals) >= 3 {
 			cWID := whereVals[0]
 			cDID := whereVals[1]
 			cID := whereVals[2]
 
 			custQ := fmt.Sprintf("SELECT c_discount, c_last, c_credit FROM bmsql_customer WHERE c_w_id = %v AND c_d_id = %v AND c_id = %v", cWID, cDID, cID)
-			custResult, err := h.execDirect(custQ)
+			rawResult, err := h.exec.Execute(custQ)
 			if err != nil {
 				return nil, err
 			}
-			if custResult == nil || !custResult.HasResultset() || len(custResult.Values) == 0 {
+			sr, ok := rawResult.(*sql.SelectResult)
+			if !ok || len(sr.Rows) == 0 {
 				return nil, fmt.Errorf("customer not found")
 			}
 
 			whQ := fmt.Sprintf("SELECT w_tax FROM bmsql_warehouse WHERE w_id = %v", cWID)
-			whResult, err := h.execDirect(whQ)
-			if err != nil {
-				return nil, err
-			}
-
+			whRaw, err := h.exec.Execute(whQ)
 			var wTax any = "0.0000"
-			if whResult != nil && whResult.HasResultset() && len(whResult.Values) > 0 {
-				wTax = whResult.Values[0][0]
+			if err == nil {
+				if whSR, ok := whRaw.(*sql.SelectResult); ok && len(whSR.Rows) > 0 {
+					wTax = whSR.Rows[0][0]
+				}
 			}
 
-			custRow := custResult.Values[0]
+			row := sr.Rows[0]
+			// Build result columns: c_discount, c_last, c_credit, w_tax
 			rs, _ := mysql.BuildSimpleTextResultset(
 				[]string{"c_discount", "c_last", "c_credit", "w_tax"},
-				[][]any{{custRow[0], custRow[1], custRow[2], wTax}},
+				[][]any{{row[0], row[1], row[2], wTax}},
 			)
 			return mysql.NewResult(rs), nil
 		}
@@ -132,6 +145,15 @@ func (h *SvrHandler) handleTupleIn(query string, args []any) (*mysql.Result, err
 	}
 	if strings.Contains(upper, "UPDATE") && strings.Contains(upper, "BMSQL_ORDER_LINE") {
 		return h.handleBatchUpdateOrderLine(query, args)
+	}
+	if strings.Contains(upper, "SELECT") && strings.Contains(upper, "BMSQL_OORDER") {
+		return h.handleSelectOOrderTupleIn(query, args)
+	}
+	if strings.Contains(upper, "SELECT") && strings.Contains(upper, "BMSQL_STOCK") {
+		return h.handleSelectStockTupleIn(query, args)
+	}
+	if strings.Contains(upper, "SELECT") && strings.Contains(upper, "BMSQL_ORDER_LINE") {
+		return h.handleSelectOrderLineTupleIn(query, args)
 	}
 
 	return mysql.NewResult(nil), nil
@@ -200,6 +222,137 @@ func (h *SvrHandler) handleBatchUpdateOrderLine(query string, args []any) (*mysq
 	return res, nil
 }
 
+// handleSelectOOrderTupleIn handles:
+//
+//	SELECT o_c_id, o_d_id FROM bmsql_oorder
+//	WHERE (o_w_id, o_d_id, o_id) IN ((?,?,?),(?,?,?),...)
+func (h *SvrHandler) handleSelectOOrderTupleIn(query string, args []any) (*mysql.Result, error) {
+	if len(args) == 0 {
+		args = extractTupleInValues(query)
+	}
+	tupleSize := 3
+	var rows [][]any
+	for i := 0; i+tupleSize <= len(args); i += tupleSize {
+		selQ := fmt.Sprintf(
+			"SELECT o_c_id, o_d_id FROM bmsql_oorder WHERE o_w_id = %v AND o_d_id = %v AND o_id = %v",
+			args[i], args[i+1], args[i+2])
+		rawResult, err := h.exec.Execute(selQ)
+		if err != nil {
+			continue
+		}
+		if sr, ok := rawResult.(*sql.SelectResult); ok {
+			for _, row := range sr.Rows {
+				anyRow := make([]any, len(row))
+				for j, v := range row {
+					anyRow[j] = v
+				}
+				rows = append(rows, anyRow)
+			}
+		}
+	}
+	rs, _ := mysql.BuildSimpleTextResultset(
+		[]string{"o_c_id", "o_d_id"}, rows)
+	return mysql.NewResult(rs), nil
+}
+
+// handleSelectStockTupleIn handles:
+//
+//	SELECT s_i_id, s_w_id, s_quantity, s_data,
+//	       s_dist_01..s_dist_10
+//	FROM bmsql_stock
+//	WHERE (s_w_id, s_i_id) IN ((?,?),(?,?),...)
+func (h *SvrHandler) handleSelectStockTupleIn(query string, args []any) (*mysql.Result, error) {
+	if len(args) == 0 {
+		args = extractTupleInValues(query)
+	}
+	tupleSize := 2
+	stockCols := []string{
+		"s_i_id", "s_w_id", "s_quantity", "s_data",
+		"s_dist_01", "s_dist_02", "s_dist_03", "s_dist_04",
+		"s_dist_05", "s_dist_06", "s_dist_07", "s_dist_08",
+		"s_dist_09", "s_dist_10",
+	}
+	var rows [][]any
+	for i := 0; i+tupleSize <= len(args); i += tupleSize {
+		selQ := fmt.Sprintf(
+			"SELECT s_i_id, s_w_id, s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 FROM bmsql_stock WHERE s_w_id = %v AND s_i_id = %v",
+			args[i], args[i+1])
+		rawResult, err := h.exec.Execute(selQ)
+		if err != nil {
+			continue
+		}
+		if sr, ok := rawResult.(*sql.SelectResult); ok {
+			for _, row := range sr.Rows {
+				anyRow := make([]any, len(row))
+				for j, v := range row {
+					anyRow[j] = v
+				}
+				rows = append(rows, anyRow)
+			}
+		}
+	}
+	rs, _ := mysql.BuildSimpleTextResultset(stockCols, rows)
+	return mysql.NewResult(rs), nil
+}
+
+// handleSelectOrderLineTupleIn handles:
+//
+//	SELECT sum(ol_amount) AS sum_ol_amount, ol_d_id
+//	FROM bmsql_order_line
+//	WHERE (ol_w_id, ol_d_id, ol_o_id) IN ((?,?,?),...)
+//	GROUP BY ol_d_id
+func (h *SvrHandler) handleSelectOrderLineTupleIn(query string, args []any) (*mysql.Result, error) {
+	if len(args) == 0 {
+		args = extractTupleInValues(query)
+	}
+	tupleSize := 3
+
+	// Collect (ol_amount, ol_d_id) per row, then group by ol_d_id and sum.
+	sums := make(map[int32]float64) // ol_d_id -> sum of ol_amount
+	for i := 0; i+tupleSize <= len(args); i += tupleSize {
+		selQ := fmt.Sprintf(
+			"SELECT ol_amount, ol_d_id FROM bmsql_order_line WHERE ol_w_id = %v AND ol_d_id = %v AND ol_o_id = %v",
+			args[i], args[i+1], args[i+2])
+		rawResult, err := h.exec.Execute(selQ)
+		if err != nil {
+			continue
+		}
+		if sr, ok := rawResult.(*sql.SelectResult); ok {
+			for _, row := range sr.Rows {
+				if len(row) >= 2 {
+					var dID int32
+					switch v := row[1].(type) {
+					case int32:
+						dID = v
+					case int64:
+						dID = int32(v)
+					}
+					var amount float64
+					switch v := row[0].(type) {
+					case float64:
+						amount = v
+					case string:
+						fmt.Sscanf(v, "%f", &amount)
+					case int32:
+						amount = float64(v)
+					case int64:
+						amount = float64(v)
+					}
+					sums[dID] += amount
+				}
+			}
+		}
+	}
+
+	var rows [][]any
+	for dID, sum := range sums {
+		rows = append(rows, []any{sum, dID})
+	}
+	rs, _ := mysql.BuildSimpleTextResultset(
+		[]string{"sum_ol_amount", "ol_d_id"}, rows)
+	return mysql.NewResult(rs), nil
+}
+
 // execDirect executes a query directly through the executor (bypasses rewrite/special-handling).
 func (h *SvrHandler) execDirect(query string) (*mysql.Result, error) {
 	result, err := h.exec.Execute(query)
@@ -233,12 +386,7 @@ func extractWhereValues(query string, args []any) []any {
 		if valStr == "" {
 			continue
 		}
-		var intVal int
-		if _, err := fmt.Sscanf(valStr, "%d", &intVal); err == nil {
-			vals = append(vals, int64(intVal))
-		} else {
-			vals = append(vals, valStr)
-		}
+		vals = append(vals, parseVal(valStr))
 	}
 	return vals
 }
@@ -271,13 +419,7 @@ func extractTupleInValues(query string) []any {
 			if depth == 2 {
 				vals := strings.Split(current.String(), ",")
 				for _, v := range vals {
-					v = strings.TrimSpace(v)
-					var intVal int
-					if _, err := fmt.Sscanf(v, "%d", &intVal); err == nil {
-						args = append(args, int64(intVal))
-					} else {
-						args = append(args, strings.Trim(v, "'\" "))
-					}
+					args = append(args, parseVal(v))
 				}
 			}
 			depth--
@@ -308,12 +450,7 @@ func extractSetAndTupleValues(query string) []any {
 	setVal = strings.Trim(setVal, "'\" ")
 
 	var args []any
-	var intVal int
-	if _, err := fmt.Sscanf(setVal, "%d", &intVal); err == nil {
-		args = append(args, int64(intVal))
-	} else {
-		args = append(args, setVal)
-	}
+	args = append(args, parseVal(setVal))
 
 	tupleVals := extractTupleInValues(query)
 	args = append(args, tupleVals...)
