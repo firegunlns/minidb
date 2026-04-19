@@ -47,6 +47,10 @@ func OpenEngine(dataDir string, order, cacheSize int) (*StorageEngine, error) {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".db") {
 			continue
 		}
+		// Skip catalog files — they are managed by the catalog package.
+		if strings.HasPrefix(ent.Name(), "__catalog_") {
+			continue
+		}
 		treeKey := ent.Name()
 		if _, exists := e.trees[treeKey]; !exists {
 			path := filepath.Join(dataDir, treeKey)

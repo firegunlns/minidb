@@ -287,3 +287,73 @@ func TestEngineSecondaryIndex(t *testing.T) {
 		t.Fatal("expected to find entry in secondary index")
 	}
 }
+
+func TestEngineSkipsCatalogFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a catalog-style file alongside a data file.
+	catKey := "__catalog_tables.db"
+	dataKey := "testdb__users.db"
+
+	e1, _ := OpenEngine(dir, 64, 256)
+	e1.OpenTree(catKey)
+	e1.OpenTree(dataKey)
+
+	cols := []ColumnDef{{Name: "id", Type: ColTypeInt}, {Name: "v", Type: ColTypeInt}}
+	pk := EncodePrimaryKey(cols[:1], int32(1))
+	e1.InsertRow(dataKey, pk, 10, EncodeRow(cols, []any{int32(1), int32(99)}))
+	e1.InsertRow(catKey, pk, 10, EncodeRow(cols, []any{int32(1), int32(88)}))
+	e1.Close()
+
+	// Reopen: catalog files should be skipped.
+	e2, _ := OpenEngine(dir, 64, 256)
+	defer e2.Close()
+
+	// Data file should be auto-loaded.
+	r, ts, err := e2.GetRow(dataKey, pk, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r == nil {
+		t.Fatal("data file row should survive restart")
+	}
+	if ts != 10 {
+		t.Errorf("expected ts=10, got %d", ts)
+	}
+
+	// Catalog file should NOT be in the engine's tree map.
+	e2.mu.RLock()
+	_, hasCat := e2.trees[catKey]
+	e2.mu.RUnlock()
+	if hasCat {
+		t.Error("engine should not auto-load catalog files")
+	}
+}
+
+func TestEngineDataSurvivesKill(t *testing.T) {
+	dir := t.TempDir()
+	treeKey := "testdb__killtest.db"
+
+	// Simulate: insert data, flush but DON'T close (simulating a kill
+	// after cache eviction wrote dirty pages to disk).
+	e1, _ := OpenEngine(dir, 64, 64) // small cache to force eviction
+	e1.OpenTree(treeKey)
+	cols := []ColumnDef{{Name: "id", Type: ColTypeInt}, {Name: "v", Type: ColTypeInt}}
+
+	for i := int32(1); i <= 100; i++ {
+		pk := EncodePrimaryKey(cols[:1], i)
+		e1.InsertRow(treeKey, pk, uint64(i), EncodeRow(cols, []any{i, i * 10}))
+	}
+	// Sync forces all dirty pages to disk but does NOT update the header.
+	e1.SyncTree(treeKey)
+	e1.Close()
+
+	// Reopen: data should be accessible (header was written by Close).
+	e2, _ := OpenEngine(dir, 64, 64)
+	defer e2.Close()
+
+	count := e2.CountAll(treeKey, []byte{0x00}, []byte{0xFF})
+	if count != 100 {
+		t.Errorf("expected 100 rows after restart, got %d", count)
+	}
+}

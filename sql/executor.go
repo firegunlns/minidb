@@ -1717,33 +1717,156 @@ func (e *Executor) evalUnaryOp(op string, operand any) any {
 
 // extractPKRange tries to extract a PK range from a WHERE clause.
 // Returns nil start/end if it can't optimize.
+// Supports equality conditions on consecutive PK columns, plus one
+// range condition (>=, >, <=, <, BETWEEN) on the next PK column.
 func (e *Executor) extractPKRange(td *catalog.TableDef, where Expr) ([]byte, []byte) {
 	// Collect all PK column equalities from the WHERE clause.
 	eqMap := e.collectEqualities(where)
 
 	// Build a prefix range from consecutive PK columns.
 	var prefix []byte
-	for _, colIdx := range td.PKCols {
+	rangeStartIdx := 0
+	for i, colIdx := range td.PKCols {
 		col := td.Columns[colIdx]
 		val, ok := eqMap[col.Name]
 		if !ok {
+			rangeStartIdx = i
 			break
 		}
 		coerced, err := storage.CoerceValue(col, val)
 		if err != nil {
+			rangeStartIdx = i
 			break
 		}
 		prefix = append(prefix, storage.EncodeColumnValue(col, coerced)...)
+		rangeStartIdx = i + 1
 	}
+
 	if len(prefix) == 0 {
 		return nil, nil
 	}
 
-	// Range: [prefix, prefix + 0xFF)
-	end := make([]byte, len(prefix)+1)
-	copy(end, prefix)
-	end[len(prefix)] = 0xFF
-	return prefix, end
+	// Default range: [prefix, prefix + 0xFF]
+	start := append([]byte(nil), prefix...)
+	end := append(append([]byte(nil), prefix...), 0xFF)
+
+	// Check for range conditions on the next PK column after the equality prefix.
+	if rangeStartIdx < len(td.PKCols) {
+		col := td.Columns[td.PKCols[rangeStartIdx]]
+		lowVal, highVal, hasLow, hasHigh, lowInclusive, highInclusive := e.collectRangeBounds(where, col.Name)
+		if hasLow {
+			lowEncoded := storage.EncodeColumnValue(col, lowVal)
+			if !lowInclusive {
+				lowEncoded = encodeNextValue(lowEncoded)
+			}
+			start = append(append([]byte(nil), prefix...), lowEncoded...)
+		}
+		if hasHigh {
+			highEncoded := storage.EncodeColumnValue(col, highVal)
+			if highInclusive {
+				// Include all keys with this prefix value: append 0xFF sentinel
+				end = append(append(append([]byte(nil), prefix...), highEncoded...), 0xFF)
+			} else {
+				// Exclusive: the encoded value itself is the boundary
+				end = append(append([]byte(nil), prefix...), highEncoded...)
+			}
+		}
+	}
+
+	return start, end
+}
+
+// rangeBounds holds collected lower/upper bounds for a single column.
+type rangeBounds struct {
+	lowVal, highVal any
+	hasLow, hasHigh  bool
+	lowIncl, highIncl bool
+}
+
+// collectRangeBounds scans AND-connected conditions for range bounds on the given column.
+func (e *Executor) collectRangeBounds(expr Expr, colName string) (lowVal, highVal any, hasLow, hasHigh, lowIncl, highIncl bool) {
+	bounds := &rangeBounds{}
+	e.collectRangeBoundsInto(expr, colName, bounds)
+	return bounds.lowVal, bounds.highVal, bounds.hasLow, bounds.hasHigh, bounds.lowIncl, bounds.highIncl
+}
+
+func (e *Executor) collectRangeBoundsInto(expr Expr, colName string, b *rangeBounds) {
+	// Handle AND: recurse into both sides.
+	if bin, ok := expr.(*BinaryExpr); ok && bin.Op == "AND" {
+		e.collectRangeBoundsInto(bin.Left, colName, b)
+		e.collectRangeBoundsInto(bin.Right, colName, b)
+		return
+	}
+
+	// Handle BETWEEN col AND low AND high.
+	if bt, ok := expr.(*BetweenExpr); ok {
+		if col, ok := bt.Expr.(*ColumnRefExpr); ok && col.Name == colName {
+			low := e.extractLiteral(bt.Low)
+			high := e.extractLiteral(bt.High)
+			if low != nil && high != nil {
+				b.hasLow, b.lowVal, b.lowIncl = true, low, true
+				b.hasHigh, b.highVal, b.highIncl = true, high, true
+			}
+		}
+		return
+	}
+
+	// Handle comparison operators: col >= val, col > val, col <= val, col < val.
+	bin, ok := expr.(*BinaryExpr)
+	if !ok {
+		return
+	}
+
+	var colSide bool // true if col is on the left
+	var col *ColumnRefExpr
+	var val any
+	if c, ok := bin.Left.(*ColumnRefExpr); ok && c.Name == colName {
+		col = c
+		val = e.extractLiteral(bin.Right)
+		colSide = true
+	} else if c, ok := bin.Right.(*ColumnRefExpr); ok && c.Name == colName {
+		col = c
+		val = e.extractLiteral(bin.Left)
+		colSide = false
+	}
+	if col == nil || val == nil {
+		return
+	}
+
+	switch bin.Op {
+	case ">=":
+		if colSide {
+			b.hasLow, b.lowVal, b.lowIncl = true, val, true
+		} else {
+			b.hasHigh, b.highVal, b.highIncl = true, val, true
+		}
+	case ">":
+		if colSide {
+			b.hasLow, b.lowVal, b.lowIncl = true, val, false
+		} else {
+			b.hasHigh, b.highVal, b.highIncl = true, val, false
+		}
+	case "<=":
+		if colSide {
+			b.hasHigh, b.highVal, b.highIncl = true, val, true
+		} else {
+			b.hasLow, b.lowVal, b.lowIncl = true, val, true
+		}
+	case "<":
+		if colSide {
+			b.hasHigh, b.highVal, b.highIncl = true, val, false
+		} else {
+			b.hasLow, b.lowVal, b.lowIncl = true, val, false
+		}
+	}
+}
+
+// encodeNextValue returns the smallest byte sequence that sorts after the given value.
+// For order-preserving int encoding: increment the last byte, or append 0x00 if
+// that would overflow. For simplicity, we append a 0x00 byte to ensure we sort
+// after all keys with exactly this value.
+func encodeNextValue(encoded []byte) []byte {
+	return append(append([]byte(nil), encoded...), 0x00)
 }
 
 // collectEqualities extracts col=val pairs from AND-connected equalities.

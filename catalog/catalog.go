@@ -94,7 +94,10 @@ func (c *Catalog) CreateDatabase(name string) error {
 	if _, found := c.dbTree.Find(key); found {
 		return fmt.Errorf("database %q already exists", name)
 	}
-	return c.dbTree.Insert(key, []byte(name))
+	if err := c.dbTree.Insert(key, []byte(name)); err != nil {
+		return err
+	}
+	return c.dbTree.Sync()
 }
 
 func (c *Catalog) DropDatabase(name string) error {
@@ -146,7 +149,7 @@ func (c *Catalog) CreateTable(td *TableDef) error {
 		return err
 	}
 	c.cache[td.Database+"."+td.Name] = td
-	return nil
+	return c.tblTree.Sync()
 }
 
 func (c *Catalog) GetTable(db, name string) (*TableDef, error) {
