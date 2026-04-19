@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"lns.com/minidb/metrics"
 )
 
 const nilPage int64 = -1
@@ -163,17 +166,21 @@ func (t *PersistentBPTree) allocNode(isLeaf bool) (*pnode, error) {
 // then validates that rootID has not changed. Retries until stable.
 // Returns (nil, nil) when the tree is empty.
 func (t *PersistentBPTree) latchRootRLock() (*pnode, error) {
+	start := time.Now()
 	for {
 		rootID := atomic.LoadInt64(&t.rootID)
 		if rootID == nilPage {
+			metrics.BPTreeLatchDuration.WithLabelValues("rlock").Observe(time.Since(start).Seconds())
 			return nil, nil
 		}
 		n, err := t.loadAndPin(rootID)
 		if err != nil {
+			metrics.BPTreeLatchDuration.WithLabelValues("rlock").Observe(time.Since(start).Seconds())
 			return nil, err
 		}
 		n.mu.RLock()
 		if atomic.LoadInt64(&t.rootID) == rootID {
+			metrics.BPTreeLatchDuration.WithLabelValues("rlock").Observe(time.Since(start).Seconds())
 			return n, nil
 		}
 		n.mu.RUnlock()
@@ -183,17 +190,21 @@ func (t *PersistentBPTree) latchRootRLock() (*pnode, error) {
 
 // latchRootWLock is the write-lock variant, used after writeMu is held.
 func (t *PersistentBPTree) latchRootWLock() (*pnode, error) {
+	start := time.Now()
 	for {
 		rootID := atomic.LoadInt64(&t.rootID)
 		if rootID == nilPage {
+			metrics.BPTreeLatchDuration.WithLabelValues("wlock").Observe(time.Since(start).Seconds())
 			return nil, nil
 		}
 		n, err := t.loadAndPin(rootID)
 		if err != nil {
+			metrics.BPTreeLatchDuration.WithLabelValues("wlock").Observe(time.Since(start).Seconds())
 			return nil, err
 		}
 		n.mu.Lock()
 		if atomic.LoadInt64(&t.rootID) == rootID {
+			metrics.BPTreeLatchDuration.WithLabelValues("wlock").Observe(time.Since(start).Seconds())
 			return n, nil
 		}
 		n.mu.Unlock()
@@ -205,8 +216,11 @@ func (t *PersistentBPTree) latchRootWLock() (*pnode, error) {
 
 // Find returns the value associated with key.
 func (t *PersistentBPTree) Find(key []byte) ([]byte, bool) {
+	start := time.Now()
 	root, err := t.latchRootRLock()
 	if err != nil || root == nil {
+		metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+		metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
 		return nil, false
 	}
 
@@ -218,6 +232,8 @@ func (t *PersistentBPTree) Find(key []byte) ([]byte, bool) {
 		if err != nil {
 			cur.mu.RUnlock()
 			t.unpin(cur.pageID)
+			metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+			metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
 			return nil, false
 		}
 		child.mu.RLock()
@@ -230,6 +246,8 @@ func (t *PersistentBPTree) Find(key []byte) ([]byte, bool) {
 	if cur.bloom != nil && !cur.bloom.MayContain(key) {
 		cur.mu.RUnlock()
 		t.unpin(cur.pageID)
+		metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+		metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
 		return nil, false
 	}
 
@@ -238,15 +256,20 @@ func (t *PersistentBPTree) Find(key []byte) ([]byte, bool) {
 		val := copyBytes(cur.valAt(idx))
 		cur.mu.RUnlock()
 		t.unpin(cur.pageID)
+		metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+		metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
 		return val, true
 	}
 	cur.mu.RUnlock()
 	t.unpin(cur.pageID)
+	metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+	metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
 	return nil, false
 }
 
 // RangeScan returns all key-value pairs where start <= key <= end.
 func (t *PersistentBPTree) RangeScan(start, end []byte) []KeyValuePair {
+	scanStart := time.Now()
 	leaf := t.findLeafRLatch(start)
 
 	var results []KeyValuePair
@@ -256,6 +279,8 @@ func (t *PersistentBPTree) RangeScan(start, end []byte) []KeyValuePair {
 			if bytes.Compare(k, end) > 0 {
 				leaf.mu.RUnlock()
 				t.unpin(leaf.pageID)
+				metrics.BPTreeOpDuration.WithLabelValues("range_scan").Observe(time.Since(scanStart).Seconds())
+				metrics.BPTreeOpsTotal.WithLabelValues("range_scan").Inc()
 				return results
 			}
 			if bytes.Compare(k, start) >= 0 {
@@ -278,7 +303,113 @@ func (t *PersistentBPTree) RangeScan(start, end []byte) []KeyValuePair {
 		}
 		leaf.mu.RLock()
 	}
+	metrics.BPTreeOpDuration.WithLabelValues("range_scan").Observe(time.Since(scanStart).Seconds())
+	metrics.BPTreeOpsTotal.WithLabelValues("range_scan").Inc()
 	return results
+}
+
+// RangeScanFn calls fn for each key-value pair where start <= key <= end.
+// Key and value are direct references into the leaf page — fn must not retain
+// them after returning. If fn returns false the scan stops immediately.
+func (t *PersistentBPTree) RangeScanFn(start, end []byte, fn func(key, value []byte) bool) {
+	leaf := t.findLeafRLatch(start)
+	for leaf != nil {
+		for i := 0; i < leaf.numKeys(); i++ {
+			k := leaf.keyAt(i)
+			if bytes.Compare(k, end) > 0 {
+				leaf.mu.RUnlock()
+				t.unpin(leaf.pageID)
+				return
+			}
+			if bytes.Compare(k, start) >= 0 {
+				if !fn(k, leaf.valAt(i)) {
+					leaf.mu.RUnlock()
+					t.unpin(leaf.pageID)
+					return
+				}
+			}
+		}
+		nextID := leaf.next
+		leaf.mu.RUnlock()
+		t.unpin(leaf.pageID)
+		if nextID == nilPage {
+			break
+		}
+		var err error
+		leaf, err = t.loadAndPin(nextID)
+		if err != nil {
+			break
+		}
+		leaf.mu.RLock()
+	}
+}
+
+// CountRange counts keys in [start, end] without reading values.
+// It traverses leaf pages and counts keys without copying any value data.
+func (t *PersistentBPTree) CountRange(start, end []byte) int64 {
+	leaf := t.findLeafRLatch(start)
+
+	var count int64
+	for leaf != nil {
+		for i := 0; i < leaf.numKeys(); i++ {
+			k := leaf.keyAt(i)
+			if bytes.Compare(k, end) > 0 {
+				leaf.mu.RUnlock()
+				t.unpin(leaf.pageID)
+				return count
+			}
+			if bytes.Compare(k, start) >= 0 {
+				count++
+			}
+		}
+		nextID := leaf.next
+		leaf.mu.RUnlock()
+		t.unpin(leaf.pageID)
+		if nextID == nilPage {
+			break
+		}
+		var err error
+		leaf, err = t.loadAndPin(nextID)
+		if err != nil {
+			break
+		}
+		leaf.mu.RLock()
+	}
+	return count
+}
+
+// ScanKeys returns only the keys in [start, end] without any value data.
+// Used by MVCC layer for counting distinct PKs without the cost of copying values.
+func (t *PersistentBPTree) ScanKeys(start, end []byte) [][]byte {
+	leaf := t.findLeafRLatch(start)
+
+	var keys [][]byte
+	for leaf != nil {
+		for i := 0; i < leaf.numKeys(); i++ {
+			k := leaf.keyAt(i)
+			if bytes.Compare(k, end) > 0 {
+				leaf.mu.RUnlock()
+				t.unpin(leaf.pageID)
+				return keys
+			}
+			if bytes.Compare(k, start) >= 0 {
+				keys = append(keys, copyBytes(k))
+			}
+		}
+		nextID := leaf.next
+		leaf.mu.RUnlock()
+		t.unpin(leaf.pageID)
+		if nextID == nilPage {
+			break
+		}
+		var err error
+		leaf, err = t.loadAndPin(nextID)
+		if err != nil {
+			break
+		}
+		leaf.mu.RLock()
+	}
+	return keys
 }
 
 // Count returns the total number of keys in the tree.
@@ -345,15 +476,21 @@ func (t *PersistentBPTree) Validate() bool {
 
 // Insert associates key with value, overwriting any existing entry.
 func (t *PersistentBPTree) Insert(key, value []byte) error {
+	start := time.Now()
 	// Fast path: empty tree.
 	rootID := atomic.LoadInt64(&t.rootID)
 	if rootID == nilPage {
-		return t.insertEmpty(key, value)
+		err := t.insertEmpty(key, value)
+		metrics.BPTreeOpDuration.WithLabelValues("insert").Observe(time.Since(start).Seconds())
+		metrics.BPTreeOpsTotal.WithLabelValues("insert").Inc()
+		return err
 	}
 
 	t.writeMu.Lock()
 	err := t.insertAttempt(key, value)
 	t.writeMu.Unlock()
+	metrics.BPTreeOpDuration.WithLabelValues("insert").Observe(time.Since(start).Seconds())
+	metrics.BPTreeOpsTotal.WithLabelValues("insert").Inc()
 	return err
 }
 
@@ -431,9 +568,12 @@ func (t *PersistentBPTree) insertAttempt(key, value []byte) error {
 
 // Delete removes key from the tree.
 func (t *PersistentBPTree) Delete(key []byte) bool {
+	start := time.Now()
 	t.writeMu.Lock()
 	found := t.deleteAttempt(key)
 	t.writeMu.Unlock()
+	metrics.BPTreeOpDuration.WithLabelValues("delete").Observe(time.Since(start).Seconds())
+	metrics.BPTreeOpsTotal.WithLabelValues("delete").Inc()
 	return found
 }
 

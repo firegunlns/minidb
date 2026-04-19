@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"lns.com/minidb/metrics"
 )
 
 const (
@@ -52,9 +55,25 @@ func (w *WAL) Close() error {
 	return nil
 }
 
+// Truncate empties the WAL file. Call after all dirty pages have been flushed
+// to their respective B+ tree files so that recovery is not needed.
+func (w *WAL) Truncate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		if err := w.f.Truncate(0); err != nil {
+			return err
+		}
+		_, err := w.f.Seek(0, 0)
+		return err
+	}
+	return nil
+}
+
 // Append writes a record to the WAL and returns the allocated timestamp.
 // Note: Sync is NOT called here - callers should sync periodically if needed.
 func (w *WAL) Append(rec Record) uint64 {
+	start := time.Now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -84,6 +103,7 @@ func (w *WAL) Append(rec Record) uint64 {
 	w.f.Write(buf)
 	// Removed: w.f.Sync() - too expensive for every write
 
+	metrics.WALAppendDuration.Observe(time.Since(start).Seconds())
 	return ts
 }
 

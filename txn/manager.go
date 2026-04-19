@@ -2,7 +2,10 @@ package txn
 
 import (
 	"errors"
+	"sync"
+	"time"
 
+	"lns.com/minidb/metrics"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/wal"
 )
@@ -20,22 +23,39 @@ type Txn struct {
 
 // Manager coordinates transactions with OCC.
 type Manager struct {
-	engine *storage.StorageEngine
-	ts     *TimestampOracle
-	wal    *wal.WAL
+	engine     *storage.StorageEngine
+	ts         *TimestampOracle
+	wal        *wal.WAL
+	activeMu   sync.Mutex
+	activeTxns map[uint64]*Txn // startTS -> Txn
+	gcCounter  int
+	gcInterval int // run GC every N commits
 }
 
 func NewManager(engine *storage.StorageEngine, ts *TimestampOracle, w *wal.WAL) *Manager {
-	return &Manager{engine: engine, ts: ts, wal: w}
+	return &Manager{
+		engine:     engine,
+		ts:         ts,
+		wal:        w,
+		activeTxns: make(map[uint64]*Txn),
+		gcInterval: 100,
+	}
 }
 
 // Begin starts a new transaction with a snapshot timestamp.
 func (m *Manager) Begin() *Txn {
-	return &Txn{
+	start := time.Now()
+	txn := &Txn{
 		mgr:     m,
 		startTS: m.ts.Current(), // snapshot at current time
 		ws:      NewWorkspace(),
 	}
+	m.activeMu.Lock()
+	m.activeTxns[txn.startTS] = txn
+	m.activeMu.Unlock()
+	metrics.TxnDuration.WithLabelValues("begin").Observe(time.Since(start).Seconds())
+	metrics.ActiveTransactions.Inc()
+	return txn
 }
 
 // Get reads a row, checking the workspace first (read-your-writes),
@@ -165,13 +185,19 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 
 // Commit validates the read set, writes to WAL, and applies writes.
 func (t *Txn) Commit() error {
+	start := time.Now()
 	if t.finalized {
 		return errors.New("transaction is finalized")
 	}
 	t.finalized = true
+	metrics.ActiveTransactions.Dec()
+	t.mgr.activeMu.Lock()
+	delete(t.mgr.activeTxns, t.startTS)
+	t.mgr.activeMu.Unlock()
 
 	// Validate read set: re-read each key and check commitTS hasn't changed.
 	readSet := t.ws.ReadSet()
+	validateStart := time.Now()
 	for key, origTS := range readSet {
 		pk := t.ws.readPKs[key]
 		treeKey := wsKeyToTree(key)
@@ -180,9 +206,12 @@ func (t *Txn) Commit() error {
 			return err
 		}
 		if curTS != origTS {
+			metrics.TxnConflictsTotal.Inc()
+			metrics.TxnDuration.WithLabelValues("commit").Observe(time.Since(start).Seconds())
 			return ErrConflict
 		}
 	}
+	metrics.TxnCommitValidateDuration.Observe(time.Since(validateStart).Seconds())
 
 	// Allocate commit timestamp.
 	t.commitTS = t.mgr.ts.Next()
@@ -196,8 +225,10 @@ func (t *Txn) Commit() error {
 			rec = wal.DeleteRecord(treeKey, pk, nil)
 		} else if t.ws.IsInserted(treeKey, pk) {
 			rec = wal.InsertRecord(treeKey, pk, rowData)
+			metrics.RowsWrittenTotal.Inc()
 		} else {
 			rec = wal.UpdateRecord(treeKey, pk, nil, rowData)
+			metrics.RowsWrittenTotal.Inc()
 		}
 		rec.TxnTS = t.startTS
 		rec.CommitTS = t.commitTS
@@ -224,12 +255,63 @@ func (t *Txn) Commit() error {
 	commitRec.CommitTS = t.commitTS
 	t.mgr.wal.Append(commitRec)
 
+	metrics.TxnCommitsTotal.Inc()
+	metrics.TxnDuration.WithLabelValues("commit").Observe(time.Since(start).Seconds())
+	t.mgr.maybeRunGC()
 	return nil
 }
 
 // Rollback discards the transaction.
 func (t *Txn) Rollback() {
+	if t.finalized {
+		return
+	}
+	start := time.Now()
 	t.finalized = true
+	metrics.ActiveTransactions.Dec()
+	t.mgr.activeMu.Lock()
+	delete(t.mgr.activeTxns, t.startTS)
+	t.mgr.activeMu.Unlock()
+	metrics.TxnRollbacksTotal.Inc()
+	metrics.TxnDuration.WithLabelValues("rollback").Observe(time.Since(start).Seconds())
+}
+
+// MinActiveTS returns the minimum startTS of all currently active transactions.
+// If no transactions are active, returns the current timestamp.
+func (m *Manager) MinActiveTS() uint64 {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if len(m.activeTxns) == 0 {
+		return m.ts.Current()
+	}
+	minTS := uint64(0)
+	first := true
+	for ts := range m.activeTxns {
+		if first || ts < minTS {
+			minTS = ts
+			first = false
+		}
+	}
+	return minTS
+}
+
+func (m *Manager) maybeRunGC() {
+	m.activeMu.Lock()
+	m.gcCounter++
+	shouldRun := m.gcCounter >= m.gcInterval
+	if shouldRun {
+		m.gcCounter = 0
+	}
+	m.activeMu.Unlock()
+
+	if !shouldRun {
+		return
+	}
+	safeTS := m.MinActiveTS()
+	if safeTS == 0 {
+		return
+	}
+	m.engine.RunGC(safeTS)
 }
 
 // wsPKInRange extracts the PK bytes from a wsKey if it belongs to the given tree

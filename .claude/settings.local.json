@@ -84,7 +84,8 @@
       "Bash(tail:*)",
       "Bash(head:*)",
       "Bash(cd /Users/alan/work/learn/benchmarksql-5.0-mysql-support-opt-2.1/run && ./runBenchmark.sh props.minidb 2>&1)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(curl:*)"
     ]
   }
 }

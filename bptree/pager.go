@@ -5,6 +5,9 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"time"
+
+	"lns.com/minidb/metrics"
 )
 
 const (
@@ -131,9 +134,13 @@ func (p *Pager) Free(pageID int64) {
 
 // Read loads the data stored in the given page.
 func (p *Pager) Read(pageID int64) ([]byte, error) {
+	start := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.readPage(pageID)
+	data, err := p.readPage(pageID)
+	metrics.PagerIODuration.WithLabelValues("read").Observe(time.Since(start).Seconds())
+	metrics.PagerReadsTotal.Inc()
+	return data, err
 }
 
 func (p *Pager) readPage(pageID int64) ([]byte, error) {
@@ -155,9 +162,13 @@ func (p *Pager) readPage(pageID int64) ([]byte, error) {
 
 // Write stores data into the slot for the given page.
 func (p *Pager) Write(pageID int64, data []byte) error {
+	start := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.writePage(pageID, data)
+	err := p.writePage(pageID, data)
+	metrics.PagerIODuration.WithLabelValues("write").Observe(time.Since(start).Seconds())
+	metrics.PagerWritesTotal.Inc()
+	return err
 }
 
 func (p *Pager) writePage(pageID int64, data []byte) error {

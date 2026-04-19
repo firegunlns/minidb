@@ -10,6 +10,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"lns.com/minidb/catalog"
+	"lns.com/minidb/metrics"
 	"lns.com/minidb/sql"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
@@ -44,8 +45,10 @@ func (h *SvrHandler) UseDB(dbName string) error {
 }
 
 func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error) {
-	log.Printf("HandleQuery: %s", query[:min(len(query), 200)])
+	start := time.Now()
 	defer func() {
+		metrics.QueryDuration.Observe(time.Since(start).Seconds())
+		metrics.QueriesTotal.WithLabelValues("query").Inc()
 		if r := recover(); r != nil {
 			log.Printf("HandleQuery panic: %v", r)
 			err = fmt.Errorf("internal error: %v", r)
@@ -95,6 +98,11 @@ func (h *SvrHandler) HandleStmtPrepare(query string) (params int, columns int, c
 }
 
 func (h *SvrHandler) HandleStmtExecute(context any, query string, args []any) (*mysql.Result, error) {
+	start := time.Now()
+	defer func() {
+		metrics.QueryDuration.Observe(time.Since(start).Seconds())
+		metrics.QueriesTotal.WithLabelValues("stmt_execute").Inc()
+	}()
 	actualQuery := replacePlaceholders(query, args)
 	q := rewriteSQL(actualQuery)
 	upper := strings.ToUpper(strings.TrimSpace(q))

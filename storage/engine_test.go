@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -194,6 +195,54 @@ func TestEnginePersistence(t *testing.T) {
 	vals, _ := DecodeRow(r, cols)
 	if vals[1].(int32) != 99 {
 		t.Errorf("expected val=99, got %v", vals[1])
+	}
+}
+
+func TestEnginePersistenceWithoutWAL(t *testing.T) {
+	dir := t.TempDir()
+
+	// Phase 1: create engine, insert data, close (flushes to disk).
+	e1, _ := OpenEngine(dir, 64, 256)
+	treeKey := "testdb__walless.db"
+	e1.OpenTree(treeKey)
+	cols := []ColumnDef{{Name: "id", Type: ColTypeInt}, {Name: "v", Type: ColTypeInt}}
+
+	for i := int32(1); i <= 5; i++ {
+		pk := EncodePrimaryKey(cols[:1], i)
+		e1.InsertRow(treeKey, pk, uint64(i*10), EncodeRow(cols, []any{i, i * 100}))
+	}
+	e1.Close()
+
+	// Phase 2: simulate clean shutdown by truncating WAL, then reopen.
+	// OpenEngine should load trees from .db files directly.
+	walPath := dir + "/wal.log"
+	if f, err := os.Create(walPath); err == nil {
+		f.Close()
+	}
+
+	e2, err := OpenEngine(dir, 64, 256)
+	if err != nil {
+		t.Fatalf("OpenEngine after WAL truncation: %v", err)
+	}
+	defer e2.Close()
+
+	// Trees should be auto-loaded — no need to call OpenTree.
+	for i := int32(1); i <= 5; i++ {
+		pk := EncodePrimaryKey(cols[:1], i)
+		r, ts, err := e2.GetRow(treeKey, pk, uint64(i*10+5))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r == nil {
+			t.Fatalf("row %d should persist after WAL truncation", i)
+		}
+		if ts != uint64(i*10) {
+			t.Errorf("row %d: expected ts=%d, got %d", i, i*10, ts)
+		}
+		vals, _ := DecodeRow(r, cols)
+		if vals[1].(int32) != i*100 {
+			t.Errorf("row %d: expected val=%d, got %v", i, i*100, vals[1])
+		}
 	}
 }
 

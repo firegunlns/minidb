@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
+
+	"lns.com/minidb/metrics"
 )
 
 type LRUCache struct {
@@ -209,6 +212,7 @@ func (c *LRUCache) readNodeData(pageID int64) ([]byte, []int64, error) {
 // GetOrLoad atomically checks the cache and loads from disk if absent.
 // The returned node is pinned (pins incremented). Caller must call Unpin when done.
 func (c *LRUCache) GetOrLoad(pageID int64) (*pnode, error) {
+	start := time.Now()
 	c.mu.Lock()
 	if elem, ok := c.items[pageID]; ok {
 		c.order.MoveToFront(elem)
@@ -216,6 +220,8 @@ func (c *LRUCache) GetOrLoad(pageID int64) (*pnode, error) {
 		ent.pins++
 		node := ent.node
 		c.mu.Unlock()
+		metrics.CacheGetOrLoadDuration.WithLabelValues("true").Observe(time.Since(start).Seconds())
+		metrics.CacheHitsTotal.Inc()
 		return node, nil
 	}
 	c.mu.Unlock()
@@ -246,6 +252,8 @@ func (c *LRUCache) GetOrLoad(pageID int64) (*pnode, error) {
 	entry := &cacheEntry{pageID: pageID, node: n, pins: 1}
 	elem := c.order.PushFront(entry)
 	c.items[pageID] = elem
+	metrics.CacheGetOrLoadDuration.WithLabelValues("false").Observe(time.Since(start).Seconds())
+	metrics.CacheMissesTotal.Inc()
 	return n, nil
 }
 
@@ -299,6 +307,7 @@ func (c *LRUCache) Len() int {
 }
 
 func (c *LRUCache) evict() {
+	start := time.Now()
 	elem := c.order.Back()
 	for elem != nil {
 		ent := elem.Value.(*cacheEntry)
@@ -317,6 +326,7 @@ func (c *LRUCache) evict() {
 			}
 			ent.node.dirty = false
 		}
+		metrics.CacheEvictDuration.Observe(time.Since(start).Seconds())
 		return
 	}
 }

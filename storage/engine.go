@@ -1,11 +1,16 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"lns.com/minidb/bptree"
+	"lns.com/minidb/metrics"
 	"lns.com/minidb/wal"
 )
 
@@ -17,16 +22,43 @@ type StorageEngine struct {
 	order     int
 	cacheSize int
 	trees     map[string]*bptree.PersistentBPTree
+
+	dirtyPKs map[string]map[string]struct{} // treeKey -> set of PK strings that have old versions
+	dirtyMu  sync.Mutex
 }
 
 // OpenEngine creates or opens a StorageEngine backed by files in dataDir.
 func OpenEngine(dataDir string, order, cacheSize int) (*StorageEngine, error) {
-	return &StorageEngine{
+	e := &StorageEngine{
 		dataDir:   dataDir,
 		order:     order,
 		cacheSize: cacheSize,
 		trees:     make(map[string]*bptree.PersistentBPTree),
-	}, nil
+		dirtyPKs:  make(map[string]map[string]struct{}),
+	}
+
+	// Scan data directory for existing .db files and open them.
+	// This ensures trees are loaded even when WAL is empty (clean shutdown).
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("read data dir: %w", err)
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".db") {
+			continue
+		}
+		treeKey := ent.Name()
+		if _, exists := e.trees[treeKey]; !exists {
+			path := filepath.Join(dataDir, treeKey)
+			tree, err := bptree.OpenPersistentBPTree(path, order, cacheSize)
+			if err != nil {
+				return nil, fmt.Errorf("open tree %s: %w", treeKey, err)
+			}
+			e.trees[treeKey] = tree
+		}
+	}
+
+	return e, nil
 }
 
 // RecoverFromWAL replays committed transactions from the WAL.
@@ -112,6 +144,26 @@ func (e *StorageEngine) getTree(treeKey string) *bptree.PersistentBPTree {
 	return e.trees[treeKey]
 }
 
+// markDirty records that a PK in the given tree has produced a recyclable old version.
+func (e *StorageEngine) markDirty(treeKey string, pk string) {
+	e.dirtyMu.Lock()
+	if e.dirtyPKs[treeKey] == nil {
+		e.dirtyPKs[treeKey] = make(map[string]struct{})
+	}
+	e.dirtyPKs[treeKey][pk] = struct{}{}
+	e.dirtyMu.Unlock()
+}
+
+// readdDirty puts a PK back into the dirty set for the next GC pass.
+func (e *StorageEngine) readdDirty(treeKey string, pk string) {
+	e.dirtyMu.Lock()
+	if e.dirtyPKs[treeKey] == nil {
+		e.dirtyPKs[treeKey] = make(map[string]struct{})
+	}
+	e.dirtyPKs[treeKey][pk] = struct{}{}
+	e.dirtyMu.Unlock()
+}
+
 // --- MVCC row operations ---
 
 // InsertRow inserts a new row version at the given commit timestamp.
@@ -128,21 +180,25 @@ func (e *StorageEngine) InsertRow(treeKey string, pk []byte, commitTS uint64, ro
 // GetRow retrieves the visible version of a row at the given read timestamp.
 // Returns the row data, the commit timestamp of that version, or nil if not visible.
 func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte, uint64, error) {
+	start := time.Now()
 	tree := e.getTree(treeKey)
 	if tree == nil {
 		return nil, 0, fmt.Errorf("tree %q not open", treeKey)
 	}
-	start, end := ScanRangeForPK(pk)
-	kvs := tree.RangeScan(start, end)
+	scanStart, scanEnd := ScanRangeForPK(pk)
+	kvs := tree.RangeScan(scanStart, scanEnd)
 	for _, kv := range kvs {
 		xmin, xmax, flags, rowData, err := DecodeMVCCValue(kv.Value)
 		if err != nil {
 			continue
 		}
 		if IsVisible(xmin, xmax, flags, readTS) {
+			metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
+			metrics.RowsReadTotal.Inc()
 			return rowData, xmin, nil
 		}
 	}
+	metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
 	return nil, 0, nil
 }
 
@@ -176,7 +232,11 @@ func (e *StorageEngine) UpdateRow(treeKey string, pk []byte, commitTS uint64, ol
 	// Insert new version.
 	vkey := VersionKey(pk, commitTS)
 	mvccVal := EncodeMVCCValue(commitTS, 0, 0, oldRowData)
-	return tree.Insert(vkey, mvccVal)
+	if err := tree.Insert(vkey, mvccVal); err != nil {
+		return err
+	}
+	e.markDirty(treeKey, string(pk))
+	return nil
 }
 
 // DeleteRow marks a row as deleted by inserting a tombstone and setting xmax on the old version.
@@ -208,36 +268,36 @@ func (e *StorageEngine) DeleteRow(treeKey string, pk []byte, commitTS uint64) er
 	// Insert tombstone.
 	vkey := VersionKey(pk, commitTS)
 	mvccVal := EncodeMVCCValue(commitTS, 0, FlagDeleted, nil)
-	return tree.Insert(vkey, mvccVal)
+	if err := tree.Insert(vkey, mvccVal); err != nil {
+		return err
+	}
+	e.markDirty(treeKey, string(pk))
+	return nil
 }
 
 // ScanRange iterates over rows in [start, end) key range visible at readTS.
 // The callback receives the primary key and row data for each visible row.
 func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint64, fn func(pk, row []byte) bool) {
+	scanStart := time.Now()
 	tree := e.getTree(treeKey)
 	if tree == nil {
+		metrics.MVCCScanDuration.Observe(time.Since(scanStart).Seconds())
 		return
 	}
-	// We need to scan the raw versioned keys and filter by visibility.
-	// Expand start/end to cover all versions.
-	// start/end are raw PK ranges, so we need versioned ranges.
-	// For the start PK, the versioned start is the PK itself (with 0x00 suffix = newest).
-	// For the end PK, we need the PK + 0xFF...FF suffix.
-	scanStart := make([]byte, len(start)+8)
-	copy(scanStart, start)
-	scanEnd := make([]byte, len(end)+8)
-	copy(scanEnd, end)
-	for i := len(end); i < len(scanEnd); i++ {
-		scanEnd[i] = 0xFF
+	verScanStart := make([]byte, len(start)+8)
+	copy(verScanStart, start)
+	verScanEnd := make([]byte, len(end)+8)
+	copy(verScanEnd, end)
+	for i := len(end); i < len(verScanEnd); i++ {
+		verScanEnd[i] = 0xFF
 	}
 
-	kvs := tree.RangeScan(scanStart, scanEnd)
+	kvs := tree.RangeScan(verScanStart, verScanEnd)
 
-	// Group by PK prefix, return first visible version for each.
-	seen := make(map[string]bool)
+	var prevPK []byte
 	for _, kv := range kvs {
-		pkPrefix := string(KeyPrefix(kv.Key))
-		if seen[pkPrefix] {
+		pk := KeyPrefix(kv.Key)
+		if prevPK != nil && bytes.Equal(pk, prevPK) {
 			continue
 		}
 		xmin, xmax, flags, rowData, err := DecodeMVCCValue(kv.Value)
@@ -245,12 +305,14 @@ func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint
 			continue
 		}
 		if IsVisible(xmin, xmax, flags, readTS) {
-			seen[pkPrefix] = true
-			if !fn([]byte(pkPrefix), rowData) {
+			prevPK = append(prevPK[:0], pk...)
+			metrics.RowsReadTotal.Inc()
+			if !fn([]byte(pk), rowData) {
 				break
 			}
 		}
 	}
+	metrics.MVCCScanDuration.Observe(time.Since(scanStart).Seconds())
 }
 
 // --- Raw operations (for secondary indexes) ---
@@ -296,20 +358,221 @@ func (e *StorageEngine) ScanAll(treeKey string, start, end []byte, fn func(pk, r
 
 	kvs := tree.RangeScan(scanStart, scanEnd)
 
-	seen := make(map[string]bool)
+	// Same PK-group optimisation as ScanRange: versions of each PK are
+	// adjacent, newest first. Only decode the first version per PK.
+	var prevPK []byte
 	for _, kv := range kvs {
-		pkPrefix := string(KeyPrefix(kv.Key))
-		if seen[pkPrefix] {
+		pk := KeyPrefix(kv.Key)
+		if prevPK != nil && bytes.Equal(pk, prevPK) {
 			continue
 		}
+		prevPK = pk
 		_, _, _, rowData, err := DecodeMVCCValue(kv.Value)
 		if err != nil {
 			continue
 		}
-		seen[pkPrefix] = true
-		if !fn([]byte(pkPrefix), rowData) {
+		if !fn(pk, rowData) {
 			break
 		}
+	}
+}
+
+// CountAll counts distinct PKs in [start, end) range without decoding MVCC values.
+// Uses key-only traversal with PK dedup inline — no value copy, no key materialization.
+func (e *StorageEngine) CountAll(treeKey string, start, end []byte) int64 {
+	tree := e.getTree(treeKey)
+	if tree == nil {
+		return 0
+	}
+
+	scanStart := make([]byte, len(start)+8)
+	copy(scanStart, start)
+	scanEnd := make([]byte, len(end)+8)
+	copy(scanEnd, end)
+	for i := len(end); i < len(scanEnd); i++ {
+		scanEnd[i] = 0xFF
+	}
+
+	var count int64
+	var prevPK []byte
+	tree.RangeScanFn(scanStart, scanEnd, func(key, _ []byte) bool {
+		pk := KeyPrefix(key)
+		if prevPK != nil && bytes.Equal(pk, prevPK) {
+			return true // same PK, skip
+		}
+		prevPK = append(prevPK[:0], pk...)
+		count++
+		return true
+	})
+	return count
+}
+
+// --- Garbage collection ---
+
+type versionInfo struct {
+	key   []byte
+	xmin  uint64
+	xmax  uint64
+	flags byte
+}
+
+// VacuumTree removes stale MVCC versions from the specified tree using a full scan.
+// Deprecated: use vacuumDirtyPKs instead for targeted GC.
+func (e *StorageEngine) VacuumTree(treeKey string, safeTS uint64, limit int) (int, error) {
+	tree := e.getTree(treeKey)
+	if tree == nil {
+		return 0, nil
+	}
+
+	// Full range scan.
+	scanStart := []byte{0x00}
+	scanEnd := bytes.Repeat([]byte{0xFF}, 32)
+	kvs := tree.RangeScan(scanStart, scanEnd)
+
+	// Group by PK prefix, identify GC-eligible versions.
+	var toDelete [][]byte
+	var currentPK string
+	var versions []versionInfo
+
+	for _, kv := range kvs {
+		if len(toDelete) >= limit {
+			break
+		}
+		xmin, xmax, flags, _, err := DecodeMVCCValue(kv.Value)
+		if err != nil {
+			continue
+		}
+
+		pk := string(KeyPrefix(kv.Key))
+		if pk != currentPK {
+			if len(versions) > 0 {
+				toDelete = append(toDelete, gcEligible(versions, safeTS)...)
+			}
+			versions = versions[:0]
+			currentPK = pk
+		}
+		versions = append(versions, versionInfo{key: kv.Key, xmin: xmin, xmax: xmax, flags: flags})
+	}
+	if len(versions) > 0 && len(toDelete) < limit {
+		toDelete = append(toDelete, gcEligible(versions, safeTS)...)
+	}
+
+	removed := 0
+	for _, key := range toDelete {
+		if removed >= limit {
+			break
+		}
+		tree.Delete(key)
+		removed++
+	}
+	return removed, nil
+}
+
+// vacuumDirtyPKs performs targeted GC on only the PKs that have been marked dirty.
+// It swaps out the current dirty set, processes each PK individually, and re-adds
+// any remaining PKs if the limit is exhausted.
+func (e *StorageEngine) vacuumDirtyPKs(safeTS uint64, limit int) int {
+	e.dirtyMu.Lock()
+	dirty := e.dirtyPKs
+	e.dirtyPKs = make(map[string]map[string]struct{})
+	e.dirtyMu.Unlock()
+
+	removed := 0
+	for treeKey, pks := range dirty {
+		tree := e.getTree(treeKey)
+		if tree == nil {
+			continue
+		}
+		for pkStr := range pks {
+			if removed >= limit {
+				e.readdDirty(treeKey, pkStr)
+				continue
+			}
+			pk := []byte(pkStr)
+			start, end := ScanRangeForPK(pk)
+			kvs := tree.RangeScan(start, end)
+
+			var versions []versionInfo
+			for _, kv := range kvs {
+				xmin, xmax, flags, _, err := DecodeMVCCValue(kv.Value)
+				if err != nil {
+					continue
+				}
+				versions = append(versions, versionInfo{key: kv.Key, xmin: xmin, xmax: xmax, flags: flags})
+			}
+
+			toDelete := gcEligible(versions, safeTS)
+			for _, key := range toDelete {
+				if removed >= limit {
+					e.readdDirty(treeKey, pkStr)
+					break
+				}
+				tree.Delete(key)
+				removed++
+			}
+		}
+	}
+	return removed
+}
+
+// gcEligible returns the keys of versions that can be safely removed.
+// versions are ordered newest-first (B+ tree ordering with ^commitTS).
+func gcEligible(versions []versionInfo, safeTS uint64) [][]byte {
+	if len(versions) <= 1 {
+		return nil
+	}
+
+	var toDelete [][]byte
+	kept := 0
+
+	// Walk newest to oldest. A version is eligible if:
+	// - superseded (xmax != 0 && xmax < safeTS), or
+	// - old tombstone (flags & FlagDeleted && xmin < safeTS)
+	for i := len(versions) - 1; i >= 0; i-- {
+		v := versions[i]
+		isSuperseded := v.xmax != 0 && v.xmax < safeTS
+		isOldTombstone := v.flags&FlagDeleted != 0 && v.xmin < safeTS
+
+		remaining := len(versions) - len(toDelete) - kept
+		if remaining <= 1 {
+			// Must keep at least one version.
+			break
+		}
+
+		if isSuperseded || isOldTombstone {
+			toDelete = append(toDelete, v.key)
+		} else {
+			kept++
+		}
+	}
+	return toDelete
+}
+
+// RunGC performs garbage collection on dirty PKs only.
+func (e *StorageEngine) RunGC(safeTS uint64) {
+	start := time.Now()
+	removed := e.vacuumDirtyPKs(safeTS, 500)
+	metrics.GCDuration.Observe(time.Since(start).Seconds())
+	metrics.GCPassesTotal.Inc()
+	metrics.GCVersionsRemovedTotal.Add(float64(removed))
+}
+
+// RunFullGC repeatedly runs vacuumDirtyPKs until no more versions are removed.
+// Intended for use after WAL recovery to clean up all accumulated old versions.
+func (e *StorageEngine) RunFullGC(safeTS uint64) {
+	start := time.Now()
+	totalRemoved := 0
+	for {
+		removed := e.vacuumDirtyPKs(safeTS, 5000)
+		if removed == 0 {
+			break
+		}
+		totalRemoved += removed
+	}
+	if totalRemoved > 0 {
+		metrics.GCDuration.Observe(time.Since(start).Seconds())
+		metrics.GCPassesTotal.Inc()
+		metrics.GCVersionsRemovedTotal.Add(float64(totalRemoved))
 	}
 }
 

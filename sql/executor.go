@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"lns.com/minidb/catalog"
+	"lns.com/minidb/metrics"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
 )
@@ -55,17 +57,40 @@ func (e *Executor) Database() string {
 
 // Execute parses and executes a SQL statement.
 func (e *Executor) Execute(sql string) (any, error) {
+	parseStart := time.Now()
 	p := NewParser()
 	stmt, err := p.Parse(sql)
+	metrics.ParseDuration.Observe(time.Since(parseStart).Seconds())
 	if err != nil {
 		return nil, err
 	}
-	return e.executeStmt(stmt)
+
+	execStart := time.Now()
+	result, err := e.executeStmt(stmt)
+	metrics.ExecuteDuration.WithLabelValues(stmtLabel(stmt)).Observe(time.Since(execStart).Seconds())
+	return result, err
 }
 
 // ExecuteStmt executes a pre-parsed statement.
 func (e *Executor) ExecuteStmt(stmt Stmt) (any, error) {
 	return e.executeStmt(stmt)
+}
+
+func stmtLabel(stmt Stmt) string {
+	switch stmt.(type) {
+	case *InsertStmt:
+		return "insert"
+	case *SelectStmt:
+		return "select"
+	case *UpdateStmt:
+		return "update"
+	case *DeleteStmt:
+		return "delete"
+	case *BeginStmt, *CommitStmt, *RollbackStmt:
+		return "txn"
+	default:
+		return "ddl"
+	}
 }
 
 func (e *Executor) executeStmt(stmt Stmt) (any, error) {
@@ -632,6 +657,21 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 	if start == nil {
 		start = []byte{0x00}
 		end = []byte{0xFF}
+	}
+
+	// Fast path: SELECT COUNT(1) / COUNT(*) without WHERE.
+	if s.Where == nil && len(s.SelectExprs) == 1 {
+		var countFunc bool
+		if f, ok := s.SelectExprs[0].(*FuncCallExpr); ok && strings.ToUpper(f.Name) == "COUNT" {
+			countFunc = true
+		} else if f, ok := s.SelectExprs[0].(*AggregateFuncExpr); ok && strings.ToUpper(f.Name) == "COUNT" {
+			countFunc = true
+		}
+		if countFunc {
+			count := e.engine.CountAll(treeKey, start, end)
+			colName := "count(1)"
+			return &SelectResult{Columns: []string{colName}, Rows: [][]any{{count}}}, nil
+		}
 	}
 
 	type aggState struct {

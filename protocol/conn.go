@@ -8,6 +8,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/server"
 
 	"lns.com/minidb/catalog"
+	"lns.com/minidb/metrics"
 	"lns.com/minidb/storage"
 	"lns.com/minidb/txn"
 )
@@ -47,11 +48,13 @@ func (s *Server) Accept() error {
 	auth.AddUser("root", "")
 
 	go func() {
+		metrics.ActiveConnections.Inc()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("connection panic recovered: %v\nStack: %s", r, debug.Stack())
 			}
 			conn.Close()
+			metrics.ActiveConnections.Dec()
 		}()
 
 		// Per-connection handler — fully independent executor/txn state.
@@ -64,13 +67,11 @@ func (s *Server) Accept() error {
 			return
 		}
 
-		log.Printf("client connected from %s", conn.RemoteAddr())
 		for {
 			if err := c.HandleCommand(); err != nil {
 				break
 			}
 		}
-		log.Printf("client disconnected from %s", conn.RemoteAddr())
 	}()
 
 	return nil
