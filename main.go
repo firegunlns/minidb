@@ -132,8 +132,10 @@ func main() {
 
 	<-sigCh
 	log.Println("shutting down...")
+	// Ignore subsequent signals so shutdown can complete.
+	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 	svr.Close()
-	engine.Close() // flush all trees first
-	w.Truncate()   // data is durable, safe to truncate WAL
-	cat.Close()
+	cat.Close()   // flush catalog first (small, fast)
+	engine.Close() // flush all data trees
+	w.Truncate()  // data is durable, safe to truncate WAL
 }

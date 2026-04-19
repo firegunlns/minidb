@@ -137,6 +137,14 @@ var (
 		Name: "minidb_gc_passes_total",
 		Help: "Total number of GC passes",
 	})
+	TableRowsRead = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "minidb_table_rows_read_total",
+		Help: "Rows read per table",
+	}, []string{"table"})
+	TableScansTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "minidb_table_scans_total",
+		Help: "Number of scan operations per table",
+	}, []string{"table", "op"})
 )
 
 // --- Gauges ---
@@ -187,6 +195,8 @@ func init() {
 		RowsWrittenTotal,
 		GCVersionsRemovedTotal,
 		GCPassesTotal,
+		TableRowsRead,
+		TableScansTotal,
 		// Gauges
 		ActiveConnections,
 		CacheSize,

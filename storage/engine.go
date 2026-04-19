@@ -189,6 +189,7 @@ func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte
 	if tree == nil {
 		return nil, 0, fmt.Errorf("tree %q not open", treeKey)
 	}
+	metrics.TableScansTotal.WithLabelValues(treeKey, "get").Inc()
 	scanStart, scanEnd := ScanRangeForPK(pk)
 	kvs := tree.RangeScan(scanStart, scanEnd)
 	for _, kv := range kvs {
@@ -199,6 +200,7 @@ func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte
 		if IsVisible(xmin, xmax, flags, readTS) {
 			metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
 			metrics.RowsReadTotal.Inc()
+			metrics.TableRowsRead.WithLabelValues(treeKey).Inc()
 			return rowData, xmin, nil
 		}
 	}
@@ -288,6 +290,7 @@ func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint
 		metrics.MVCCScanDuration.Observe(time.Since(scanStart).Seconds())
 		return
 	}
+	metrics.TableScansTotal.WithLabelValues(treeKey, "scan").Inc()
 	verScanStart := make([]byte, len(start)+8)
 	copy(verScanStart, start)
 	verScanEnd := make([]byte, len(end)+8)
@@ -311,6 +314,7 @@ func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint
 		if IsVisible(xmin, xmax, flags, readTS) {
 			prevPK = append(prevPK[:0], pk...)
 			metrics.RowsReadTotal.Inc()
+			metrics.TableRowsRead.WithLabelValues(treeKey).Inc()
 			if !fn([]byte(pk), rowData) {
 				break
 			}
@@ -351,6 +355,7 @@ func (e *StorageEngine) ScanAll(treeKey string, start, end []byte, fn func(pk, r
 	if tree == nil {
 		return
 	}
+	metrics.TableScansTotal.WithLabelValues(treeKey, "scanall").Inc()
 
 	scanStart := make([]byte, len(start)+8)
 	copy(scanStart, start)
@@ -388,6 +393,7 @@ func (e *StorageEngine) CountAll(treeKey string, start, end []byte) int64 {
 	if tree == nil {
 		return 0
 	}
+	metrics.TableScansTotal.WithLabelValues(treeKey, "count").Inc()
 
 	scanStart := make([]byte, len(start)+8)
 	copy(scanStart, start)

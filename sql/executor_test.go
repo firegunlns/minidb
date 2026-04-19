@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"testing"
 
 	"lns.com/minidb/catalog"
@@ -609,5 +610,86 @@ func TestAggregateCount(t *testing.T) {
 	rows = rs.(*SelectResult)
 	if rows.Rows[0][0].(int64) != 2 {
 		t.Fatalf("expected count=2, got %v", rows.Rows[0][0])
+	}
+}
+
+// TestSelectINOnPK verifies that WHERE col IN (...) on a single-column PK
+// uses point lookups instead of a full table scan.
+func TestSelectINOnPK(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE item (i_id INT NOT NULL PRIMARY KEY, i_name VARCHAR(24), i_price DECIMAL(5,2))`)
+
+	// Insert 20 items.
+	for i := 1; i <= 20; i++ {
+		env.exec.Execute(fmt.Sprintf("INSERT INTO item (i_id, i_name, i_price) VALUES (%d, 'item_%d', '%d.00')", i, i, i*10))
+	}
+
+	// Single-value IN.
+	rs, err := env.exec.Execute("SELECT i_id, i_name FROM item WHERE i_id IN (5)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("IN (5): expected 1 row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0][0].(int32) != 5 {
+		t.Errorf("IN (5): expected i_id=5, got %v", rows.Rows[0][0])
+	}
+
+	// Multi-value IN.
+	rs, err = env.exec.Execute("SELECT i_id, i_name FROM item WHERE i_id IN (3, 7, 11)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 3 {
+		t.Fatalf("IN (3,7,11): expected 3 rows, got %d", len(rows.Rows))
+	}
+
+	// IN with non-existent value.
+	rs, err = env.exec.Execute("SELECT i_id FROM item WHERE i_id IN (99)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 0 {
+		t.Fatalf("IN (99): expected 0 rows, got %d", len(rows.Rows))
+	}
+
+	// Mixed: some exist, some don't.
+	rs, err = env.exec.Execute("SELECT i_id FROM item WHERE i_id IN (1, 99, 20)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("IN (1,99,20): expected 2 rows, got %d", len(rows.Rows))
+	}
+}
+
+// TestSelectINOnNonPKColumn verifies that IN on a non-PK column
+// falls back to a full scan (doesn't use the PK optimization).
+func TestSelectINOnNonPKColumn(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT)`)
+
+	env.exec.Execute("INSERT INTO t1 (id, val) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, val) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO t1 (id, val) VALUES (3, 10)")
+
+	rs, err := env.exec.Execute("SELECT id FROM t1 WHERE val IN (10)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("val IN (10): expected 2 rows, got %d", len(rows.Rows))
 	}
 }

@@ -612,30 +612,39 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 		}
 	}
 
-	var start, end []byte
-	if s.Where != nil {
-		start, end = e.extractPKRange(td, s.Where)
-	}
-	if start == nil {
-		start = []byte{0x00}
-		end = []byte{0xFF}
-	}
-
+	// Optimization: if WHERE is col IN (v1, v2, ...) on a single-column PK,
+	// decompose into point lookups instead of a full table scan.
 	var rows [][]any
-	pkCols := td.PrimaryKeyColumns()
+	if s.Where != nil {
+		if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
+			rows = inRows
+		}
+	}
 
-	t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
-		vals, _ := storage.DecodeRow(rowData, td.Columns)
-		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+	if rows == nil {
+		var start, end []byte
+		if s.Where != nil {
+			start, end = e.extractPKRange(td, s.Where)
+		}
+		if start == nil {
+			start = []byte{0x00}
+			end = []byte{0xFF}
+		}
+
+		pkCols := td.PrimaryKeyColumns()
+		t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
+			vals, _ := storage.DecodeRow(rowData, td.Columns)
+			if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+				return true
+			}
+			row := make([]any, len(colIndices))
+			for i, ci := range colIndices {
+				row[i] = vals[ci]
+			}
+			rows = append(rows, row)
 			return true
-		}
-		row := make([]any, len(colIndices))
-		for i, ci := range colIndices {
-			row[i] = vals[ci]
-		}
-		rows = append(rows, row)
-		return true
-	})
+		})
+	}
 
 	if len(s.OrderBy) > 0 {
 		e.sortRows(rows, colNames, s.OrderBy)
@@ -645,6 +654,65 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 	}
 
 	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: tableName}, nil
+}
+
+// tryINOnPK checks if the WHERE clause is a simple col IN (v1, v2, ...) on a
+// single-column primary key. If so, it performs point lookups for each value
+// and returns (rows, true). Otherwise returns (nil, false).
+func (e *Executor) tryINOnPK(t *txn.Txn, td *catalog.TableDef, treeKey string, where Expr, colIndices []int) ([][]any, bool) {
+	inExpr, ok := where.(*InExpr)
+	if !ok || inExpr.Not || len(inExpr.Values) == 0 {
+		return nil, false
+	}
+
+	// Check that the IN target is a column reference.
+	col, ok := inExpr.Expr.(*ColumnRefExpr)
+	if !ok {
+		return nil, false
+	}
+
+	// Must be a single-column PK and the column must be that PK.
+	if len(td.PKCols) != 1 {
+		return nil, false
+	}
+	pkColIdx := td.PKCols[0]
+	if td.Columns[pkColIdx].Name != col.Name {
+		return nil, false
+	}
+
+	pkCol := td.Columns[pkColIdx]
+
+	// Extract literal values from the IN list.
+	var vals []any
+	for _, v := range inExpr.Values {
+		lit := e.extractLiteral(v)
+		if lit == nil {
+			return nil, false
+		}
+		coerced, err := storage.CoerceValue(pkCol, lit)
+		if err != nil {
+			return nil, false
+		}
+		vals = append(vals, coerced)
+	}
+
+	// Point lookup each value.
+	var rows [][]any
+	pkCols := []storage.ColumnDef{pkCol}
+	for _, val := range vals {
+		pk := storage.EncodePrimaryKey(pkCols, val)
+		rowData, err := t.Get(treeKey, td.Columns, pk)
+		if err != nil || rowData == nil {
+			continue
+		}
+		decoded, _ := storage.DecodeRow(rowData, td.Columns)
+		row := make([]any, len(colIndices))
+		for i, ci := range colIndices {
+			row[i] = decoded[ci]
+		}
+		rows = append(rows, row)
+	}
+	return rows, true
 }
 
 func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, td *catalog.TableDef) (any, error) {
@@ -1879,6 +1947,15 @@ func (e *Executor) collectEqualities(expr Expr) map[string]any {
 func (e *Executor) collectEqualitiesInto(expr Expr, m map[string]any) {
 	binExpr, ok := expr.(*BinaryExpr)
 	if !ok {
+		// Handle single-value IN as equality: col IN (val) ≡ col = val
+		if inExpr, ok := expr.(*InExpr); ok && !inExpr.Not && len(inExpr.Values) == 1 {
+			if col, ok := inExpr.Expr.(*ColumnRefExpr); ok {
+				val := e.extractLiteral(inExpr.Values[0])
+				if col.Name != "" && val != nil {
+					m[col.Name] = val
+				}
+			}
+		}
 		return
 	}
 	if binExpr.Op == "AND" {
