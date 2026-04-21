@@ -50,6 +50,7 @@ func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error)
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
+		metrics.HandleQueryDuration.Observe(elapsed.Seconds())
 		metrics.QueryDuration.Observe(elapsed.Seconds())
 		metrics.QueriesTotal.WithLabelValues("query").Inc()
 		if elapsed > 5*time.Second {
@@ -61,6 +62,8 @@ func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error)
 		}
 	}()
 
+	// Stage 1: rewrite + routing.
+	t0 := time.Now()
 	q := rewriteSQL(query)
 	upper := strings.ToUpper(strings.TrimSpace(q))
 
@@ -82,12 +85,23 @@ func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error)
 	if needsSpecialHandling(q) {
 		return h.handleSpecialQuery(q, nil)
 	}
+	metrics.RewriteDuration.Observe(time.Since(t0).Seconds())
 
+	// Stage 2: execute (parse + plan + run).
 	res, err := h.exec.Execute(q)
 	if err != nil {
 		return nil, err
 	}
-	return convertResult(res)
+
+	// Stage 3: convert result.
+	t1 := time.Now()
+	mysqlRes, err := convertResult(res)
+	if err != nil {
+		return nil, err
+	}
+	metrics.ConvertResultDuration.Observe(time.Since(t1).Seconds())
+
+	return mysqlRes, nil
 }
 
 func (h *SvrHandler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {
@@ -106,9 +120,13 @@ func (h *SvrHandler) HandleStmtPrepare(query string) (params int, columns int, c
 func (h *SvrHandler) HandleStmtExecute(context any, query string, args []any) (*mysql.Result, error) {
 	start := time.Now()
 	defer func() {
+		metrics.HandleQueryDuration.Observe(time.Since(start).Seconds())
 		metrics.QueryDuration.Observe(time.Since(start).Seconds())
 		metrics.QueriesTotal.WithLabelValues("stmt_execute").Inc()
 	}()
+
+	// Stage 1: rewrite.
+	t0 := time.Now()
 	actualQuery := replacePlaceholders(query, args)
 	q := rewriteSQL(actualQuery)
 	upper := strings.ToUpper(strings.TrimSpace(q))
@@ -131,12 +149,23 @@ func (h *SvrHandler) HandleStmtExecute(context any, query string, args []any) (*
 	if needsSpecialHandling(q) {
 		return h.handleSpecialQuery(q, args)
 	}
+	metrics.RewriteDuration.Observe(time.Since(t0).Seconds())
 
+	// Stage 2: execute.
 	result, err := h.exec.Execute(q)
 	if err != nil {
 		return nil, err
 	}
-	return convertResult(result)
+
+	// Stage 3: convert result.
+	t1 := time.Now()
+	mysqlRes, err := convertResult(result)
+	if err != nil {
+		return nil, err
+	}
+	metrics.ConvertResultDuration.Observe(time.Since(t1).Seconds())
+
+	return mysqlRes, nil
 }
 
 func (h *SvrHandler) HandleStmtClose(context any) error {

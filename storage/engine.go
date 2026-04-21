@@ -248,9 +248,11 @@ func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte
 			if ent.rowData == nil {
 				// Deleted or tombstone
 				metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
+				metrics.MVCCGetVerCacheHitDuration.Observe(time.Since(start).Seconds())
 				return nil, 0, nil
 			}
 			metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
+			metrics.MVCCGetVerCacheHitDuration.Observe(time.Since(start).Seconds())
 			metrics.RowsReadTotal.Inc()
 			metrics.TableRowsRead.WithLabelValues(treeKey).Inc()
 			return ent.rowData, ent.commitTS, nil
@@ -261,6 +263,8 @@ func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte
 		e.verCacheStats.misses.Add(1)
 	}
 
+	// Slow path: B+ tree scan.
+	treeScanStart := time.Now()
 	tree := e.getTree(treeKey)
 	if tree == nil {
 		return nil, 0, fmt.Errorf("tree %q not open", treeKey)
@@ -286,6 +290,7 @@ func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte
 		commitTS = xmin
 		return false
 	})
+	metrics.MVCCGetTreeScanDuration.Observe(time.Since(treeScanStart).Seconds())
 	if found {
 		metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
 		metrics.RowsReadTotal.Inc()
@@ -371,30 +376,43 @@ func (e *StorageEngine) ScanRange(treeKey string, start, end []byte, readTS uint
 		verScanEnd[i] = 0xFF
 	}
 
+	var callbackDur time.Duration
 	var prevPK []byte
 	tree.RangeScanFn(verScanStart, verScanEnd, func(key, value []byte) bool {
+		t0 := time.Now()
 		pk := KeyPrefix(key)
 		if prevPK != nil && bytes.Equal(pk, prevPK) {
+			callbackDur += time.Since(t0)
 			return true // same PK, skip older versions
 		}
 		xmin, _, flags, rowData, err := DecodeMVCCValue(value)
 		if err != nil {
+			callbackDur += time.Since(t0)
 			return true
 		}
 		if xmin > readTS {
+			callbackDur += time.Since(t0)
 			return true // version created after our snapshot, skip
 		}
 		prevPK = append(prevPK[:0], pk...)
 		if flags&FlagDeleted != 0 {
+			callbackDur += time.Since(t0)
 			return true // tombstone — row is deleted, skip older versions too
 		}
 		metrics.RowsReadTotal.Inc()
 		metrics.TableRowsRead.WithLabelValues(treeKey).Inc()
 		pkCopy := make([]byte, len(pk))
 		copy(pkCopy, pk)
+		callbackDur += time.Since(t0)
 		return fn(pkCopy, rowData)
 	})
-	metrics.MVCCScanDuration.Observe(time.Since(scanStart).Seconds())
+
+	totalDur := time.Since(scanStart)
+	metrics.MVCCScanDuration.Observe(totalDur.Seconds())
+	metrics.MVCCScanCallbackDuration.Observe(callbackDur.Seconds())
+	// treeScan = total - callback (tree traversal + page loads + version skipping overhead)
+	treeScanDur := totalDur - callbackDur
+	metrics.MVCCScanTreeScanDuration.Observe(treeScanDur.Seconds())
 }
 
 // --- Raw operations (for secondary indexes) ---
@@ -640,7 +658,7 @@ func (e *StorageEngine) VacuumTree(treeKey string, safeTS uint64, limit int) (in
 		pk := string(KeyPrefix(kv.Key))
 		if pk != currentPK {
 			if len(versions) > 0 {
-				toDelete = append(toDelete, gcEligible(versions, safeTS)...)
+				toDelete = append(toDelete, gcEligible(versions, safeTS, 0)...)
 			}
 			versions = versions[:0]
 			currentPK = pk
@@ -648,7 +666,7 @@ func (e *StorageEngine) VacuumTree(treeKey string, safeTS uint64, limit int) (in
 		versions = append(versions, versionInfo{key: kv.Key, xmin: xmin, xmax: xmax, flags: flags})
 	}
 	if len(versions) > 0 && len(toDelete) < limit {
-		toDelete = append(toDelete, gcEligible(versions, safeTS)...)
+		toDelete = append(toDelete, gcEligible(versions, safeTS, 0)...)
 	}
 
 	removed := 0
@@ -663,9 +681,8 @@ func (e *StorageEngine) VacuumTree(treeKey string, safeTS uint64, limit int) (in
 }
 
 // vacuumDirtyPKs performs targeted GC on only the PKs that have been marked dirty.
-// It swaps out the current dirty set, processes each PK individually, and re-adds
-// any remaining PKs if the limit is exhausted.
-func (e *StorageEngine) vacuumDirtyPKs(safeTS uint64, limit int) int {
+// It swaps out the current dirty set and processes each PK.
+func (e *StorageEngine) vacuumDirtyPKs(safeTS uint64, safeMargin uint64) int {
 	e.dirtyMu.Lock()
 	dirty := e.dirtyPKs
 	e.dirtyPKs = make(map[string]map[string]struct{})
@@ -678,10 +695,6 @@ func (e *StorageEngine) vacuumDirtyPKs(safeTS uint64, limit int) int {
 			continue
 		}
 		for pkStr := range pks {
-			if removed >= limit {
-				e.readdDirty(treeKey, pkStr)
-				continue
-			}
 			pk := []byte(pkStr)
 			start, end := ScanRangeForPK(pk)
 			kvs := tree.RangeScan(start, end)
@@ -695,12 +708,8 @@ func (e *StorageEngine) vacuumDirtyPKs(safeTS uint64, limit int) int {
 				versions = append(versions, versionInfo{key: kv.Key, xmin: xmin, xmax: xmax, flags: flags})
 			}
 
-			toDelete := gcEligible(versions, safeTS)
+			toDelete := gcEligible(versions, safeTS, safeMargin)
 			for _, key := range toDelete {
-				if removed >= limit {
-					e.readdDirty(treeKey, pkStr)
-					break
-				}
 				tree.Delete(key)
 				removed++
 			}
@@ -720,17 +729,30 @@ func (e *StorageEngine) vacuumDirtyPKs(safeTS uint64, limit int) int {
 // A version can be removed when a newer version is visible to ALL active
 // transactions (xmin < safeTS), because no active transaction would ever
 // need to see the older version.
-func gcEligible(versions []versionInfo, safeTS uint64) [][]byte {
+//
+// safeMargin is subtracted from safeTS to provide a safety buffer against
+// B+ tree concurrent leaf splits that may cause RangeScan to miss the latest
+// version during GC. Versions newer than (safeTS - safeMargin) are never deleted.
+func gcEligible(versions []versionInfo, safeTS uint64, safeMargin uint64) [][]byte {
 	if len(versions) <= 1 {
 		return nil
 	}
 
-	// Find the first (newest) version that is universally visible.
-	// All versions after it can be removed because this version
-	// supersedes them for every active transaction.
+	// Adjusted safeTS: don't delete versions that are too recent.
+	adjustedTS := safeTS
+	if safeMargin < safeTS {
+		adjustedTS = safeTS - safeMargin
+	} else {
+		return nil // safety margin covers everything, don't delete
+	}
+
+	// Find the first (newest) version that is universally visible
+	// AND old enough to be safe (xmin < adjustedTS).
+	// All versions after it can be removed.
 	for i := 0; i < len(versions); i++ {
-		if versions[i].xmin < safeTS {
-			// This version is visible to ALL active transactions.
+		if versions[i].xmin < adjustedTS {
+			// This version is visible to ALL active transactions
+			// and old enough to survive a concurrent B+ tree split.
 			// All older versions are superseded.
 			var toDelete [][]byte
 			for j := i + 1; j < len(versions); j++ {
@@ -744,12 +766,22 @@ func gcEligible(versions []versionInfo, safeTS uint64) [][]byte {
 }
 
 // RunGC performs garbage collection on dirty PKs only.
-func (e *StorageEngine) RunGC(safeTS uint64) {
+// Called by the background GC goroutine — no limit, process all dirty PKs.
+// Returns the number of versions removed.
+func (e *StorageEngine) RunGC(safeTS uint64) int {
 	start := time.Now()
-	removed := e.vacuumDirtyPKs(safeTS, 500)
-	metrics.GCDuration.Observe(time.Since(start).Seconds())
+	// Safety margin: keep versions newer than this many timestamp ticks.
+	// This protects against B+ tree RangeScan missing the latest version
+	// due to concurrent leaf splits (the scan releases page locks between leaves).
+	const safeMargin uint64 = 500
+	removed := e.vacuumDirtyPKs(safeTS, safeMargin)
+	dur := time.Since(start)
+	metrics.GCDuration.Observe(dur.Seconds())
 	metrics.GCPassesTotal.Inc()
-	metrics.GCVersionsRemovedTotal.Add(float64(removed))
+	if removed > 0 {
+		metrics.GCVersionsRemovedTotal.Add(float64(removed))
+	}
+	return removed
 }
 
 // RunFullGC repeatedly runs vacuumDirtyPKs until no more versions are removed.
@@ -758,7 +790,7 @@ func (e *StorageEngine) RunFullGC(safeTS uint64) {
 	start := time.Now()
 	totalRemoved := 0
 	for {
-		removed := e.vacuumDirtyPKs(safeTS, 5000)
+		removed := e.vacuumDirtyPKs(safeTS, 0)
 		if removed == 0 {
 			break
 		}

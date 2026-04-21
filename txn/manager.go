@@ -134,8 +134,6 @@ type Manager struct {
 	activeMu   sync.Mutex
 	activeTxns map[uint64]*Txn // 活跃事务映射
 	rowLocks   *rowLockMgr      // 行级写锁
-	gcCounter  int
-	gcInterval int // 每N次提交运行一次GC
 
 	// flushLogAtCommit WAL刷盘策略（类似innodb_flush_log_at_trx_commit）:
 	//   0 = 异步写，不等待刷盘（最快，断电可能丢失最近事务）
@@ -145,6 +143,10 @@ type Manager struct {
 
 	// groupCommit batches concurrent Flush+Sync calls. nil when flushLogAtCommit == 0.
 	groupCommit *groupCommitter
+
+	// Background GC goroutine.
+	gcStopCh chan struct{} // signal to stop
+	gcDoneCh chan struct{} // signal that goroutine exited
 }
 
 func NewManager(engine *storage.StorageEngine, ts *TimestampOracle, w *wal.WAL, flushLogAtCommit int) *Manager {
@@ -157,13 +159,43 @@ func NewManager(engine *storage.StorageEngine, ts *TimestampOracle, w *wal.WAL, 
 		wal:              w,
 		activeTxns:       make(map[uint64]*Txn),
 		rowLocks:         newRowLockMgr(),
-		gcInterval:       100,
 		flushLogAtCommit: flushLogAtCommit,
+		gcStopCh:         make(chan struct{}),
+		gcDoneCh:         make(chan struct{}),
 	}
 	if flushLogAtCommit > 0 {
 		m.groupCommit = newGroupCommitter(w, flushLogAtCommit == 1)
 	}
+	go m.backgroundGC()
 	return m
+}
+
+// Close stops the background GC goroutine.
+func (m *Manager) Close() {
+	close(m.gcStopCh)
+	<-m.gcDoneCh
+}
+
+// backgroundGC runs GC continuously when there is work, sleeps when idle.
+func (m *Manager) backgroundGC() {
+	defer close(m.gcDoneCh)
+	for {
+		select {
+		case <-m.gcStopCh:
+			return
+		default:
+		}
+		safeTS := m.MinActiveTS()
+		if safeTS > 0 {
+			removed := m.engine.RunGC(safeTS)
+			if removed > 0 {
+				// More work to do — loop immediately.
+				continue
+			}
+		}
+		// No work done — sleep briefly before checking again.
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // Begin starts a new transaction with a snapshot timestamp.
@@ -232,8 +264,13 @@ func (t *Txn) Delete(treeKey string, cols []storage.ColumnDef, pk []byte) error 
 
 // Scan iterates over rows in a key range, merging workspace writes with engine data.
 func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, fn func(pk, row []byte) bool) {
+	scanStart := time.Now()
+	defer func() {
+		metrics.TxnScanDuration.Observe(time.Since(scanStart).Seconds())
+	}()
 
-	// Collect workspace writes in the range.
+	// Stage 1: Collect workspace writes in the range.
+	t0 := time.Now()
 	wsResults := make(map[string][]byte)
 	t.ws.mu.RLock()
 	for key, data := range t.ws.writes {
@@ -244,8 +281,10 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 		}
 	}
 	t.ws.mu.RUnlock()
+	metrics.TxnScanWSCollectDuration.Observe(time.Since(t0).Seconds())
 
-	// Scan engine and combine with workspace.
+	// Stage 2: Scan engine and combine with workspace.
+	t1 := time.Now()
 	seen := make(map[string]bool)
 	isIndex := strings.Contains(treeKey, "__idx__")
 
@@ -288,8 +327,10 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 			return true
 		})
 	}
+	metrics.TxnScanEngineScanDuration.Observe(time.Since(t1).Seconds())
 
-	// Add workspace inserts that weren't in the engine scan.
+	// Stage 3: Add workspace inserts that weren't in the engine scan.
+	t2 := time.Now()
 	for pkStr, data := range wsResults {
 		if seen[pkStr] {
 			continue
@@ -301,6 +342,7 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 			break
 		}
 	}
+	metrics.TxnScanWSMergeDuration.Observe(time.Since(t2).Seconds())
 }
 
 // Commit writes to WAL and applies writes. No OCC validation.
@@ -419,7 +461,6 @@ func (t *Txn) Commit() error {
 
 	metrics.TxnCommitsTotal.Inc()
 	t.mgr.rowLocks.unlock(writeKeys)
-	t.mgr.maybeRunGC()
 	return nil
 }
 
@@ -453,25 +494,6 @@ func (m *Manager) MinActiveTS() uint64 {
 		}
 	}
 	return minTS
-}
-
-func (m *Manager) maybeRunGC() {
-	m.activeMu.Lock()
-	m.gcCounter++
-	shouldRun := m.gcCounter >= m.gcInterval
-	if shouldRun {
-		m.gcCounter = 0
-	}
-	m.activeMu.Unlock()
-
-	if !shouldRun {
-		return
-	}
-	safeTS := m.MinActiveTS()
-	if safeTS == 0 {
-		return
-	}
-	m.engine.RunGC(safeTS)
 }
 
 // wsPKInRange extracts the PK bytes from a wsKey if it belongs to the given tree

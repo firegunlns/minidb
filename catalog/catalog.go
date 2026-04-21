@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"lns.com/minidb/bptree"
@@ -23,18 +24,21 @@ const (
 // Catalog 数据库目录
 // 存储所有数据库和表的元数据
 type Catalog struct {
-	mu      sync.RWMutex
-	dataDir string
-	dbTree  *bptree.PersistentBPTree // 数据库树
-	tblTree *bptree.PersistentBPTree // 表树
-	incTree *bptree.PersistentBPTree // 自增序列树
-	cache   map[string]*TableDef     // 表定义缓存 "db.table" -> TableDef
+	mu       sync.RWMutex            // 保护 dbTree/tblTree/cache
+	incMu    sync.Mutex              // 独立锁，保护自增序列
+	dataDir  string
+	dbTree   *bptree.PersistentBPTree // 数据库树
+	tblTree  *bptree.PersistentBPTree // 表树
+	incTree  *bptree.PersistentBPTree // 自增序列树（仅 Close 时持久化）
+	cache    map[string]*TableDef     // 表定义缓存 "db.table" -> TableDef
+	incCache map[string]int64         // 自增序列内存缓存 "db\x00table\x00col" -> 当前值
 }
 
 func Open(dataDir string) (*Catalog, error) {
 	c := &Catalog{
-		dataDir: dataDir,
-		cache:   make(map[string]*TableDef),
+		dataDir:  dataDir,
+		cache:    make(map[string]*TableDef),
+		incCache: make(map[string]int64),
 	}
 
 	var err error
@@ -54,12 +58,18 @@ func Open(dataDir string) (*Catalog, error) {
 	// Load all tables into cache.
 	c.loadCache()
 
+	// Load all auto-inc values into memory.
+	c.loadIncCache()
+
 	return c, nil
 }
 
 func (c *Catalog) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.incMu.Lock()
+	defer c.incMu.Unlock()
+	c.flushIncCache()
 	c.dbTree.Close()
 	c.tblTree.Close()
 	c.incTree.Close()
@@ -202,22 +212,42 @@ func (c *Catalog) UpdateTable(db, name string, td *TableDef) error {
 
 // --- Auto-increment ---
 
-func (c *Catalog) NextAutoInc(db, table, col string) (int64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	key := []byte("autoinc\x00" + db + "\x00" + table + "\x00" + col)
-	var cur int64
-	if val, found := c.incTree.Find(key); found {
-		cur = int64(binary.BigEndian.Uint64(val))
+// autoIncKey returns the in-memory cache key for an auto-inc counter.
+func autoIncKey(db, table, col string) string {
+	return db + "\x00" + table + "\x00" + col
+}
+
+func (c *Catalog) loadIncCache() {
+	kvs := c.incTree.RangeScan([]byte{0x00}, []byte{0xFF})
+	for _, kv := range kvs {
+		// Disk key: "autoinc\x00" + db + "\x00" + table + "\x00" + col
+		parts := strings.SplitN(string(kv.Key), "\x00", 4)
+		if len(parts) == 4 {
+			memKey := parts[1] + "\x00" + parts[2] + "\x00" + parts[3]
+			c.incCache[memKey] = int64(binary.BigEndian.Uint64(kv.Value))
+		}
 	}
-	cur++
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(cur))
-	if err := c.incTree.Insert(key, buf); err != nil {
-		return 0, err
+}
+
+func (c *Catalog) NextAutoInc(db, table, col string) (int64, error) {
+	key := autoIncKey(db, table, col)
+	c.incMu.Lock()
+	c.incCache[key]++
+	val := c.incCache[key]
+	c.incMu.Unlock()
+	return val, nil
+}
+
+// flushIncCache writes all in-memory auto-inc counters to the incTree.
+func (c *Catalog) flushIncCache() {
+	for memKey, val := range c.incCache {
+		parts := strings.SplitN(memKey, "\x00", 3)
+		diskKey := []byte("autoinc\x00" + parts[0] + "\x00" + parts[1] + "\x00" + parts[2])
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(val))
+		c.incTree.Insert(diskKey, buf)
 	}
 	c.incTree.Sync()
-	return cur, nil
 }
 
 // --- Serialization ---

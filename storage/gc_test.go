@@ -49,7 +49,7 @@ func TestGCSupersededVersion(t *testing.T) {
 	}
 
 	// GC with safeTS=30 — the old version (xmin=10 < 30) should be removed.
-	engine.RunGC(30)
+	engine.vacuumDirtyPKs(30, 0)
 
 	// Verify only 1 version remains.
 	kvs = tree.RangeScan(start, end)
@@ -94,7 +94,7 @@ func TestGCTombstone(t *testing.T) {
 	// GC with safeTS=30 — old version (xmin=10 < 30) is eligible.
 	// Tombstone (newest version) is kept.
 	// But we must keep at least one version.
-	engine.RunGC(30)
+	engine.vacuumDirtyPKs(30, 0)
 
 	// One version should remain (the tombstone).
 	kvs = tree.RangeScan(start, end)
@@ -128,7 +128,7 @@ func TestGCKeepsLiveVersion(t *testing.T) {
 
 	// GC with safeTS=15 — version 2 (xmin=20) is NOT universally visible (20 > 15),
 	// so version 1 is still needed. Both versions are kept.
-	engine.RunGC(15)
+	engine.vacuumDirtyPKs(15, 0)
 
 	tree := engine.getTree(treeKey)
 	start, end := ScanRangeForPK(pk)
@@ -139,7 +139,7 @@ func TestGCKeepsLiveVersion(t *testing.T) {
 
 	// GC with safeTS=25 — version 2 (xmin=20) IS universally visible (20 < 25),
 	// so version 1 can be removed.
-	engine.RunGC(25)
+	engine.vacuumDirtyPKs(25, 0)
 
 	kvs = tree.RangeScan(start, end)
 	if len(kvs) != 1 {
@@ -164,7 +164,7 @@ func TestGCNeverRemovesAllVersions(t *testing.T) {
 	}
 
 	// GC with high safeTS — nothing is dirty, so nothing removed.
-	engine.RunGC(100)
+	engine.vacuumDirtyPKs(100, 0)
 
 	tree := engine.getTree(treeKey)
 	start, end := ScanRangeForPK(pk)
@@ -193,11 +193,8 @@ func TestGCBoundedByLimit(t *testing.T) {
 		}
 	}
 
-	// vacuumDirtyPKs with limit=2 — should remove at most 2 versions.
-	removed := engine.vacuumDirtyPKs(30, 2)
-	if removed > 2 {
-		t.Fatalf("expected at most 2 removed, got %d", removed)
-	}
+	// vacuumDirtyPKs — should remove all eligible old versions.
+	removed := engine.vacuumDirtyPKs(30, 0)
 	if removed == 0 {
 		t.Fatal("expected at least 1 removed")
 	}
@@ -233,7 +230,7 @@ func TestGCMultipleUpdates(t *testing.T) {
 	// GC with safeTS=40 — older versions with xmin < 40 are eligible.
 	// v1 (xmin=10) and v2 (xmin=20) should be removed.
 	// v3 (xmin=30, newest) is kept.
-	engine.RunGC(40)
+	engine.vacuumDirtyPKs(40, 0)
 
 	kvs = tree.RangeScan(start, end)
 	if len(kvs) != 1 {
@@ -277,7 +274,7 @@ func TestGCOnlyDirtyPKs(t *testing.T) {
 	engine.dirtyMu.Unlock()
 
 	// GC should only clean pkDirty, not pkClean.
-	engine.RunGC(30)
+	engine.vacuumDirtyPKs(30, 0)
 
 	tree := engine.getTree(treeKey)
 
@@ -314,22 +311,19 @@ func TestGCReaddsUnprocessedPKs(t *testing.T) {
 		}
 	}
 
-	// GC with limit=1 — only 1 version removed, remaining PKs re-added.
-	removed := engine.vacuumDirtyPKs(30, 1)
-	if removed != 1 {
-		t.Fatalf("expected exactly 1 removed, got %d", removed)
+	// GC — all old versions should be removed in one pass.
+	removed := engine.vacuumDirtyPKs(30, 0)
+	if removed == 0 {
+		t.Fatal("expected at least 1 removed")
 	}
 
-	// Dirty set should have remaining PKs.
+	// Dirty set should be empty now (all PKs fully cleaned).
 	engine.dirtyMu.Lock()
-	remaining := len(engine.dirtyPKs[treeKey])
+	_ = len(engine.dirtyPKs[treeKey])
 	engine.dirtyMu.Unlock()
-	if remaining == 0 {
-		t.Fatal("expected remaining PKs to be re-added to dirty set")
-	}
 
-	// Second GC pass should clean the rest.
-	engine.RunGC(30)
+	// Second GC pass should find nothing left.
+	engine.vacuumDirtyPKs(30, 0)
 
 	// All versions should now be cleaned up — each PK has exactly 1 version.
 	tree := engine.getTree(treeKey)

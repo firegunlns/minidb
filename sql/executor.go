@@ -754,10 +754,18 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 }
 
 func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef) (any, error) {
+	totalStart := time.Now()
+	defer func() {
+		metrics.SelectSimpleDuration.Observe(time.Since(totalStart).Seconds())
+	}()
+
 	tableName := ref.Table
 	if ref.Alias != "" {
 		tableName = ref.Alias
 	}
+
+	// Stage 1: GetTable + column resolution.
+	t0 := time.Now()
 	td, err := e.cat.GetTable(e.dbName, ref.Table)
 	if err != nil {
 		return nil, err
@@ -790,9 +798,10 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 			colIndices[i] = idx
 		}
 	}
+	metrics.SelectResolveDuration.Observe(time.Since(t0).Seconds())
 
-	// Optimization: if WHERE is col IN (v1, v2, ...) on a single-column PK,
-	// decompose into point lookups instead of a full table scan.
+	// Stage 2: Optimization path selection.
+	t1 := time.Now()
 	var rows [][]any
 	if s.Where != nil {
 		if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
@@ -806,8 +815,11 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 			rows = idxRows
 		}
 	}
+	metrics.SelectOptPathDuration.Observe(time.Since(t1).Seconds())
 
+	// Stage 3: Scan loop (may include t.Scan internally for opt paths).
 	if rows == nil {
+		t2 := time.Now()
 		var start, end []byte
 		if s.Where != nil {
 			start, end = e.extractPKRange(td, s.Where)
@@ -845,14 +857,21 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 			}
 			return true
 		})
+		metrics.SelectScanLoopDuration.Observe(time.Since(t2).Seconds())
+	} else {
+		// Opt path (IN/idx) already completed scan inside opt path — account as scan loop.
+		metrics.SelectScanLoopDuration.Observe(time.Since(t1).Seconds())
 	}
 
+	// Stage 4: Sort + limit + result building.
+	t3 := time.Now()
 	if len(s.OrderBy) > 0 {
 		e.sortRows(rows, colNames, s.OrderBy)
 	}
 	if s.Limit != nil && *s.Limit < len(rows) {
 		rows = rows[:*s.Limit]
 	}
+	metrics.SelectPostProcessDuration.Observe(time.Since(t3).Seconds())
 
 	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: tableName}, nil
 }

@@ -12,6 +12,22 @@ var dbBuckets = prometheus.ExponentialBuckets(0.00001, 2, 15)
 // --- Histograms ---
 
 var (
+	// Protocol layer stage durations.
+	RewriteDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_protocol_rewrite_duration_seconds",
+		Help:    "SQL rewrite + routing duration (HandleQuery before Execute)",
+		Buckets: dbBuckets,
+	})
+	ConvertResultDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_protocol_convert_result_duration_seconds",
+		Help:    "Result conversion duration (convertResult)",
+		Buckets: dbBuckets,
+	})
+	HandleQueryDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_protocol_handle_query_duration_seconds",
+		Help:    "Full HandleQuery duration including rewrite + execute + convert",
+		Buckets: dbBuckets,
+	})
 	QueryDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "minidb_query_duration_seconds",
 		Help:    "End-to-end query processing duration",
@@ -72,14 +88,81 @@ var (
 		Help:    "MVCC GetRow duration",
 		Buckets: dbBuckets,
 	})
+	MVCCGetVerCacheHitDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_mvcc_get_vercache_hit_duration_seconds",
+		Help:    "MVCC GetRow verCache hit path duration",
+		Buckets: dbBuckets,
+	})
+	MVCCGetTreeScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_mvcc_get_treescan_duration_seconds",
+		Help:    "MVCC GetRow B+tree scan path duration (verCache miss)",
+		Buckets: dbBuckets,
+	})
 	MVCCScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "minidb_mvcc_scan_duration_seconds",
 		Help:    "MVCC ScanRange duration",
 		Buckets: dbBuckets,
 	})
+	MVCCScanTreeScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_mvcc_scan_treescan_duration_seconds",
+		Help:    "MVCC ScanRange: B+tree RangeScan duration (tree traversal + page loads)",
+		Buckets: dbBuckets,
+	})
+	MVCCScanCallbackDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_mvcc_scan_callback_duration_seconds",
+		Help:    "MVCC ScanRange: callback duration (decode + filter + user fn)",
+		Buckets: dbBuckets,
+	})
 	GCDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "minidb_gc_duration_seconds",
 		Help:    "GC pass duration",
+		Buckets: dbBuckets,
+	})
+	// txn.Scan() internal stages.
+	TxnScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_scan_duration_seconds",
+		Help:    "txn.Scan total duration",
+		Buckets: dbBuckets,
+	})
+	TxnScanWSCollectDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_scan_ws_collect_duration_seconds",
+		Help:    "txn.Scan: workspace collection duration (iterate ws.writes, filter by range)",
+		Buckets: dbBuckets,
+	})
+	TxnScanEngineScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_scan_engine_scan_duration_seconds",
+		Help:    "txn.Scan: engine ScanRange/ScanRaw duration (MVCC or index scan)",
+		Buckets: dbBuckets,
+	})
+	TxnScanWSMergeDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_scan_ws_merge_duration_seconds",
+		Help:    "txn.Scan: workspace insert merge duration (unseen ws inserts)",
+		Buckets: dbBuckets,
+	})
+	// execSelectSimple() internal stages.
+	SelectSimpleDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_select_simple_duration_seconds",
+		Help:    "execSelectSimple total duration",
+		Buckets: dbBuckets,
+	})
+	SelectResolveDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_select_resolve_duration_seconds",
+		Help:    "execSelectSimple: GetTable + column resolution duration",
+		Buckets: dbBuckets,
+	})
+	SelectOptPathDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_select_opt_path_duration_seconds",
+		Help:    "execSelectSimple: optimization path selection (tryINOnPK, tryIndexScan, extractPKRange)",
+		Buckets: dbBuckets,
+	})
+	SelectScanLoopDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_select_scan_loop_duration_seconds",
+		Help:    "execSelectSimple: scan loop duration (t.Scan + DecodeRow + evalWhere + column projection)",
+		Buckets: dbBuckets,
+	})
+	SelectPostProcessDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_select_post_process_duration_seconds",
+		Help:    "execSelectSimple: sort + limit + result building duration",
 		Buckets: dbBuckets,
 	})
 )
@@ -173,6 +256,9 @@ var (
 func init() {
 	prometheus.MustRegister(
 		// Histograms
+		RewriteDuration,
+		ConvertResultDuration,
+		HandleQueryDuration,
 		QueryDuration,
 		ParseDuration,
 		ExecuteDuration,
@@ -185,8 +271,21 @@ func init() {
 		CacheEvictDuration,
 		PagerIODuration,
 		MVCCGetDuration,
+		MVCCGetVerCacheHitDuration,
+		MVCCGetTreeScanDuration,
 		MVCCScanDuration,
+		MVCCScanTreeScanDuration,
+		MVCCScanCallbackDuration,
 		GCDuration,
+		TxnScanDuration,
+		TxnScanWSCollectDuration,
+		TxnScanEngineScanDuration,
+		TxnScanWSMergeDuration,
+		SelectSimpleDuration,
+		SelectResolveDuration,
+		SelectOptPathDuration,
+		SelectScanLoopDuration,
+		SelectPostProcessDuration,
 		// Counters
 		QueriesTotal,
 		TxnCommitsTotal,
