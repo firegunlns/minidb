@@ -111,6 +111,8 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execShowDatabases()
 	case *DescTableStmt:
 		return e.execDescTable(s)
+	case *ShowIndexStmt:
+		return e.execShowIndex(s)
 	case *InsertStmt:
 		return e.execDML(func(txn *txn.Txn) (any, error) {
 			return e.execInsert(txn, s)
@@ -135,6 +137,8 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execRollback()
 	case *AlterTableStmt:
 		return e.execAlterTable(s)
+	case *CreateIndexStmt:
+		return e.execCreateIndex(s)
 	case *ExplainStmt:
 		return e.execExplain(s)
 	default:
@@ -192,15 +196,99 @@ func (e *Executor) execCreateTable(s *CreateTableStmt) (any, error) {
 		PKCols:   pkCols,
 	}
 
+	// Copy inline index definitions.
+	for _, idx := range s.Indexes {
+		td.Indexes = append(td.Indexes, catalog.IndexDef{
+			Name:    idx.Name,
+			Columns: idx.Columns,
+			Unique:  idx.Unique,
+		})
+	}
+
 	treeKey := td.DataFile()
 	if err := e.engine.OpenTree(treeKey); err != nil {
 		return nil, err
+	}
+
+	// Open index tree files.
+	for i := range td.Indexes {
+		idxTreeKey := td.IndexFile(&td.Indexes[i])
+		if err := e.engine.OpenTree(idxTreeKey); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := e.cat.CreateTable(td); err != nil {
 		return nil, err
 	}
 	return &OKResult{}, nil
+}
+
+func (e *Executor) execCreateIndex(s *CreateIndexStmt) (any, error) {
+	if e.dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	td, err := e.cat.GetTable(e.dbName, s.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate columns exist.
+	for _, colName := range s.Columns {
+		if td.ColumnIndex(colName) < 0 {
+			return nil, fmt.Errorf("column %q not found in table %q", colName, s.Table)
+		}
+	}
+
+	idxDef := catalog.IndexDef{
+		Name:    s.IndexName,
+		Columns: s.Columns,
+		Unique:  s.Unique,
+	}
+
+	// Create the index tree file.
+	idxTreeKey := td.IndexFile(&idxDef)
+	if err := e.engine.OpenTree(idxTreeKey); err != nil {
+		return nil, err
+	}
+
+	// Backfill: scan existing data and populate index.
+	pkCols := td.PrimaryKeyColumns()
+	idxColDefs := idxColumnDefs(td, &idxDef)
+	txn := e.mgr.Begin()
+	txn.Scan(td.DataFile(), pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, td.Columns)
+		pkVals := make([]any, len(td.PKCols))
+		for i, colIdx := range td.PKCols {
+			pkVals[i] = vals[colIdx]
+		}
+		idxVals := make([]any, len(idxDef.Columns))
+		for j, colName := range idxDef.Columns {
+			idxVals[j] = vals[td.ColumnIndex(colName)]
+		}
+		idxKey := storage.EncodeIndexKey(idxColDefs, idxVals, pkCols, pkVals...)
+		txn.Insert(idxTreeKey, idxKey, nil)
+		return true
+	})
+	if err := txn.Commit(); err != nil {
+		return nil, fmt.Errorf("index backfill failed: %w", err)
+	}
+
+	// Update catalog.
+	td.Indexes = append(td.Indexes, idxDef)
+	if err := e.cat.UpdateTable(e.dbName, s.Table, td); err != nil {
+		return nil, err
+	}
+	return &OKResult{}, nil
+}
+
+// idxColumnDefs returns the storage.ColumnDef slice for an index's columns.
+func idxColumnDefs(td *catalog.TableDef, idx *catalog.IndexDef) []storage.ColumnDef {
+	cols := make([]storage.ColumnDef, len(idx.Columns))
+	for i, name := range idx.Columns {
+		cols[i] = td.Columns[td.ColumnIndex(name)]
+	}
+	return cols
 }
 
 func (e *Executor) execDropTable(s *DropTableStmt) (any, error) {
@@ -279,6 +367,84 @@ func (e *Executor) execDescTable(s *DescTableStmt) (any, error) {
 			extraStr,
 		})
 	}
+	return result, nil
+}
+
+func (e *Executor) execShowIndex(s *ShowIndexStmt) (any, error) {
+	dbName := e.dbName
+	if s.DB != "" {
+		dbName = s.DB
+	}
+	if dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	td, err := e.cat.GetTable(dbName, s.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &SelectResult{
+		Columns: []string{"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality", "Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression"},
+	}
+
+	// Primary key rows.
+	for seq, pkIdx := range td.PKCols {
+		col := td.Columns[pkIdx]
+		nullStr := "YES"
+		if !col.Nullable {
+			nullStr = "NO"
+		}
+		result.Rows = append(result.Rows, []any{
+			s.Table,
+			int32(0), // Non_unique = 0 for PK
+			"PRIMARY",
+			int32(seq + 1),
+			col.Name,
+			"A",
+			int64(0),   // Cardinality (unknown)
+			nil,         // Sub_part
+			nil,         // Packed
+			nullStr,
+			"BTREE",
+			"",
+			"",
+			"YES",
+			nil,
+		})
+	}
+
+	// Secondary index rows.
+	for _, idx := range td.Indexes {
+		for seq, colName := range idx.Columns {
+			colIdx := td.ColumnIndex(colName)
+			nullStr := "YES"
+			if colIdx >= 0 && !td.Columns[colIdx].Nullable {
+				nullStr = "NO"
+			}
+			nonUnique := int32(1)
+			if idx.Unique {
+				nonUnique = 0
+			}
+			result.Rows = append(result.Rows, []any{
+				s.Table,
+				nonUnique,
+				idx.Name,
+				int32(seq + 1),
+				colName,
+				"A",
+				int64(0),
+				nil,
+				nil,
+				nullStr,
+				"BTREE",
+				"",
+				"",
+				"YES",
+				nil,
+			})
+		}
+	}
+
 	return result, nil
 }
 
@@ -555,6 +721,19 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 		if err := t.Insert(treeKey, pk, rowData); err != nil {
 			return nil, err
 		}
+
+		// Insert into secondary indexes.
+		for i := range td.Indexes {
+			idx := &td.Indexes[i]
+			idxTreeKey := td.IndexFile(idx)
+			idxColDefs := idxColumnDefs(td, idx)
+			idxVals := make([]any, len(idx.Columns))
+			for j, colName := range idx.Columns {
+				idxVals[j] = coerced[td.ColumnIndex(colName)]
+			}
+			idxKey := storage.EncodeIndexKey(idxColDefs, idxVals, pkCols, pkVals...)
+			t.Insert(idxTreeKey, idxKey, nil)
+		}
 	}
 
 	return &OKResult{AffectedRows: len(s.Values), InsertID: lastID}, nil
@@ -621,6 +800,13 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 		}
 	}
 
+	// Optimization: use secondary index if WHERE matches an index prefix.
+	if rows == nil && s.Where != nil && len(td.Indexes) > 0 {
+		if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
+			rows = idxRows
+		}
+	}
+
 	if rows == nil {
 		var start, end []byte
 		if s.Where != nil {
@@ -629,6 +815,18 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 		if start == nil {
 			start = []byte{0x00}
 			end = []byte{0xFF}
+		}
+
+		// Check if ORDER BY matches PK ascending order and we can stop early.
+		limitEarlyStop := -1
+		if s.Limit != nil && len(s.OrderBy) > 0 {
+			if e.orderByMatchesPKAsc(td, s.OrderBy, s.Where) {
+				limitEarlyStop = int(*s.Limit)
+			}
+		}
+		// If no ORDER BY but LIMIT is set, still stop early (rows come in PK order).
+		if s.Limit != nil && len(s.OrderBy) == 0 {
+			limitEarlyStop = int(*s.Limit)
 		}
 
 		pkCols := td.PrimaryKeyColumns()
@@ -642,6 +840,9 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 				row[i] = vals[ci]
 			}
 			rows = append(rows, row)
+			if limitEarlyStop > 0 && len(rows) >= limitEarlyStop {
+				return false // stop scanning
+			}
 			return true
 		})
 	}
@@ -715,6 +916,157 @@ func (e *Executor) tryINOnPK(t *txn.Txn, td *catalog.TableDef, treeKey string, w
 	return rows, true
 }
 
+// tryIndexScan checks if a secondary index can be used for the query.
+// Returns (rows, true) if an index was used, (nil, false) otherwise.
+func (e *Executor) tryIndexScan(t *txn.Txn, td *catalog.TableDef, s *SelectStmt, colIndices []int, colNames []string) ([][]any, bool) {
+	if len(td.Indexes) == 0 {
+		metrics.IndexScanAttempts.WithLabelValues("no_idx").Inc()
+		return nil, false
+	}
+
+	eqMap := e.collectEqualities(s.Where)
+	if len(eqMap) == 0 {
+		metrics.IndexScanAttempts.WithLabelValues("no_eq").Inc()
+		return nil, false
+	}
+
+	// If all PK columns have equalities, prefer PK point/range lookup
+	// over secondary index scan — it's always more selective.
+	pkEqCount := 0
+	for _, pkIdx := range td.PKCols {
+		if _, ok := eqMap[td.Columns[pkIdx].Name]; ok {
+			pkEqCount++
+		}
+	}
+	if pkEqCount == len(td.PKCols) {
+		metrics.IndexScanAttempts.WithLabelValues("pk_preferred").Inc()
+		return nil, false
+	}
+
+	// Find best matching index.
+	var bestIdx *catalog.IndexDef
+	var bestEqCols int
+	for i := range td.Indexes {
+		idx := &td.Indexes[i]
+		eqCols := 0
+		for _, colName := range idx.Columns {
+			if _, ok := eqMap[colName]; ok {
+				eqCols++
+			} else {
+				break
+			}
+		}
+		if eqCols > bestEqCols {
+			bestEqCols = eqCols
+			bestIdx = idx
+		}
+	}
+	if bestIdx == nil || bestEqCols == 0 {
+		metrics.IndexScanAttempts.WithLabelValues("no_match").Inc()
+		return nil, false
+	}
+
+	// Build index scan range.
+	idxColDefs := idxColumnDefs(td, bestIdx)
+	pkCols := td.PrimaryKeyColumns()
+	var prefix []byte
+	for i := 0; i < bestEqCols; i++ {
+		colName := bestIdx.Columns[i]
+		colIdx := td.ColumnIndex(colName)
+		col := td.Columns[colIdx]
+		val := eqMap[colName]
+		coerced, err := storage.CoerceValue(col, val)
+		if err != nil {
+			metrics.IndexScanAttempts.WithLabelValues("coerce_fail").Inc()
+			return nil, false
+		}
+		prefix = append(prefix, storage.EncodeColumnValue(col, coerced)...)
+	}
+	start := append([]byte(nil), prefix...)
+	end := append(append([]byte(nil), prefix...), 0xFF)
+
+	// Check if covering index: index columns + PK columns contain all select columns.
+	coveredSet := make(map[int]bool)
+	for _, colName := range bestIdx.Columns {
+		coveredSet[td.ColumnIndex(colName)] = true
+	}
+	for _, pkIdx := range td.PKCols {
+		coveredSet[pkIdx] = true
+	}
+	isCovering := true
+	for _, ci := range colIndices {
+		if !coveredSet[ci] {
+			isCovering = false
+			break
+		}
+	}
+
+	// Scan index tree.
+	idxTreeKey := td.IndexFile(bestIdx)
+	var rows [][]any
+	t.Scan(idxTreeKey, idxColDefs, start, end, func(idxKey, _ []byte) bool {
+		pkBytes := storage.DecodeIndexKeyPK(idxKey, idxColDefs)
+
+		if isCovering {
+			// Decode values directly from index key.
+			vals := make([]any, len(td.Columns))
+			offset := 0
+			for _, colName := range bestIdx.Columns {
+				ci := td.ColumnIndex(colName)
+				col := td.Columns[ci]
+				val, nextOff := storage.DecodeColumnValue(idxKey, offset, col)
+				vals[ci] = val
+				offset = nextOff
+			}
+			// Decode PK columns.
+			for i, pkCol := range pkCols {
+				val, nextOff := storage.DecodeColumnValue(pkBytes, 0, pkCol)
+				vals[td.PKCols[i]] = val
+				pkBytes = pkBytes[nextOff:]
+			}
+			if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+				return true
+			}
+			row := make([]any, len(colIndices))
+			for i, ci := range colIndices {
+				row[i] = vals[ci]
+			}
+			rows = append(rows, row)
+		} else {
+			// Point lookup on main table.
+			rowData, err := t.Get(td.DataFile(), td.Columns, pkBytes)
+			if err != nil || rowData == nil {
+				return true
+			}
+			vals, _ := storage.DecodeRow(rowData, td.Columns)
+			if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+				return true
+			}
+			row := make([]any, len(colIndices))
+			for i, ci := range colIndices {
+				row[i] = vals[ci]
+			}
+			rows = append(rows, row)
+		}
+		return true
+	})
+
+	// ORDER BY optimization: if ORDER BY column is the next index column
+	// after the equality prefix, results are already sorted.
+	if len(s.OrderBy) == 1 && bestEqCols < len(bestIdx.Columns) {
+		if bestIdx.Columns[bestEqCols] == s.OrderBy[0].Column && !s.OrderBy[0].Desc {
+			// Already sorted by index order, skip sortRows.
+		} else {
+			e.sortRows(rows, colNames, s.OrderBy)
+		}
+	} else if len(s.OrderBy) > 0 {
+		e.sortRows(rows, colNames, s.OrderBy)
+	}
+
+	metrics.IndexScanAttempts.WithLabelValues("index_used").Inc()
+	return rows, true
+}
+
 func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, td *catalog.TableDef) (any, error) {
 	treeKey := td.DataFile()
 
@@ -739,6 +1091,68 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 			count := e.engine.CountAll(treeKey, start, end)
 			colName := "count(1)"
 			return &SelectResult{Columns: []string{colName}, Rows: [][]any{{count}}}, nil
+		}
+	}
+
+	// Fast path: SELECT MIN/MAX(pk_col) WHERE pk_prefix = ?
+	// When the aggregate is MIN or MAX on the next PK column after the
+	// equality prefix, the B+ tree scan is already ordered, so we only
+	// need to read the first (MIN) or last (MAX) matching row.
+	if len(s.SelectExprs) == 1 && s.Where != nil && start != nil {
+		var funcName string
+		var funcArg Expr
+		if f, ok := s.SelectExprs[0].(*FuncCallExpr); ok && len(f.Args) == 1 {
+			funcName = strings.ToUpper(f.Name)
+			funcArg = f.Args[0]
+		} else if f, ok := s.SelectExprs[0].(*AggregateFuncExpr); ok && len(f.Args) == 1 {
+			funcName = strings.ToUpper(f.Name)
+			funcArg = f.Args[0]
+		}
+		if (funcName == "MIN" || funcName == "MAX") && funcArg != nil {
+			if col, ok := funcArg.(*ColumnRefExpr); ok {
+				eqMap := e.collectEqualities(s.Where)
+				prefixLen := 0
+				for _, colIdx := range td.PKCols {
+					if _, ok := eqMap[td.Columns[colIdx].Name]; ok {
+						prefixLen++
+					} else {
+						break
+					}
+				}
+				if prefixLen < len(td.PKCols) {
+					nextPKColIdx := td.PKCols[prefixLen]
+					if td.Columns[nextPKColIdx].Name == col.Name {
+						colName := strings.ToLower(funcName)
+						if funcName == "MIN" {
+							// First row in the scan range is the minimum.
+							var minVal any
+							e.engine.ScanAll(treeKey, start, end, func(pk, rowData []byte) bool {
+								vals, _ := storage.DecodeRow(rowData, td.Columns)
+								if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+									return true
+								}
+								minVal = vals[nextPKColIdx]
+								return false // stop after first matching row
+							})
+							return &SelectResult{Columns: []string{colName}, Rows: [][]any{{minVal}}}, nil
+						}
+						// MAX: scan to the end and keep the last matching value.
+						var maxVal any
+						e.engine.ScanAll(treeKey, start, end, func(pk, rowData []byte) bool {
+							vals, _ := storage.DecodeRow(rowData, td.Columns)
+							if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+								return true
+							}
+							v := vals[nextPKColIdx]
+							if maxVal == nil || compareValues(v, maxVal) > 0 {
+								maxVal = v
+							}
+							return true
+						})
+						return &SelectResult{Columns: []string{colName}, Rows: [][]any{{maxVal}}}, nil
+					}
+				}
+			}
 		}
 	}
 
@@ -1121,6 +1535,48 @@ func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (any, error) {
 		}
 
 		newRow := storage.EncodeRow(td.Columns, newVals)
+
+		// Update secondary indexes if any indexed columns changed.
+		if len(td.Indexes) > 0 {
+			pkVals := make([]any, len(td.PKCols))
+			for i, colIdx := range td.PKCols {
+				pkVals[i] = vals[colIdx]
+			}
+			for j := range td.Indexes {
+				idx := &td.Indexes[j]
+				// Check if any index column changed.
+				changed := false
+				for _, colName := range idx.Columns {
+					ci := td.ColumnIndex(colName)
+					if compareValues(vals[ci], newVals[ci]) != 0 {
+						changed = true
+						break
+					}
+				}
+				if !changed {
+					continue
+				}
+				idxTreeKey := td.IndexFile(idx)
+				idxColDefs := idxColumnDefs(td, idx)
+
+				// Delete old index entry.
+				oldIdxVals := make([]any, len(idx.Columns))
+				for k, colName := range idx.Columns {
+					oldIdxVals[k] = vals[td.ColumnIndex(colName)]
+				}
+				oldKey := storage.EncodeIndexKey(idxColDefs, oldIdxVals, pkCols, pkVals...)
+				t.Delete(idxTreeKey, pkCols, oldKey)
+
+				// Insert new index entry.
+				newIdxVals := make([]any, len(idx.Columns))
+				for k, colName := range idx.Columns {
+					newIdxVals[k] = newVals[td.ColumnIndex(colName)]
+				}
+				newKey := storage.EncodeIndexKey(idxColDefs, newIdxVals, pkCols, pkVals...)
+				t.Insert(idxTreeKey, newKey, nil)
+			}
+		}
+
 		if err := t.Update(treeKey, pkCols, pk, newRow); err != nil {
 			return false
 		}
@@ -1151,6 +1607,25 @@ func (e *Executor) execDelete(t *txn.Txn, s *DeleteStmt) (any, error) {
 
 		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
 			return true
+		}
+
+		// Delete from secondary indexes.
+		if len(td.Indexes) > 0 {
+			pkVals := make([]any, len(td.PKCols))
+			for i, colIdx := range td.PKCols {
+				pkVals[i] = vals[colIdx]
+			}
+			for j := range td.Indexes {
+				idx := &td.Indexes[j]
+				idxTreeKey := td.IndexFile(idx)
+				idxColDefs := idxColumnDefs(td, idx)
+				idxVals := make([]any, len(idx.Columns))
+				for k, colName := range idx.Columns {
+					idxVals[k] = vals[td.ColumnIndex(colName)]
+				}
+				idxKey := storage.EncodeIndexKey(idxColDefs, idxVals, pkCols, pkVals...)
+				t.Delete(idxTreeKey, pkCols, idxKey)
+			}
 		}
 
 		if err := t.Delete(treeKey, pkCols, pk); err != nil {
@@ -1225,17 +1700,20 @@ func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
 	if _, ok := s.TableRef.(*JoinTableRef); ok {
 		selectType = "JOIN"
 	}
+
+	accessType, possibleKeys, usedKey, extra := e.explainIndexInfoForSelect(tableName, s)
+
 	r.Rows = append(r.Rows, []any{
 		1,
 		selectType,
 		tableName,
-		e.getAccessType(s),
-		nil,
-		e.getUsedKey(s),
+		accessType,
+		possibleKeys,
+		usedKey,
 		nil,
 		nil,
 		"estimate",
-		e.getExtra(s),
+		extra,
 	})
 }
 
@@ -1255,84 +1733,237 @@ func (e *Executor) explainInsert(r *SelectResult, s *InsertStmt) {
 }
 
 func (e *Executor) explainUpdate(r *SelectResult, s *UpdateStmt) {
+	accessType, possibleKeys, usedKey, extra := e.explainIndexInfoForDML(s.Table, s.Where)
 	r.Rows = append(r.Rows, []any{
 		1,
 		"UPDATE",
 		s.Table,
-		e.getAccessTypeFromWhere(s.Where),
-		nil,
-		e.getKeyFromWhere(s.Where),
+		accessType,
+		possibleKeys,
+		usedKey,
 		nil,
 		nil,
 		"estimate",
-		e.getExtraFromWhere(s.Where),
+		extra,
 	})
 }
 
 func (e *Executor) explainDelete(r *SelectResult, s *DeleteStmt) {
+	accessType, possibleKeys, usedKey, extra := e.explainIndexInfoForDML(s.Table, s.Where)
 	r.Rows = append(r.Rows, []any{
 		1,
 		"DELETE",
 		s.Table,
-		e.getAccessTypeFromWhere(s.Where),
-		nil,
-		e.getKeyFromWhere(s.Where),
+		accessType,
+		possibleKeys,
+		usedKey,
 		nil,
 		nil,
 		"estimate",
-		e.getExtraFromWhere(s.Where),
+		extra,
 	})
 }
 
-func (e *Executor) getAccessType(s *SelectStmt) string {
-	if s.Where != nil {
-		return "range"
-	}
-	return "ALL"
-}
+// explainIndexInfoForSelect returns (accessType, possibleKeys, usedKey, extra) for a SELECT.
+// possibleKeys is a comma-separated string (e.g. "PRIMARY,idx_c_last") for MySQL compatibility.
+func (e *Executor) explainIndexInfoForSelect(tableName string, s *SelectStmt) (string, any, any, string) {
+	td, _ := e.cat.GetTable(e.dbName, tableName)
 
-func (e *Executor) getUsedKey(s *SelectStmt) string {
-	if s.Where != nil {
-		return "PRIMARY"
-	}
-	return ""
-}
-
-func (e *Executor) getExtra(s *SelectStmt) string {
 	var extras []string
 	if s.SelectAll {
 		extras = append(extras, "select tables scan")
 	} else {
 		extras = append(extras, "select columns")
 	}
-	if len(s.OrderBy) > 0 {
-		extras = append(extras, "using filesort")
+
+	if s.Where == nil {
+		if len(s.OrderBy) > 0 {
+			extras = append(extras, "using filesort")
+		}
+		if s.Limit != nil {
+			extras = append(extras, fmt.Sprintf("limit %d", *s.Limit))
+		}
+		return "ALL", nil, nil, strings.Join(extras, "; ")
 	}
+
+	// Determine which index/PK matches best.
+	accessType := "range"
+	usedKey := any("PRIMARY")
+
+	eqMap := e.collectEqualities(s.Where)
+	// Count PK equalities.
+	pkEq := 0
+	if td != nil {
+		for _, pkIdx := range td.PKCols {
+			colName := td.Columns[pkIdx].Name
+			if _, ok := eqMap[colName]; ok {
+				pkEq++
+			}
+		}
+	}
+
+	// Find best secondary index.
+	var bestIdxName string
+	var bestIdxEqCols int
+	if td != nil && len(td.Indexes) > 0 && len(eqMap) > 0 {
+		bestIdxName, bestIdxEqCols = e.findBestIndexName(td, eqMap)
+	}
+
+	// Build possible_keys list (comma-separated string).
+	var possibleKeysList []string
+	possibleKeysList = append(possibleKeysList, "PRIMARY")
+
+	// Choose: if PK has all columns matched (point query), prefer PK.
+	// Otherwise, if secondary index has more equalities, use it.
+	if td != nil && len(td.PKCols) > 0 && pkEq == len(td.PKCols) {
+		// Full PK match — PRIMARY wins (point lookup).
+		usedKey = "PRIMARY"
+	} else if bestIdxName != "" && bestIdxEqCols > 0 {
+		possibleKeysList = append(possibleKeysList, bestIdxName)
+		if bestIdxEqCols > pkEq {
+			usedKey = bestIdxName
+		}
+	}
+
+	possibleKeys := strings.Join(possibleKeysList, ",")
+
+	// Build extras based on chosen key.
+	if td != nil && usedKey == bestIdxName && bestIdxName != "" {
+		idx := e.findIndexByName(td, bestIdxName)
+		if idx != nil {
+			if e.isCoveringIndex(td, idx, s) {
+				extras = append(extras, "using index")
+			}
+			if e.orderBySatisfiedByIndex(td, idx, bestIdxEqCols, s) {
+				// ORDER BY satisfied by index order — no filesort.
+			} else if len(s.OrderBy) > 0 {
+				extras = append(extras, "using filesort")
+			}
+		}
+	} else {
+		if len(s.OrderBy) > 0 {
+			extras = append(extras, "using filesort")
+		}
+	}
+
 	if s.Limit != nil {
 		extras = append(extras, fmt.Sprintf("limit %d", *s.Limit))
 	}
-	return strings.Join(extras, "; ")
+
+	return accessType, possibleKeys, usedKey, strings.Join(extras, "; ")
 }
 
-func (e *Executor) getAccessTypeFromWhere(where Expr) string {
-	if where != nil {
-		return "range"
+// explainIndexInfoForDML returns (accessType, possibleKeys, usedKey, extra) for UPDATE/DELETE.
+func (e *Executor) explainIndexInfoForDML(table string, where Expr) (string, any, any, string) {
+	if where == nil {
+		return "ALL", nil, nil, ""
 	}
-	return "ALL"
+
+	td, _ := e.cat.GetTable(e.dbName, table)
+	possibleKeys := any("PRIMARY")
+	usedKey := any("PRIMARY")
+	accessType := "range"
+
+	if td == nil || len(td.Indexes) == 0 {
+		return accessType, possibleKeys, usedKey, "using where"
+	}
+
+	eqMap := e.collectEqualities(where)
+	if len(eqMap) == 0 {
+		return accessType, possibleKeys, usedKey, "using where"
+	}
+
+	// Count PK equalities.
+	pkEq := 0
+	for _, pkIdx := range td.PKCols {
+		colName := td.Columns[pkIdx].Name
+		if _, ok := eqMap[colName]; ok {
+			pkEq++
+		}
+	}
+
+	bestIdxName, bestIdxEqCols := e.findBestIndexName(td, eqMap)
+	if bestIdxName != "" {
+		possibleKeys = fmt.Sprintf("PRIMARY,%s", bestIdxName)
+		// Prefer PK if all PK columns have equalities (point query).
+		if pkEq < len(td.PKCols) && bestIdxEqCols > pkEq {
+			usedKey = bestIdxName
+		}
+	}
+
+	return accessType, possibleKeys, usedKey, "using where"
 }
 
-func (e *Executor) getKeyFromWhere(where Expr) any {
-	if where != nil {
-		return "PRIMARY"
+// findBestIndexName returns (indexName, eqCols) for the index matching the most
+// equality prefix columns from eqMap.
+func (e *Executor) findBestIndexName(td *catalog.TableDef, eqMap map[string]any) (string, int) {
+	var bestName string
+	var bestEqCols int
+	for i := range td.Indexes {
+		idx := &td.Indexes[i]
+		eqCols := 0
+		for _, colName := range idx.Columns {
+			if _, ok := eqMap[colName]; ok {
+				eqCols++
+			} else {
+				break
+			}
+		}
+		if eqCols > bestEqCols {
+			bestEqCols = eqCols
+			bestName = idx.Name
+		}
+	}
+	return bestName, bestEqCols
+}
+
+func (e *Executor) findIndexByName(td *catalog.TableDef, name string) *catalog.IndexDef {
+	for i := range td.Indexes {
+		if td.Indexes[i].Name == name {
+			return &td.Indexes[i]
+		}
 	}
 	return nil
 }
 
-func (e *Executor) getExtraFromWhere(where Expr) string {
-	if where != nil {
-		return "using where"
+// isCoveringIndex checks if the index covers all columns in the SELECT.
+func (e *Executor) isCoveringIndex(td *catalog.TableDef, idx *catalog.IndexDef, s *SelectStmt) bool {
+	if s.SelectAll {
+		return false
 	}
-	return ""
+	coveredSet := make(map[int]bool)
+	for _, colName := range idx.Columns {
+		coveredSet[td.ColumnIndex(colName)] = true
+	}
+	for _, pkIdx := range td.PKCols {
+		coveredSet[pkIdx] = true
+	}
+	for _, expr := range s.SelectExprs {
+		colName, ok := expr.(ColumnRefExpr)
+		if !ok {
+			return false
+		}
+		ci := td.ColumnIndex(colName.Name)
+		if ci < 0 || !coveredSet[ci] {
+			return false
+		}
+	}
+	return true
+}
+
+// orderBySatisfiedByIndex checks if ORDER BY is already satisfied by the index.
+func (e *Executor) orderBySatisfiedByIndex(td *catalog.TableDef, idx *catalog.IndexDef, eqCols int, s *SelectStmt) bool {
+	if len(s.OrderBy) == 0 {
+		return true
+	}
+	// Check if the ORDER BY column is the next index column after the equality prefix.
+	obCol := s.OrderBy[0].Column
+	for i, colName := range idx.Columns {
+		if i == eqCols && colName == obCol {
+			return true
+		}
+	}
+	return false
 }
 
 // ActiveTxn returns the active transaction (for protocol layer).
@@ -1985,6 +2616,42 @@ func (e *Executor) extractLiteral(expr Expr) any {
 		return lit.Value
 	}
 	return nil
+}
+
+// orderByMatchesPKAsc returns true if the ORDER BY columns match the PK columns
+// in ascending order, accounting for the equality prefix from the WHERE clause.
+// For example, if PK is (a, b, c), WHERE a=? AND b=? and ORDER BY c ASC,
+// the scan results are already sorted by c within the (a, b) prefix.
+func (e *Executor) orderByMatchesPKAsc(td *catalog.TableDef, orderBy []OrderByClause, where Expr) bool {
+	if len(orderBy) == 0 {
+		return false
+	}
+
+	// Count how many PK prefix columns have equalities in WHERE.
+	eqMap := e.collectEqualities(where)
+	prefixLen := 0
+	for _, colIdx := range td.PKCols {
+		if _, ok := eqMap[td.Columns[colIdx].Name]; ok {
+			prefixLen++
+		} else {
+			break
+		}
+	}
+
+	// ORDER BY must match PK columns starting from prefixLen.
+	if prefixLen+len(orderBy) > len(td.PKCols) {
+		return false
+	}
+	for i, ob := range orderBy {
+		if ob.Desc {
+			return false
+		}
+		pkColIdx := td.PKCols[prefixLen+i]
+		if ob.Column != td.Columns[pkColIdx].Name {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Executor) sortRows(rows [][]any, colNames []string, orderBy []OrderByClause) {

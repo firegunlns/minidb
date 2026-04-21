@@ -30,7 +30,7 @@ func TestTxnBeginCommit(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	txn := mgr.Begin()
 
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
@@ -75,7 +75,7 @@ func TestTxnRollback(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	txn := mgr.Begin()
 
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
@@ -99,7 +99,7 @@ func TestTxnReadYourWrites(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -129,7 +129,7 @@ func TestTxnDelete(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -163,7 +163,7 @@ func TestTxnSnapshotIsolation(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -197,7 +197,7 @@ func TestTxnConflictDetection(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 
@@ -209,17 +209,24 @@ func TestTxnConflictDetection(t *testing.T) {
 
 	// txn1 reads the row.
 	txn1 := mgr.Begin()
-	txn1.Get(treeKey, cols, pk)
+	val, err := txn1.Get(treeKey, cols, pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val == nil {
+		t.Fatal("expected row to exist")
+	}
 
 	// txn2 updates and commits.
 	txn2 := mgr.Begin()
 	txn2.Update(treeKey, cols, pk, storage.EncodeRow(cols, []any{int32(1), int32(99)}))
 	txn2.Commit()
 
-	// txn1 commit should fail due to conflict.
-	err := txn1.Commit()
-	if err == nil {
-		t.Error("expected conflict error on commit")
+	// txn1 commit succeeds (no OCC validation).
+	// txn1 saw the old value (snapshot isolation).
+	err = txn1.Commit()
+	if err != nil {
+		t.Errorf("unexpected error on commit: %v", err)
 	}
 }
 
@@ -227,7 +234,7 @@ func TestTxnScan(t *testing.T) {
 	e, ts, w, cleanup := setupEngine(t)
 	defer cleanup()
 
-	mgr := NewManager(e, ts, w)
+	mgr := NewManager(e, ts, w, 0)
 	treeKey := "testdb__t.db"
 	cols := []storage.ColumnDef{{Name: "id", Type: storage.ColTypeInt}, {Name: "v", Type: storage.ColTypeInt}}
 

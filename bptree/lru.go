@@ -1,3 +1,5 @@
+// Package bptree 实现了 B+ 树数据结构
+// 本文件包含 LRU 缓存实现
 package bptree
 
 import (
@@ -11,20 +13,33 @@ import (
 	"lns.com/minidb/metrics"
 )
 
+// LRUCache LRU缓存
+// 用于缓存B+树节点，减少磁盘IO
+// mu: 互斥锁保护缓存
+// capacity: 缓存容量
+// items: pageID到缓存条目的映射
+// order: 双向链表，front=最近使用(MRU)，back=最久未使用(LRU)
+// pager: 页面管理器
+// compressor: 压缩器（可选）
+// formatVersion: 格式版本
 type LRUCache struct {
 	mu            sync.Mutex
 	capacity      int
 	items         map[int64]*list.Element
-	order         *list.List // front = MRU, back = LRU
+	order         *list.List
 	pager         *Pager
 	compressor    Compressor
 	formatVersion uint32
 }
 
+// cacheEntry 缓存条目
+// pageID: 页面ID
+// node: 缓存的节点
+// pins: 固定计数，大于0时不可驱逐
 type cacheEntry struct {
 	pageID int64
 	node   *pnode
-	pins   int // while > 0, entry cannot be evicted
+	pins   int
 }
 
 func NewLRUCache(capacity int, pager *Pager, compressor Compressor, formatVersion uint32) *LRUCache {
@@ -245,9 +260,17 @@ func (c *LRUCache) GetOrLoad(pageID int64) (*pnode, error) {
 		return ent.node, nil
 	}
 
+	// Try to evict unpinned entries. If all are pinned, expand capacity.
+	evicted := false
 	for len(c.items) >= c.capacity {
-		c.evict()
+		if !c.evictOne() {
+			// All entries are pinned — expand capacity to avoid infinite loop.
+			c.capacity = len(c.items) + 256
+			break
+		}
+		evicted = true
 	}
+	_ = evicted
 
 	entry := &cacheEntry{pageID: pageID, node: n, pins: 1}
 	elem := c.order.PushFront(entry)
@@ -268,7 +291,10 @@ func (c *LRUCache) PutPinned(n *pnode) {
 	}
 
 	for len(c.items) >= c.capacity {
-		c.evict()
+		if !c.evictOne() {
+			c.capacity = len(c.items) + 256
+			break
+		}
 	}
 
 	entry := &cacheEntry{pageID: n.pageID, node: n, pins: 1}
@@ -306,7 +332,8 @@ func (c *LRUCache) Len() int {
 	return len(c.items)
 }
 
-func (c *LRUCache) evict() {
+// evictOne tries to evict one unpinned entry. Returns true if an entry was evicted.
+func (c *LRUCache) evictOne() bool {
 	start := time.Now()
 	elem := c.order.Back()
 	for elem != nil {
@@ -319,14 +346,12 @@ func (c *LRUCache) evict() {
 		delete(c.items, ent.pageID)
 		if ent.node.dirty {
 			if err := c.writeNodeToPager(ent.node); err != nil {
-				// Log the error but continue eviction — the node is already
-				// removed from cache so we can't keep it. Future reads will
-				// need to reconstruct from the B+ tree structure.
 				log.Printf("LRU evict: write page %d failed: %v", ent.node.pageID, err)
 			}
 			ent.node.dirty = false
 		}
 		metrics.CacheEvictDuration.Observe(time.Since(start).Seconds())
-		return
+		return true
 	}
+	return false
 }

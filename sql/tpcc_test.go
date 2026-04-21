@@ -15,7 +15,7 @@ func newTPCCTestEnv(t *testing.T) (*Executor, func()) {
 	e, _ := storage.OpenEngine(dir, 64, 256)
 	ts := txn.NewTimestampOracle()
 	w, _ := wal.Open(dir)
-	mgr := txn.NewManager(e, ts, w)
+	mgr := txn.NewManager(e, ts, w, 0)
 	cat, _ := catalog.Open(dir)
 	exec := NewExecutor(e, mgr, cat, "")
 

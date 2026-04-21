@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"lns.com/minidb/catalog"
@@ -29,7 +30,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	ts := txn.NewTimestampOracle()
 	w, _ := wal.Open(dir)
-	mgr := txn.NewManager(e, ts, w)
+	mgr := txn.NewManager(e, ts, w, 0)
 	cat, err := catalog.Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -693,3 +694,650 @@ func TestSelectINOnNonPKColumn(t *testing.T) {
 		t.Fatalf("val IN (10): expected 2 rows, got %d", len(rows.Rows))
 	}
 }
+
+// TestSecondaryIndex tests CREATE INDEX + query + INSERT/UPDATE/DELETE index maintenance.
+func TestSecondaryIndex(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE customer (
+		c_w_id INT NOT NULL,
+		c_d_id INT NOT NULL,
+		c_id INT NOT NULL,
+		c_last VARCHAR(16),
+		c_first VARCHAR(16),
+		c_credit VARCHAR(2),
+		PRIMARY KEY (c_w_id, c_d_id, c_id)
+	)`)
+
+	// Create secondary index.
+	_, err := env.exec.Execute("CREATE INDEX idx_c_last ON customer (c_w_id, c_d_id, c_last, c_first)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert data.
+	for w := 1; w <= 2; w++ {
+		for d := 1; d <= 2; d++ {
+			for c := 1; c <= 5; c++ {
+				last := fmt.Sprintf("LAST_%d", c%3)
+				first := fmt.Sprintf("FIRST_%d", c)
+				env.exec.Execute(fmt.Sprintf(
+					"INSERT INTO customer (c_w_id, c_d_id, c_id, c_last, c_first, c_credit) VALUES (%d, %d, %d, '%s', '%s', 'GC')",
+					w, d, c, last, first))
+			}
+		}
+	}
+
+	// Query by c_last — should use index.
+	rs, err := env.exec.Execute("SELECT c_id, c_first FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'LAST_1' ORDER BY c_first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	t.Logf("Index scan result: %v", rows.Rows)
+	// LAST_1: c_id % 3 == 1 => c_id=1, c_id=4 → 2 rows
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+	// Should be ordered by c_first.
+	if rows.Rows[0][1].(string) > rows.Rows[1][1].(string) {
+		t.Error("results not ordered by c_first")
+	}
+
+	// Update an indexed column.
+	env.exec.Execute("UPDATE customer SET c_last = 'LAST_0' WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1")
+
+	// Old value should be gone.
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'LAST_1' ORDER BY c_first")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 1 { // was 2, now 1 after updating c_id=1
+		t.Errorf("after UPDATE: expected 1 row for LAST_1, got %d", len(rows.Rows))
+	}
+
+	// New value should be found.
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'LAST_0' ORDER BY c_first")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 2 { // c_id=1 (updated) + c_id=3 (original LAST_0)
+		t.Errorf("after UPDATE: expected 2 rows for LAST_0, got %d", len(rows.Rows))
+	}
+
+	// Delete a row.
+	env.exec.Execute("DELETE FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 3")
+
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'LAST_0'")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 1 { // c_id=1 only
+		t.Errorf("after DELETE: expected 1 row, got %d", len(rows.Rows))
+	}
+}
+
+// TestCreateIndexWithBackfill tests CREATE INDEX on a table with existing data.
+func TestCreateIndexWithBackfill(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE items (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), category INT)`)
+
+	// Insert data BEFORE creating index.
+	for i := 1; i <= 10; i++ {
+		env.exec.Execute(fmt.Sprintf("INSERT INTO items (id, name, category) VALUES (%d, 'item_%d', %d)", i, i, i%3))
+	}
+
+	// Now create index on existing data.
+	_, err := env.exec.Execute("CREATE INDEX idx_category ON items (category)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Query should use index.
+	rs, err := env.exec.Execute("SELECT id FROM items WHERE category = 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	// category=0: id=3, id=6, id=9 → 3 rows
+	if len(rows.Rows) != 3 {
+		t.Fatalf("expected 3 rows with category=0, got %d", len(rows.Rows))
+	}
+}
+
+// TestInlineIndexInCreateTable tests KEY constraint in CREATE TABLE.
+func TestInlineIndexInCreateTable(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (
+		id INT NOT NULL PRIMARY KEY,
+		val INT,
+		KEY idx_val (val)
+	)`)
+
+	// Verify index was created.
+	td, _ := env.cat.GetTable("testdb", "t1")
+	if len(td.Indexes) != 1 {
+		t.Fatalf("expected 1 index, got %d", len(td.Indexes))
+	}
+	if td.Indexes[0].Name != "idx_val" {
+		t.Errorf("expected index name 'idx_val', got %q", td.Indexes[0].Name)
+	}
+
+	// Insert and query.
+	env.exec.Execute("INSERT INTO t1 (id, val) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, val) VALUES (2, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, val) VALUES (3, 20)")
+
+	rs, _ := env.exec.Execute("SELECT id FROM t1 WHERE val = 10")
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+}
+
+// TestShowIndex tests SHOW INDEX and SHOW KEYS FROM.
+func TestShowIndex(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE customer (
+		c_w_id INT NOT NULL,
+		c_d_id INT NOT NULL,
+		c_id INT NOT NULL,
+		c_last VARCHAR(16),
+		c_first VARCHAR(16),
+		PRIMARY KEY (c_w_id, c_d_id, c_id)
+	)`)
+	env.exec.Execute("CREATE INDEX idx_c_last ON customer (c_w_id, c_d_id, c_last, c_first)")
+
+	// SHOW INDEX FROM
+	rs, err := env.exec.Execute("SHOW INDEX FROM customer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	// 3 PK columns + 4 index columns = 7 rows
+	if len(rows.Rows) != 7 {
+		t.Fatalf("expected 7 rows, got %d", len(rows.Rows))
+	}
+	// Verify columns.
+	if len(rows.Columns) != 15 {
+		t.Fatalf("expected 15 columns, got %d", len(rows.Columns))
+	}
+	// Check PK rows.
+	for i := 0; i < 3; i++ {
+		if rows.Rows[i][2] != "PRIMARY" {
+			t.Errorf("row %d: expected Key_name=PRIMARY, got %v", i, rows.Rows[i][2])
+		}
+		if rows.Rows[i][1] != int32(0) {
+			t.Errorf("row %d: expected Non_unique=0, got %v", i, rows.Rows[i][1])
+		}
+	}
+	// Check secondary index rows.
+	for i := 3; i < 7; i++ {
+		if rows.Rows[i][2] != "idx_c_last" {
+			t.Errorf("row %d: expected Key_name=idx_c_last, got %v", i, rows.Rows[i][2])
+		}
+		if rows.Rows[i][1] != int32(1) {
+			t.Errorf("row %d: expected Non_unique=1, got %v", i, rows.Rows[i][1])
+		}
+	}
+	// Check column order in secondary index.
+	expectedCols := []string{"c_w_id", "c_d_id", "c_last", "c_first"}
+	for i, col := range expectedCols {
+		if rows.Rows[3+i][4] != col {
+			t.Errorf("idx row %d: expected Column_name=%s, got %v", i, col, rows.Rows[3+i][4])
+		}
+		if rows.Rows[3+i][3] != int32(i+1) {
+			t.Errorf("idx row %d: expected Seq_in_index=%d, got %v", i, i+1, rows.Rows[3+i][3])
+		}
+	}
+
+	// SHOW KEYS FROM (same output).
+	rs2, err := env.exec.Execute("SHOW KEYS FROM customer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows2 := rs2.(*SelectResult)
+	if len(rows2.Rows) != len(rows.Rows) {
+		t.Fatalf("SHOW KEYS: expected %d rows, got %d", len(rows.Rows), len(rows2.Rows))
+	}
+}
+
+// TestExplainWithIndex tests that EXPLAIN reports secondary index usage.
+func TestExplainWithIndex(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE customer (
+		c_w_id INT NOT NULL,
+		c_d_id INT NOT NULL,
+		c_id INT NOT NULL,
+		c_last VARCHAR(16),
+		c_first VARCHAR(16),
+		PRIMARY KEY (c_w_id, c_d_id, c_id)
+	)`)
+	env.exec.Execute("CREATE INDEX idx_c_last ON customer (c_w_id, c_d_id, c_last, c_first)")
+
+	// EXPLAIN a query that uses the secondary index.
+	rs, err := env.exec.Execute("EXPLAIN SELECT c_id, c_first FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAR' ORDER BY c_first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+
+	row := rows.Rows[0]
+	// possible_keys should list both PRIMARY and the index (comma-separated).
+	possibleKeys, ok := row[4].(string)
+	if !ok {
+		t.Fatalf("expected string for possible_keys, got %T: %v", row[4], row[4])
+	}
+	if !strings.Contains(possibleKeys, "PRIMARY") || !strings.Contains(possibleKeys, "idx_c_last") {
+		t.Errorf("expected possible_keys to contain PRIMARY and idx_c_last, got %v", possibleKeys)
+	}
+
+	// key should be idx_c_last (best match with 3 equalities).
+	if row[5] != "idx_c_last" {
+		t.Errorf("expected key=idx_c_last, got %v", row[5])
+	}
+
+	// Extra should mention "using index" (covering) and NOT "using filesort" (ORDER BY satisfied).
+	extra := row[9].(string)
+	t.Logf("Extra: %s", extra)
+	if !strings.Contains(extra, "using index") {
+		t.Errorf("expected Extra to contain 'using index', got %q", extra)
+	}
+	if strings.Contains(extra, "using filesort") {
+		t.Errorf("expected Extra NOT to contain 'using filesort', got %q", extra)
+	}
+
+	// EXPLAIN UPDATE with index.
+	rs, err = env.exec.Execute("EXPLAIN UPDATE customer SET c_first = 'X' WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows = rs.(*SelectResult)
+	row = rows.Rows[0]
+	if row[5] != "PRIMARY" {
+		t.Errorf("UPDATE: expected key=PRIMARY (PK match), got %v", row[5])
+	}
+
+	// EXPLAIN with no WHERE — should be ALL.
+	rs, _ = env.exec.Execute("EXPLAIN SELECT * FROM customer")
+	rows = rs.(*SelectResult)
+	row = rows.Rows[0]
+	if row[3] != "ALL" {
+		t.Errorf("no WHERE: expected type=ALL, got %v", row[3])
+	}
+	if row[5] != nil {
+		t.Errorf("no WHERE: expected key=nil, got %v", row[5])
+	}
+}
+
+// TestSecondaryIndexEndToEnd comprehensively tests that:
+// 1. Index entries are actually written to the B+ tree (file grows)
+// 2. Queries use the index (not full table scan)
+// 3. EXPLAIN shows correct index usage
+// 4. Inline KEY in CREATE TABLE works
+// 5. UPDATE/DELETE maintain index correctness
+// 6. Index with nil-ish values (empty string, zero) works
+func TestSecondaryIndexEndToEnd(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+
+	// Create table with inline index — mimics TPC-C customer.
+	env.exec.Execute(`CREATE TABLE customer (
+		c_w_id INT NOT NULL,
+		c_d_id INT NOT NULL,
+		c_id INT NOT NULL,
+		c_discount DECIMAL(4,4),
+		c_credit CHAR(2),
+		c_last VARCHAR(16),
+		c_first VARCHAR(16),
+		c_balance DECIMAL(12,2),
+		PRIMARY KEY (c_w_id, c_d_id, c_id),
+		KEY idx_c_last (c_w_id, c_d_id, c_last, c_first)
+	)`)
+
+	// Verify index is in table definition.
+	td, err := env.cat.GetTable("testdb", "customer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(td.Indexes) != 1 {
+		t.Fatalf("expected 1 index, got %d", len(td.Indexes))
+	}
+	if td.Indexes[0].Name != "idx_c_last" {
+		t.Errorf("expected idx_c_last, got %s", td.Indexes[0].Name)
+	}
+
+	// Insert data — 3 warehouses x 2 districts x 10 customers = 60 rows.
+	// c_last cycles through BAR, BAT, BAR, ... so BAR customers: odd c_ids.
+	for w := 1; w <= 3; w++ {
+		for d := 1; d <= 2; d++ {
+			for c := 1; c <= 10; c++ {
+				last := "BAT"
+				if c%2 == 1 {
+					last = "BAR"
+				}
+				env.exec.Execute(fmt.Sprintf(
+					"INSERT INTO customer (c_w_id, c_d_id, c_id, c_discount, c_credit, c_last, c_first, c_balance) VALUES (%d, %d, %d, 0.10, 'GC', '%s', 'FIRST_%d', 100.00)",
+					w, d, c, last, c))
+			}
+		}
+	}
+
+	// --- Step 1: Verify index file has data (not just header) ---
+	idxTreeKey := td.IndexFile(&td.Indexes[0])
+	// Scan the index tree directly to verify entries exist.
+	idxCount := 0
+	env.engine.ScanRaw(idxTreeKey, []byte{0x00}, []byte{0xFF}, func(key, value []byte) bool {
+		idxCount++
+		return true
+	})
+	if idxCount != 60 {
+		t.Errorf("expected 60 index entries, got %d", idxCount)
+	}
+	t.Logf("Index tree has %d entries", idxCount)
+
+	// --- Step 2: Query by c_last should use index ---
+	rs, err := env.exec.Execute("SELECT c_id, c_first FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAR' ORDER BY c_first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	// BAR: c_id=1,3,5,7,9 → 5 rows
+	if len(rows.Rows) != 5 {
+		t.Fatalf("expected 5 rows, got %d: %v", len(rows.Rows), rows.Rows)
+	}
+	// Should be ordered by c_first (FIRST_1, FIRST_3, FIRST_5, FIRST_7, FIRST_9).
+	for i, row := range rows.Rows {
+		expected := fmt.Sprintf("FIRST_%d", 1+2*i)
+		if row[1].(string) != expected {
+			t.Errorf("row %d: expected c_first=%s, got %v", i, expected, row[1])
+		}
+	}
+
+	// --- Step 3: EXPLAIN should show index usage ---
+	rs, err = env.exec.Execute("EXPLAIN SELECT c_id, c_first FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAR' ORDER BY c_first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	explainRows := rs.(*SelectResult)
+	if len(explainRows.Rows) != 1 {
+		t.Fatal("expected 1 explain row")
+	}
+	explainRow := explainRows.Rows[0]
+	possibleKeys := explainRow[4].(string)
+	usedKey := explainRow[5].(string)
+	extra := explainRow[9].(string)
+
+	if !strings.Contains(possibleKeys, "idx_c_last") {
+		t.Errorf("possible_keys should contain idx_c_last, got %q", possibleKeys)
+	}
+	if usedKey != "idx_c_last" {
+		t.Errorf("key should be idx_c_last, got %q", usedKey)
+	}
+	if !strings.Contains(extra, "using index") {
+		t.Errorf("extra should contain 'using index', got %q", extra)
+	}
+	if strings.Contains(extra, "using filesort") {
+		t.Errorf("extra should NOT contain 'using filesort', got %q", extra)
+	}
+	t.Logf("EXPLAIN: type=%v possible_keys=%v key=%v extra=%v", explainRow[3], possibleKeys, usedKey, extra)
+
+	// --- Step 4: PK point query should prefer PRIMARY over secondary index ---
+	rs, _ = env.exec.Execute("EXPLAIN SELECT * FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 5")
+	explainRows = rs.(*SelectResult)
+	explainRow = explainRows.Rows[0]
+	if explainRow[5] != "PRIMARY" {
+		t.Errorf("PK point query should use PRIMARY, got key=%v", explainRow[5])
+	}
+
+	// --- Step 5: UPDATE an indexed column, verify index is maintained ---
+	env.exec.Execute("UPDATE customer SET c_last = 'BAZ' WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1")
+
+	// Old index entry should be gone.
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAR' ORDER BY c_first")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 4 { // was 5, c_id=1 moved to BAZ
+		t.Errorf("after UPDATE: expected 4 BAR rows, got %d", len(rows.Rows))
+	}
+
+	// New index entry should exist.
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAZ'")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Errorf("after UPDATE: expected 1 BAZ row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0][0].(int32) != 1 {
+		t.Errorf("after UPDATE: expected c_id=1, got %v", rows.Rows[0][0])
+	}
+
+	// Verify total index entries still = 60.
+	idxCount2 := 0
+	env.engine.ScanRaw(idxTreeKey, []byte{0x00}, []byte{0xFF}, func(key, value []byte) bool {
+		idxCount2++
+		return true
+	})
+	if idxCount2 != 60 {
+		t.Errorf("after UPDATE: expected 60 index entries, got %d", idxCount2)
+	}
+
+	// --- Step 6: DELETE a row, verify index entry is removed ---
+	env.exec.Execute("DELETE FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 3")
+
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAR'")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 3 { // was 4, c_id=3 deleted
+		t.Errorf("after DELETE: expected 3 BAR rows, got %d", len(rows.Rows))
+	}
+
+	idxCount3 := 0
+	env.engine.ScanRaw(idxTreeKey, []byte{0x00}, []byte{0xFF}, func(key, value []byte) bool {
+		idxCount3++
+		return true
+	})
+	if idxCount3 != 59 {
+		t.Errorf("after DELETE: expected 59 index entries, got %d", idxCount3)
+	}
+
+	// --- Step 7: Non-covering index query (SELECT *) ---
+	rs, _ = env.exec.Execute("SELECT c_id, c_last FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'BAZ'")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Errorf("expected 1 BAZ row, got %d", len(rows.Rows))
+	}
+
+	// --- Step 8: Query with no matching rows ---
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_last = 'NONEXISTENT'")
+	rows = rs.(*SelectResult)
+	if len(rows.Rows) != 0 {
+		t.Errorf("expected 0 rows for NONEXISTENT, got %d", len(rows.Rows))
+	}
+
+	// --- Step 9: Full table scan when index can't help ---
+	rs, _ = env.exec.Execute("SELECT c_id FROM customer WHERE c_last = 'BAR'")
+	rows = rs.(*SelectResult)
+	// Can't use index (missing c_w_id, c_d_id prefix), falls back to scan.
+	totalBAR := 0
+	for w := 1; w <= 3; w++ {
+		for d := 1; d <= 2; d++ {
+			for c := 1; c <= 10; c++ {
+				if c%2 == 1 {
+					totalBAR++
+				}
+			}
+		}
+	}
+	// But c_id=1 was changed to BAZ, c_id=3 in w=1,d=1 was deleted
+	totalBAR -= 2
+	if len(rows.Rows) != totalBAR {
+		t.Errorf("expected %d BAR rows (full scan), got %d", totalBAR, len(rows.Rows))
+	}
+}
+
+// TestOorderUniqueIndex tests the oorder unique index from TPC-C.
+func TestOorderUniqueIndex(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE bmsql_oorder (
+		o_w_id INT NOT NULL,
+		o_d_id INT NOT NULL,
+		o_id INT NOT NULL,
+		o_c_id INT,
+		o_carrier_id INT,
+		PRIMARY KEY (o_w_id, o_d_id, o_id),
+		UNIQUE KEY bmsql_oorder_idx1 (o_w_id, o_d_id, o_c_id, o_id)
+	)`)
+
+	// Verify index was created.
+	td, _ := env.cat.GetTable("testdb", "bmsql_oorder")
+	if len(td.Indexes) != 1 {
+		t.Fatalf("expected 1 index, got %d", len(td.Indexes))
+	}
+	if !td.Indexes[0].Unique {
+		t.Error("expected unique index")
+	}
+
+	// Insert orders.
+	for w := 1; w <= 2; w++ {
+		for d := 1; d <= 2; d++ {
+			for o := 1; o <= 5; o++ {
+				env.exec.Execute(fmt.Sprintf(
+					"INSERT INTO bmsql_oorder (o_w_id, o_d_id, o_id, o_c_id, o_carrier_id) VALUES (%d, %d, %d, %d, NULL)",
+					w, d, o, o*10))
+			}
+		}
+	}
+
+	// Query using unique index columns.
+	rs, err := env.exec.Execute("SELECT o_id FROM bmsql_oorder WHERE o_w_id = 1 AND o_d_id = 1 AND o_c_id = 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0][0].(int32) != 3 {
+		t.Errorf("expected o_id=3, got %v", rows.Rows[0][0])
+	}
+
+	// Verify index entries count.
+	idxTreeKey := td.IndexFile(&td.Indexes[0])
+	idxCount := 0
+	env.engine.ScanRaw(idxTreeKey, []byte{0x00}, []byte{0xFF}, func(key, value []byte) bool {
+		idxCount++
+		return true
+	})
+	if idxCount != 20 {
+		t.Errorf("expected 20 index entries, got %d", idxCount)
+	}
+
+	// EXPLAIN should show index usage.
+	rs, _ = env.exec.Execute("EXPLAIN SELECT o_id FROM bmsql_oorder WHERE o_w_id = 1 AND o_d_id = 1 AND o_c_id = 30")
+	explainRows := rs.(*SelectResult)
+	explainRow := explainRows.Rows[0]
+	t.Logf("EXPLAIN oorder: type=%v possible_keys=%v key=%v extra=%v",
+		explainRow[3], explainRow[4], explainRow[5], explainRow[9])
+}
+
+// TestCustomerIndexSimulatedTPCC simulates the exact TPC-C Payment c_last query
+// to verify the index is being used.
+func TestCustomerIndexSimulatedTPCC(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+
+	// Exact TPC-C customer table with inline index.
+	env.exec.Execute(`CREATE TABLE bmsql_customer (
+		c_w_id INT NOT NULL,
+		c_d_id INT NOT NULL,
+		c_id INT NOT NULL,
+		c_discount DECIMAL(4,4),
+		c_credit CHAR(2),
+		c_last VARCHAR(16),
+		c_first VARCHAR(16),
+		c_credit_lim DECIMAL(12,2),
+		c_balance DECIMAL(12,2),
+		c_ytd_payment DECIMAL(12,2),
+		c_payment_cnt INT,
+		c_delivery_cnt INT,
+		c_street_1 VARCHAR(20),
+		c_street_2 VARCHAR(20),
+		c_city VARCHAR(20),
+		c_state CHAR(2),
+		c_zip CHAR(9),
+		c_phone CHAR(16),
+		c_since TIMESTAMP,
+		c_middle CHAR(2),
+		c_data VARCHAR(500),
+		PRIMARY KEY (c_w_id, c_d_id, c_id),
+		KEY bmsql_customer_idx1 (c_w_id, c_d_id, c_last, c_first)
+	)`)
+
+	td, _ := env.cat.GetTable("testdb", "bmsql_customer")
+	t.Logf("Indexes: %d, name=%s, cols=%v", len(td.Indexes), td.Indexes[0].Name, td.Indexes[0].Columns)
+
+	// Insert 30 customers (1 warehouse, 10 districts, 3 per district).
+	// c_last = "BAR" for c_id 1..15, "BAT" for c_id 16..30
+	for d := 1; d <= 10; d++ {
+		for c := 1; c <= 3; c++ {
+			id := (d-1)*3 + c
+			last := "BAR"
+			if id > 15 {
+				last = "BAT"
+			}
+			env.exec.Execute(fmt.Sprintf(
+				"INSERT INTO bmsql_customer (c_w_id, c_d_id, c_id, c_discount, c_credit, c_last, c_first, c_balance) VALUES (1, %d, %d, 0.1234, 'GC', '%s', 'FIRST_%d', 100.00)",
+				d, id, last, id))
+		}
+	}
+
+	// Verify index has entries.
+	idxTreeKey := td.IndexFile(&td.Indexes[0])
+	idxCount := 0
+	env.engine.ScanRaw(idxTreeKey, []byte{0x00}, []byte{0xFF}, func(key, value []byte) bool {
+		idxCount++
+		return true
+	})
+	t.Logf("Index entries: %d (expected 30)", idxCount)
+	if idxCount != 30 {
+		t.Fatalf("expected 30 index entries, got %d", idxCount)
+	}
+
+	// The exact Payment c_last query (simulated placeholder replacement).
+	query := "SELECT c_id, c_first FROM bmsql_customer WHERE c_w_id = 1 AND c_d_id = 5 AND c_last = 'BAR' ORDER BY c_first"
+	t.Logf("Query: %s", query)
+
+	rs, err := env.exec.Execute(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	t.Logf("Result rows: %d, data: %v", len(rows.Rows), rows.Rows)
+
+	// District 5 has c_id=13,14,15. All BAR. So 3 rows.
+	if len(rows.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows.Rows))
+	}
+
+	// Verify ordered by c_first.
+	for i, row := range rows.Rows {
+		t.Logf("  row %d: c_id=%v c_first=%v", i, row[0], row[1])
+	}
+}
+

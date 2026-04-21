@@ -24,7 +24,7 @@ func startTestServer(t *testing.T) (*Server, string) {
 	}
 	ts := txn.NewTimestampOracle()
 	w, _ := wal.Open(dir)
-	mgr := txn.NewManager(engine, ts, w)
+	mgr := txn.NewManager(engine, ts, w, 0)
 	cat, err := catalog.Open(dir)
 	if err != nil {
 		t.Fatal(err)

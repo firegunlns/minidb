@@ -1,12 +1,10 @@
+// Package bptree 实现了 B+ 树数据结构
 package bptree
 
-// lockChain tracks ancestor nodes held with write locks during optimistic
-// latch coupling for write operations. Since writeMu serializes all writers,
-// released ancestors cannot be modified by other writers.
-//
-// The chain is ordered from root toward leaf: nodes[0] is the highest
-// (closest to root) ancestor still held, nodes[len-1] is the lowest
-// (closest to leaf).
+// lockChain 锁链
+// 在乐观锁耦合写操作期间跟踪持有写锁的祖先节点
+// 由于writeMu串行化所有写操作，已释放的祖先不能被其他写操作修改
+// 链从根向叶排序：nodes[0]是最高的（最接近根）祖先，nodes[len-1]是最低的（最接近叶）
 type lockChain struct {
 	nodes []*pnode
 }

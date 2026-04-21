@@ -1,3 +1,5 @@
+// Package bptree 实现了 B+ 树数据结构
+// 本文件实现了持久化B+树，支持磁盘存储、LRU缓存、并发控制、Bloom过滤器和压缩
 package bptree
 
 import (
@@ -10,42 +12,61 @@ import (
 	"lns.com/minidb/metrics"
 )
 
+// nilPage 表示空页面的特殊ID
 const nilPage int64 = -1
 
-// pnode is the persistent counterpart of the in-memory node.
-// Pointers (children, next, parent) are replaced by page IDs.
+// pnode 持久化节点（B+树节点的磁盘版本）
+// 与内存节点node的区别：指针被页面ID替代
+// mu: 节点级锁（读写锁，用于并发控制）
+// pageID: 页面ID
+// isLeaf: 是否为叶子节点
+// keys: 存储的键
+// values: 存储的值（仅叶子节点使用）
+// indices: 逻辑索引
+// children: 子节点页面ID（仅内部节点使用）
+// next: 下一个叶子节点的页面ID（构成链表）
+// parent: 父节点页面ID
+// dirty: 是否有未写入磁盘的修改
+// bloom: Bloom过滤器（仅叶子节点使用，用于快速判断键是否可能存在）
+// overflowPages: 溢出页面ID（当节点数据超过单页大小时使用）
 type pnode struct {
-	mu            sync.RWMutex // node-level latch
+	mu            sync.RWMutex
 	pageID        int64
 	isLeaf        bool
 	keys          [][]byte
-	values        [][]byte // leaf only
+	values        [][]byte
 	indices       []int
-	children      []int64 // page IDs, internal only
-	next          int64   // leaf linked-list pointer
+	children      []int64
+	next          int64
 	parent        int64
 	dirty         bool
-	bloom         *BloomFilter // per-leaf bloom filter, nil for internal nodes
-	overflowPages []int64      // overflow page IDs associated with this node
+	bloom         *BloomFilter
+	overflowPages []int64
 }
 
-func (n *pnode) numKeys() int       { return len(n.indices) }
+// numKeys 返回节点当前存储的键数量
+func (n *pnode) numKeys() int { return len(n.indices) }
+
+// keyAt 返回指定索引位置的键
 func (n *pnode) keyAt(i int) []byte { return n.keys[n.indices[i]] }
+
+// valAt 返回指定索引位置的值
 func (n *pnode) valAt(i int) []byte { return n.values[n.indices[i]] }
 
-// PersistentBPTree is a B+ tree that persists nodes to disk through an LRU
-// buffer cache. Concurrency is managed with node-level latch coupling:
-//   - writeMu serialises writers (only one at a time).
-//   - Readers never acquire writeMu; they use per-node RLock crabbing.
-//   - rootID is accessed atomically. Readers validate after locking the root.
+// PersistentBPTree 持久化B+树
+// 通过LRU缓冲区缓存将节点持久化到磁盘
+// 并发控制使用节点级锁耦合：
+// - writeMu 串行化所有写操作
+// - 读者从不获取writeMu，而是使用每节点RLock螃蟹锁
+// - rootID通过原子操作访问，读者在锁定根节点后进行验证
 type PersistentBPTree struct {
-	writeMu       sync.Mutex // serialises writers
-	rootID        int64      // accessed via sync/atomic
-	pager         *Pager
-	cache         *LRUCache
-	order         int
-	config        Config
-	formatVersion uint32 // 1 = legacy, 2 = bloom + compression
+	writeMu       sync.Mutex // 串行化所有写操作
+	rootID        int64      // 通过sync/atomic访问
+	pager         *Pager     // 页面管理器
+	cache         *LRUCache  // LRU缓存
+	order         int        // B+树阶
+	config        Config     // 配置选项
+	formatVersion uint32     // 格式版本：1=传统版本，2=支持bloom过滤器和压缩
 }
 
 // ---------- open / close ----------
@@ -575,6 +596,65 @@ func (t *PersistentBPTree) Delete(key []byte) bool {
 	metrics.BPTreeOpDuration.WithLabelValues("delete").Observe(time.Since(start).Seconds())
 	metrics.BPTreeOpsTotal.WithLabelValues("delete").Inc()
 	return found
+}
+
+// BatchInsert inserts multiple key-value pairs with a single writeMu acquisition.
+// This is significantly more efficient than individual Insert calls when writing
+// multiple entries to the same tree because it amortizes lock overhead.
+func (t *PersistentBPTree) BatchInsert(pairs [][2][]byte) error {
+	if len(pairs) == 0 {
+		return nil
+	}
+	start := time.Now()
+	t.writeMu.Lock()
+
+	// Handle empty tree: insert first pair as root.
+	rootID := atomic.LoadInt64(&t.rootID)
+	if rootID == nilPage {
+		n, err := t.allocNode(true)
+		if err != nil {
+			t.writeMu.Unlock()
+			return err
+		}
+		n.mu.Lock()
+		n.keys = [][]byte{copyBytes(pairs[0][0])}
+		n.values = [][]byte{copyBytes(pairs[0][1])}
+		n.indices = []int{0}
+		atomic.StoreInt64(&t.rootID, n.pageID)
+		n.mu.Unlock()
+		t.unpin(n.pageID)
+		pairs = pairs[1:]
+	}
+
+	// Insert remaining pairs. insertAttempt is safe to call under writeMu
+	// since rootID is guaranteed non-nil (we hold writeMu exclusively).
+	var firstErr error
+	for _, p := range pairs {
+		if err := t.insertAttempt(p[0], p[1]); err != nil {
+			firstErr = err
+			break
+		}
+	}
+
+	t.writeMu.Unlock()
+	metrics.BPTreeOpDuration.WithLabelValues("batch_insert").Observe(time.Since(start).Seconds())
+	metrics.BPTreeOpsTotal.WithLabelValues("batch_insert").Inc()
+	return firstErr
+}
+
+// BatchDelete removes multiple keys with a single writeMu acquisition.
+func (t *PersistentBPTree) BatchDelete(keys [][]byte) {
+	if len(keys) == 0 {
+		return
+	}
+	start := time.Now()
+	t.writeMu.Lock()
+	for _, key := range keys {
+		t.deleteAttempt(key)
+	}
+	t.writeMu.Unlock()
+	metrics.BPTreeOpDuration.WithLabelValues("batch_delete").Observe(time.Since(start).Seconds())
+	metrics.BPTreeOpsTotal.WithLabelValues("batch_delete").Inc()
 }
 
 func (t *PersistentBPTree) deleteAttempt(key []byte) bool {

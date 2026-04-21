@@ -1,3 +1,5 @@
+// Package protocol 提供MySQL协议处理
+// 兼容go-mysql库，实现MySQL服务器协议
 package protocol
 
 import (
@@ -16,15 +18,15 @@ import (
 	"lns.com/minidb/txn"
 )
 
-// LnsHandler implements go-mysql Handler.
-// One instance per connection — no shared mutable state, no mutex needed.
-// Each connection's HandleCommand loop is single-goroutine, sequential.
+// SvrHandler 实现go-mysql Handler接口
+// 每个连接一个实例，无共享可变状态，无需互斥锁
+// 每个连接的HandleCommand循环是单goroutine，顺序执行
 type SvrHandler struct {
-	exec       *sql.Executor
-	engine     *storage.StorageEngine // shared, read-only
-	mgr        *txn.Manager           // shared, read-only
-	cat        *catalog.Catalog       // shared, read-only
-	autocommit bool
+	exec       *sql.Executor          // SQL执行器
+	engine     *storage.StorageEngine // 共享，只读
+	mgr        *txn.Manager           // 共享，只读
+	cat        *catalog.Catalog       // 共享，只读
+	autocommit bool                   // 是否自动提交
 }
 
 func NewSvrHandler(engine *storage.StorageEngine, mgr *txn.Manager, cat *catalog.Catalog) *SvrHandler {
@@ -47,8 +49,12 @@ func (h *SvrHandler) UseDB(dbName string) error {
 func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error) {
 	start := time.Now()
 	defer func() {
-		metrics.QueryDuration.Observe(time.Since(start).Seconds())
+		elapsed := time.Since(start)
+		metrics.QueryDuration.Observe(elapsed.Seconds())
 		metrics.QueriesTotal.WithLabelValues("query").Inc()
+		if elapsed > 5*time.Second {
+			log.Printf("Slow query (%.1fs): %.200s", elapsed.Seconds(), query)
+		}
 		if r := recover(); r != nil {
 			log.Printf("HandleQuery panic: %v", r)
 			err = fmt.Errorf("internal error: %v", r)

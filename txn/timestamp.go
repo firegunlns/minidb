@@ -1,3 +1,4 @@
+// Package txn 提供事务管理功能
 package txn
 
 import (
@@ -7,11 +8,12 @@ import (
 	"sync/atomic"
 )
 
-// TimestampOracle distributes monotonically increasing timestamps.
-// Persists the counter to a file so it survives restarts.
+// TimestampOracle 时间戳oracle
+// 分配单调递增的时间戳
+// 将计数器持久化到文件，以便重启后恢复
 type TimestampOracle struct {
-	counter uint64
-	path    string
+	counter uint64 // 时间戳计数器
+	path    string // 持久化文件路径
 }
 
 func NewTimestampOracle() *TimestampOracle {

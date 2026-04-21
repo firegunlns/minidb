@@ -1,21 +1,19 @@
+// Package txn 提供事务管理功能
 package txn
 
 import "sync"
 
-// Workspace is a private buffer for a transaction's reads and writes.
+// Workspace 事务的私有缓冲区
+// 存储事务的写集
 type Workspace struct {
 	mu       sync.RWMutex
-	writes   map[string][]byte // pk_string -> rowData (nil = delete)
-	reads    map[string]uint64 // pk_string -> commitTS at read time (for OCC validation)
-	readPKs  map[string][]byte // pk_string -> raw pk bytes
-	inserted map[string]bool   // pk_string -> true if this txn inserted it (no conflict check needed)
+	writes   map[string][]byte // pk_string -> 行数据 (nil = 删除)
+	inserted map[string]bool   // pk_string -> true表示本事务插入
 }
 
 func NewWorkspace() *Workspace {
 	return &Workspace{
 		writes:   make(map[string][]byte),
-		reads:    make(map[string]uint64),
-		readPKs:  make(map[string][]byte),
 		inserted: make(map[string]bool),
 	}
 }
@@ -55,43 +53,12 @@ func (w *Workspace) GetWrite(treeKey string, pk []byte) ([]byte, bool) {
 	return data, ok
 }
 
-// RecordRead records a read for OCC validation.
-func (w *Workspace) RecordRead(treeKey string, pk []byte, commitTS uint64) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	key := wsKey(treeKey, pk)
-	w.reads[key] = commitTS
-	w.readPKs[key] = pk
-}
-
 // IsInserted checks if a key was inserted by this txn.
 func (w *Workspace) IsInserted(treeKey string, pk []byte) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	key := wsKey(treeKey, pk)
 	return w.inserted[key]
-}
-
-// ReadSet returns all tracked reads for OCC validation.
-func (w *Workspace) ReadSet() map[string]uint64 {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	out := make(map[string]uint64, len(w.reads))
-	for k, v := range w.reads {
-		out[k] = v
-	}
-	return out
-}
-
-// WriteSet returns all buffered writes.
-func (w *Workspace) WriteSet() map[string][]byte {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	out := make(map[string][]byte, len(w.writes))
-	for k, v := range w.writes {
-		out[k] = v
-	}
-	return out
 }
 
 // IsDelete checks if a write was a delete (nil rowData).

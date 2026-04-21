@@ -1,3 +1,4 @@
+// Package bptree 实现了 B+ 树数据结构
 package bptree
 
 import (
@@ -11,41 +12,36 @@ import (
 )
 
 const (
-	defaultSlotSize        = 32768 // 32KB
-	pagerHeaderSize int64  = 4096
-	magicValue      uint32 = 0x42505452 // "BPTR"
-	currentVersion  uint32 = 2
+	defaultSlotSize        = 32768      // 默认槽大小32KB
+	pagerHeaderSize int64  = 4096       // 文件头大小
+	magicValue      uint32 = 0x42505452 // 魔数 "BPTR"
+	currentVersion  uint32 = 2          // 当前版本
 )
 
 var ErrCorrupted = errors.New("bptree: corrupted file")
 
-// fileHeader is stored at the beginning of the data file.
-// Layout (32 bytes):
-//
-//	[0:4]   Magic
-//	[4:8]   Version
-//	[8:12]  Order
-//	[12:16] SlotSize
-//	[16:24] RootPageID
-//	[24:32] PageCount
+// fileHeader 文件头
+// 存储在数据文件开头（32字节）
+// 布局：[0:4]Magic [4:8]Version [8:12]Order [12:16]SlotSize [16:24]RootPageID [24:32]PageCount
 type fileHeader struct {
-	Magic      uint32
-	Version    uint32
-	Order      uint32
-	SlotSize   uint32
-	RootPageID int64
-	PageCount  int64
+	Magic      uint32 // 魔数
+	Version    uint32 // 版本
+	Order      uint32 // B+树阶
+	SlotSize   uint32 // 槽大小
+	RootPageID int64  // 根页面ID
+	PageCount  int64  // 页面总数
 }
 
-// Pager manages fixed-size page slots in a single data file.
-// Page N is stored at file offset: pagerHeaderSize + N * slotSize.
-// Each slot layout: [4 bytes dataSize][dataSize bytes data][zero-padding].
+// Pager 页面管理器
+// 在单个数据文件中管理固定大小的页面槽
+// 页面N存储在文件偏移：pagerHeaderSize + N * slotSize
+// 每个槽布局：[4字节数据大小][数据][零填充]
 type Pager struct {
 	mu        sync.Mutex
 	file      *os.File
-	slotSize  int64
-	pageCount int64
-	freeList  []int64
+	slotSize  int64   // 槽大小
+	pageCount int64   // 页面计数
+	freeList  []int64 // 空闲页面列表
 }
 
 // NewPager opens or creates a pager backed by filePath.

@@ -1,11 +1,12 @@
+// Package bptree 实现了 B+ 树数据结构
 package bptree
 
-// Config holds optional features for PersistentBPTree.
+// Config 持久化B+树的可选配置
 type Config struct {
-	BloomEnabled    bool
-	BloomBitsPerKey int // default 10 (~1% FPR)
+	BloomEnabled    bool // 是否启用Bloom过滤器
+	BloomBitsPerKey int  // 每个键的位数，默认10（约1%误报率）
 
-	CompressionEnabled bool
+	CompressionEnabled bool // 是否启用压缩
 }
 
 // Option applies a configuration to Config.

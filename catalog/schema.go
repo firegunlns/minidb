@@ -1,25 +1,30 @@
+// Package catalog 提供数据库元数据目录功能
 package catalog
 
 import "lns.com/minidb/storage"
 
+// DatabaseDef 数据库定义
 type DatabaseDef struct {
-	Name string
+	Name string // 数据库名称
 }
 
+// TableDef 表定义
+// 存储表的完整元数据信息
 type TableDef struct {
-	Database    string
-	Name        string
-	Columns     []storage.ColumnDef
-	PKCols      []int // indices into Columns that form the primary key
-	Indexes     []IndexDef
-	ForeignKeys []ForeignKeyDef
+	Database    string              // 所属数据库
+	Name        string              // 表名
+	Columns     []storage.ColumnDef // 列定义
+	PKCols      []int               // 主键列在Columns中的索引
+	Indexes     []IndexDef          // 索引定义
+	ForeignKeys []ForeignKeyDef     // 外键定义
 }
 
+// ForeignKeyDef 外键定义
 type ForeignKeyDef struct {
-	Name       string
-	Columns    []int  // column indices in this table
-	RefTable   string // referenced table name
-	RefColumns []int  // column indices in referenced table
+	Name       string // 外键名称
+	Columns    []int  // 本表中的列索引
+	RefTable   string // 引用的表名
+	RefColumns []int  // 被引用表中的列索引
 }
 
 func (td *TableDef) PrimaryKeyColumns() []storage.ColumnDef {

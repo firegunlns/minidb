@@ -1,27 +1,28 @@
+// Package wal 提供预写日志功能
 package wal
 
-// RecordType identifies the type of WAL record.
+// RecordType WAL记录类型
 type RecordType uint8
 
 const (
-	RecInsert    RecordType = 1
-	RecUpdate    RecordType = 2
-	RecDelete    RecordType = 3
-	RecCommit    RecordType = 4
-	RecAbort     RecordType = 5
-	RecCheckpoint RecordType = 6
+	RecInsert     RecordType = 1 // 插入记录
+	RecUpdate     RecordType = 2 // 更新记录
+	RecDelete     RecordType = 3 // 删除记录
+	RecCommit     RecordType = 4 // 提交记录
+	RecAbort      RecordType = 5 // 中止记录
+	RecCheckpoint RecordType = 6 // 检查点记录
 )
 
-// Record represents a single WAL entry.
+// Record 单条WAL记录
 type Record struct {
-	Type         RecordType
-	TxnTS        uint64 // transaction start timestamp
-	CommitTS     uint64 // assigned at commit
-	CheckpointTS uint64 // for checkpoint records
-	TreeKey      string
-	PK           []byte
-	RowData      []byte
-	OldData      []byte // for updates
+	Type         RecordType // 记录类型
+	TxnTS        uint64     // 事务开始时间戳
+	CommitTS     uint64     // 提交时分配的时间戳
+	CheckpointTS uint64     // 检查点时间戳
+	TreeKey      string     // B+树键（表或索引名）
+	PK           []byte     // 主键
+	RowData      []byte     // 行数据
+	OldData      []byte     // 旧数据（用于更新）
 }
 
 // Convenience constructors.

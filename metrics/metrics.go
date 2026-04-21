@@ -1,10 +1,12 @@
+// Package metrics 提供Prometheus监控指标
+// 用于追踪数据库性能、查询延迟、事务统计等
 package metrics
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// DB buckets: 10us ~ 164ms (exponential, factor 2, 15 buckets)
+// DB buckets: 10us ~ 164ms (指数分布, 因子2, 15个桶)
 var dbBuckets = prometheus.ExponentialBuckets(0.00001, 2, 15)
 
 // --- Histograms ---
@@ -145,6 +147,10 @@ var (
 		Name: "minidb_table_scans_total",
 		Help: "Number of scan operations per table",
 	}, []string{"table", "op"})
+	IndexScanAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "minidb_index_scan_attempts_total",
+		Help: "Index scan attempts: index_used, index_missed, no_eq, no_idx, coerce_fail",
+	}, []string{"result"})
 )
 
 // --- Gauges ---
@@ -197,6 +203,7 @@ func init() {
 		GCPassesTotal,
 		TableRowsRead,
 		TableScansTotal,
+		IndexScanAttempts,
 		// Gauges
 		ActiveConnections,
 		CacheSize,

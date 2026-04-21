@@ -35,7 +35,7 @@ func TestMainGoLifecycle(t *testing.T) {
 	}
 
 	ts1 := txn.OpenTimestampOracle(dir)
-	mgr1 := txn.NewManager(engine1, ts1, w1)
+	mgr1 := txn.NewManager(engine1, ts1, w1, 0)
 	exec1 := NewExecutor(engine1, mgr1, cat1, "")
 
 	// Simulate: USE tpcc → CREATE DATABASE tpcc
@@ -129,7 +129,7 @@ func TestMainGoLifecycle(t *testing.T) {
 
 	// Also verify via SELECT.
 	ts2 := txn.OpenTimestampOracle(dir)
-	mgr2 := txn.NewManager(engine2, ts2, w2)
+	mgr2 := txn.NewManager(engine2, ts2, w2, 0)
 	exec2 := NewExecutor(engine2, mgr2, cat2, "tpcc")
 	res2, err := exec2.Execute("SELECT id, name FROM users WHERE id = 5")
 	if err != nil {

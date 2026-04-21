@@ -1,14 +1,27 @@
+// Package bptree 实现了 B+ 树数据结构
+// B+树是一种自平衡的多路搜索树，常用于数据库索引
 package bptree
 
 import (
 	"bytes"
 )
 
+// BPTree B+树主体结构
+// root: 树的根节点
+// order: B+树的阶（每个节点最多有order个子节点）
 type BPTree struct {
 	root  *node
 	order int
 }
 
+// node B+树节点
+// isLeaf: 是否为叶子节点
+// keys: 存储的键
+// values: 存储的值（仅叶子节点使用）
+// indices: 逻辑索引，用于支持节点分裂时的高效键移动
+// children: 子节点指针（仅内部节点使用）
+// next: 指向下一个叶子节点的指针（仅叶子节点使用，构成链表）
+// parent: 指向父节点的指针
 type node struct {
 	isLeaf   bool
 	keys     [][]byte
@@ -19,6 +32,8 @@ type node struct {
 	parent   *node
 }
 
+// New 创建新的B+树
+// order: B+树的阶，最小值为3
 func New(order int) *BPTree {
 	if order < 3 {
 		order = 3
@@ -26,13 +41,23 @@ func New(order int) *BPTree {
 	return &BPTree{order: order}
 }
 
+// maxKeys 返回节点能存储的最大键数
 func (t *BPTree) maxKeys() int { return t.order - 1 }
+
+// minKeys 返回节点需要保持的最小键数（低于此值触发节点合并）
 func (t *BPTree) minKeys() int { return (t.order - 1) / 2 }
 
-func (n *node) numKeys() int       { return len(n.indices) }
+// numKeys 返回节点当前存储的键数量
+func (n *node) numKeys() int { return len(n.indices) }
+
+// keyAt 返回指定索引位置的键
 func (n *node) keyAt(i int) []byte { return n.keys[n.indices[i]] }
+
+// valAt 返回指定索引位置的值
 func (n *node) valAt(i int) []byte { return n.values[n.indices[i]] }
 
+// Find 根据键查找对应的值
+// 返回值和是否找到
 func (t *BPTree) Find(key []byte) ([]byte, bool) {
 	if t.root == nil {
 		return nil, false

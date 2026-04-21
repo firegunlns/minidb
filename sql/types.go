@@ -19,11 +19,16 @@ type (
 	CreateTableStmt    struct {
 		Table   string
 		Columns []ColumnDef
+		Indexes []IndexDef
 	}
 	DropTableStmt     struct{ Table string }
 	ShowTablesStmt    struct{}
 	ShowDatabasesStmt struct{}
 	DescTableStmt     struct{ Table string }
+	ShowIndexStmt     struct {
+		Table string
+		DB    string // optional, from SHOW INDEX FROM t FROM db
+	}
 
 	InsertStmt struct {
 		Table   string
@@ -87,6 +92,12 @@ type (
 		ReferKeys  []string
 	}
 	ConstraintType int
+	CreateIndexStmt struct {
+		IndexName string
+		Table     string
+		Columns   []string
+		Unique    bool
+	}
 )
 
 const (
@@ -120,6 +131,12 @@ type ColumnDef struct {
 	Nullable  bool
 	AutoInc   bool
 	Primary   bool
+}
+
+type IndexDef struct {
+	Name    string
+	Columns []string
+	Unique  bool
 }
 
 type SetClause struct {
@@ -233,6 +250,13 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 			return &ShowTablesStmt{}, nil
 		case ast.ShowDatabases:
 			return &ShowDatabasesStmt{}, nil
+		case ast.ShowIndex:
+			s := &ShowIndexStmt{}
+			if n.Table != nil {
+				s.Table = n.Table.Name.O
+				s.DB = n.Table.Schema.O
+			}
+			return s, nil
 		}
 		return nil, fmt.Errorf("unsupported SHOW type: %v", n.Tp)
 	case *ast.CreateTableStmt:
@@ -258,6 +282,8 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		return &RollbackStmt{}, nil
 	case *ast.AlterTableStmt:
 		return convertAlterTable(n)
+	case *ast.CreateIndexStmt:
+		return convertCreateIndex(n)
 	case *ast.ExplainStmt:
 		if show, ok := n.Stmt.(*ast.ShowStmt); ok {
 			return &DescTableStmt{Table: show.Table.Name.O}, nil
@@ -314,8 +340,15 @@ func convertCreateTable(n *ast.CreateTableStmt) (*CreateTableStmt, error) {
 					}
 				}
 			}
-		case ast.ConstraintKey, ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
-			// Secondary indexes - skip for now (not supported)
+		case ast.ConstraintKey, ast.ConstraintIndex, ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
+			idx := IndexDef{
+				Name:   constraint.Name,
+				Unique: constraint.Tp == ast.ConstraintUniq || constraint.Tp == ast.ConstraintUniqKey || constraint.Tp == ast.ConstraintUniqIndex,
+			}
+			for _, key := range constraint.Keys {
+				idx.Columns = append(idx.Columns, key.Column.Name.O)
+			}
+			result.Indexes = append(result.Indexes, idx)
 		case ast.ConstraintForeignKey:
 			// Foreign keys - skip for now (not supported at table creation)
 		}
@@ -381,6 +414,20 @@ func convertAlterTable(n *ast.AlterTableStmt) (*AlterTableStmt, error) {
 			as.Name = spec.IndexName.O
 		}
 		result.Specs = append(result.Specs, as)
+	}
+	return result, nil
+}
+
+func convertCreateIndex(n *ast.CreateIndexStmt) (*CreateIndexStmt, error) {
+	result := &CreateIndexStmt{
+		IndexName: n.IndexName,
+		Table:     n.Table.Name.O,
+	}
+	if n.KeyType == ast.IndexKeyTypeUnique {
+		result.Unique = true
+	}
+	for _, part := range n.IndexPartSpecifications {
+		result.Columns = append(result.Columns, part.Column.Name.O)
 	}
 	return result, nil
 }

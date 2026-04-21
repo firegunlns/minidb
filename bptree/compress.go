@@ -1,18 +1,19 @@
+// Package bptree 实现了 B+ 树数据结构
 package bptree
 
 import (
 	"github.com/golang/snappy"
 )
 
-// Compressor transparently compresses/decompresses node data at the
-// cache-pager boundary.
+// Compressor 压缩器接口
+// 在缓存-页面管理器边界透明地压缩/解压缩节点数据
 type Compressor interface {
-	Compress(data []byte) []byte
-	Decompress(data []byte) ([]byte, error)
+	Compress(data []byte) []byte            // 压缩数据
+	Decompress(data []byte) ([]byte, error) // 解压缩数据
 }
 
-// SnappyCompressor uses snappy block compression.
-// Format: [1B flag][payload] where flag=0 means raw, flag=1 means snappy.
+// SnappyCompressor 使用Snappy块压缩
+// 格式：[1字节标志][数据] 标志=0表示原始，标志=1表示Snappy压缩
 type SnappyCompressor struct{}
 
 func (c *SnappyCompressor) Compress(data []byte) []byte {

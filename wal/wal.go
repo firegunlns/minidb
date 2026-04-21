@@ -1,3 +1,5 @@
+// Package wal 提供预写日志（WAL）功能
+// 用于确保事务的持久性和崩溃恢复
 package wal
 
 import (
@@ -13,25 +15,33 @@ import (
 )
 
 const (
-	walFileName = "wal.log"
-	magicByte   = 0xDB
+	walFileName = "wal.log" // WAL文件名
+	magicByte   = 0xDB      // 魔数字节，用于校验
 )
 
-// WAL is an append-only write-ahead log.
-// Record format on disk:
-//
-//	[1B magic][4B payloadLen][4B CRC32][payload]
-//
-// Payload format depends on record type:
-//
-//	[1B type][8B txnTS][8B commitTS][...type-specific data...]
+// WAL 预写日志
+// 是一种追加写的日志，用于确保事务的持久性
+// 磁盘格式：[1字节magic][4字节payloadLen][4字节CRC32][payload]
+// payload格式取决于记录类型：[1字节type][8字节txnTS][8字节commitTS][...类型特定数据...]
 type WAL struct {
 	mu        sync.Mutex
 	f         *os.File
-	tsCounter uint64
+	tsCounter uint64 // 时间戳计数器
+
+	// 缓冲写入通道，用于异步批量写入
+	bufCh  chan bufEntry
+	closer chan struct{}
 }
 
-// Open creates or opens a WAL file in the given directory.
+// bufEntry 缓冲写入条目
+// buf: 要写入的字节数据
+// done: 写入完成时的信号通道
+type bufEntry struct {
+	buf  []byte
+	done chan struct{}
+}
+
+// Open 创建或打开指定目录中的WAL文件
 func Open(dir string) (*WAL, error) {
 	path := filepath.Join(dir, walFileName)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
@@ -39,13 +49,52 @@ func Open(dir string) (*WAL, error) {
 		return nil, err
 	}
 	// Scan to find the highest timestamp.
-	w := &WAL{f: f}
+	w := &WAL{
+		f:      f,
+		bufCh:  make(chan bufEntry, 256),
+		closer: make(chan struct{}),
+	}
 	w.scanForTimestamp()
+	go w.writeLoop()
 	return w, nil
+}
+
+// writeLoop drains the buffered channel and writes to the file.
+// This avoids per-record mutex contention — callers only serialize on the channel.
+func (w *WAL) writeLoop() {
+	for {
+		select {
+		case <-w.closer:
+			// Drain remaining entries before exiting.
+			for {
+				select {
+				case e := <-w.bufCh:
+					if len(e.buf) > 0 {
+						w.f.Write(e.buf)
+					}
+					if e.done != nil {
+						close(e.done)
+					}
+				default:
+					return
+				}
+			}
+		case e := <-w.bufCh:
+			if len(e.buf) > 0 {
+				w.f.Write(e.buf)
+			}
+			if e.done != nil {
+				close(e.done)
+			}
+		}
+	}
 }
 
 // Close flushes and closes the WAL file.
 func (w *WAL) Close() error {
+	// Drain all pending writes.
+	w.Flush()
+	close(w.closer) // signal writeLoop to exit
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.f != nil {
@@ -53,6 +102,13 @@ func (w *WAL) Close() error {
 		return w.f.Close()
 	}
 	return nil
+}
+
+// Flush waits for all pending writes to be applied to the file.
+func (w *WAL) Flush() {
+	done := make(chan struct{})
+	w.bufCh <- bufEntry{done: done}
+	<-done
 }
 
 // Truncate empties the WAL file. Call after all dirty pages have been flushed
@@ -71,21 +127,18 @@ func (w *WAL) Truncate() error {
 }
 
 // Append writes a record to the WAL and returns the allocated timestamp.
-// Note: Sync is NOT called here - callers should sync periodically if needed.
+// Fully asynchronous — all records go to a buffered channel.
 func (w *WAL) Append(rec Record) uint64 {
 	start := time.Now()
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	ts := atomic.AddUint64(&w.tsCounter, 1)
 	switch rec.Type {
 	case RecCommit:
 		rec.CommitTS = ts
 	case RecCheckpoint:
-		// Store CheckpointTS in CommitTS field for serialization.
 		rec.CommitTS = rec.CheckpointTS
 	case RecAbort:
-		// TxnTS already set by caller.
 	default:
 		if rec.TxnTS == 0 {
 			rec.TxnTS = ts
@@ -100,18 +153,28 @@ func (w *WAL) Append(rec Record) uint64 {
 	binary.BigEndian.PutUint32(buf[5:], crc)
 	copy(buf[9:], payload)
 
-	w.f.Write(buf)
-	// Removed: w.f.Sync() - too expensive for every write
+	w.mu.Unlock()
+
+	w.bufCh <- bufEntry{buf: buf}
 
 	metrics.WALAppendDuration.Observe(time.Since(start).Seconds())
 	return ts
 }
 
 // Sync flushes the WAL to disk.
+// Uses fdatasync on Linux (skips metadata sync, faster).
+// Uses fsync on other platforms.
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.f.Sync()
+	return walFileSync(w.f)
+}
+
+// FlushAndSync waits for all pending writes to reach the file, then fsyncs.
+// This is the durable commit path: data is guaranteed on disk after return.
+func (w *WAL) FlushAndSync() error {
+	w.Flush()
+	return w.Sync()
 }
 
 // ReadAll reads all records from the WAL file.

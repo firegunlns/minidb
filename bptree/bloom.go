@@ -1,3 +1,4 @@
+// Package bptree 实现了 B+ 树数据结构
 package bptree
 
 import (
@@ -5,13 +6,14 @@ import (
 	"hash/fnv"
 )
 
-// BloomFilter is a space-efficient probabilistic data structure that tests
-// whether an element is possibly in a set. False positives are possible;
-// false negatives are not.
+// BloomFilter Bloom过滤器
+// 一种空间高效的概率数据结构，用于快速判断元素是否可能存在
+// 可能存在误报（false positive），但不会漏报（false negative）
+// 用于快速判断查询的键是否可能存在于叶子节点中，避免不必要的磁盘读取
 type BloomFilter struct {
-	bits    []uint64
-	numBits uint32
-	numHash uint8
+	bits    []uint64 // 位数组
+	numBits uint32   // 位数量
+	numHash uint8    // 哈希函数数量
 }
 
 // NewBloomFilter creates a BloomFilter sized for expectedKeys with the given
@@ -105,7 +107,7 @@ func DeserializeBloomFilter(data []byte) *BloomFilter {
 		return nil
 	}
 	numHash := data[0]
-	numBits := binary.LittleEndian.Uint32(data[1:4+1])
+	numBits := binary.LittleEndian.Uint32(data[1 : 4+1])
 	if numBits == 0 || numBits%64 != 0 {
 		return nil
 	}

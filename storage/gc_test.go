@@ -35,7 +35,7 @@ func TestGCSupersededVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Update at ts=20 — old version gets xmax=20, PK marked dirty.
+	// Update at ts=20 — new version inserted, PK marked dirty.
 	if err := engine.UpdateRow(treeKey, pk, 20, []byte("v2")); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestGCSupersededVersion(t *testing.T) {
 		t.Fatalf("expected 2 versions before GC, got %d", len(kvs))
 	}
 
-	// GC with safeTS=30 — the old version (xmax=20 < 30) should be removed.
+	// GC with safeTS=30 — the old version (xmin=10 < 30) should be removed.
 	engine.RunGC(30)
 
 	// Verify only 1 version remains.
@@ -79,7 +79,7 @@ func TestGCTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Delete at ts=20 — old version gets xmax=20, tombstone inserted, PK marked dirty.
+	// Delete at ts=20 — tombstone inserted, PK marked dirty.
 	if err := engine.DeleteRow(treeKey, pk, 20); err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +91,8 @@ func TestGCTombstone(t *testing.T) {
 		t.Fatalf("expected 2 versions before GC, got %d", len(kvs))
 	}
 
-	// GC with safeTS=30 — old version (xmax=20 < 30) is eligible.
-	// Tombstone (xmin=20 < 30, FlagDeleted) is also eligible.
+	// GC with safeTS=30 — old version (xmin=10 < 30) is eligible.
+	// Tombstone (newest version) is kept.
 	// But we must keep at least one version.
 	engine.RunGC(30)
 
@@ -121,20 +121,29 @@ func TestGCKeepsLiveVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Update at ts=20 — old version gets xmax=20, PK marked dirty.
+	// Update at ts=20 — new version inserted, PK marked dirty.
 	if err := engine.UpdateRow(treeKey, pk, 20, []byte("v2")); err != nil {
 		t.Fatal(err)
 	}
 
-	// GC with safeTS=15 — old version has xmax=20 which is NOT < 15.
-	// It should NOT be removed.
+	// GC with safeTS=15 — version 2 (xmin=20) is NOT universally visible (20 > 15),
+	// so version 1 is still needed. Both versions are kept.
 	engine.RunGC(15)
 
 	tree := engine.getTree(treeKey)
 	start, end := ScanRangeForPK(pk)
 	kvs := tree.RangeScan(start, end)
 	if len(kvs) != 2 {
-		t.Fatalf("expected 2 versions (nothing removed), got %d", len(kvs))
+		t.Fatalf("expected 2 versions (version 2 not universally visible yet), got %d", len(kvs))
+	}
+
+	// GC with safeTS=25 — version 2 (xmin=20) IS universally visible (20 < 25),
+	// so version 1 can be removed.
+	engine.RunGC(25)
+
+	kvs = tree.RangeScan(start, end)
+	if len(kvs) != 1 {
+		t.Fatalf("expected 1 version (old version removed), got %d", len(kvs))
 	}
 }
 
@@ -221,9 +230,9 @@ func TestGCMultipleUpdates(t *testing.T) {
 		t.Fatalf("expected 3 versions before GC, got %d", len(kvs))
 	}
 
-	// GC with safeTS=40 — versions with xmax < 40 are eligible.
-	// v1 (xmax=20) and v2 (xmax=30) should be removed.
-	// v3 (xmax=0) should remain.
+	// GC with safeTS=40 — older versions with xmin < 40 are eligible.
+	// v1 (xmin=10) and v2 (xmin=20) should be removed.
+	// v3 (xmin=30, newest) is kept.
 	engine.RunGC(40)
 
 	kvs = tree.RangeScan(start, end)

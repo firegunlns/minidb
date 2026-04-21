@@ -1,6 +1,8 @@
 package wal
 
 import (
+	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -20,6 +22,9 @@ func TestWALAppendAndRead(t *testing.T) {
 	w.Append(rec2)
 
 	commitTS := w.Append(CommitRecord(ts1))
+
+	// Flush to ensure all records are written before reading.
+	w.Flush()
 
 	// Read back all records.
 	records, err := w.ReadAll()
@@ -209,4 +214,11 @@ func TestWALEmpty(t *testing.T) {
 	if len(recs) != 0 {
 		t.Errorf("expected 0 records from empty WAL, got %d", len(recs))
 	}
+}
+
+func TestTemp1(t *testing.T){
+
+	data := []byte{0x00, 0x00, 0x56, 0x32, 0x66}
+	len := binary.BigEndian.Uint32(data)
+	fmt.Printf("%x", len)
 }

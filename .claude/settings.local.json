@@ -85,7 +85,16 @@
       "Bash(head:*)",
       "Bash(cd /Users/alan/work/learn/benchmarksql-5.0-mysql-support-opt-2.1/run && ./runBenchmark.sh props.minidb 2>&1)",
       "Bash(cat:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(lsof:*)",
+      "Bash(pkill:*)",
+      "Bash(tee:*)",
+      "Bash(pgrep:*)",
+      "Bash(./runBenchmark.sh:*)",
+      "Bash(killall:*)",
+      "Bash(./runDatabaseBuild.sh:*)",
+      "Bash(./runSQL.sh:*)",
+      "Bash(bash:*)"
     ]
   }
 }

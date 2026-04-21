@@ -81,13 +81,14 @@ func TestVisibilityBasic(t *testing.T) {
 }
 
 func TestVisibilityDeleted(t *testing.T) {
-	// xmin=10, xmax=20 (deleted at 20), read at ts=15 → visible (deletion not yet committed)
-	if !IsVisible(10, 20, 0, 15) {
-		t.Error("row deleted at 20 should be visible at 15")
+	// xmax is no longer used in visibility checks.
+	// A non-deleted version with xmin <= readTS is always visible.
+	// Deletion is handled by tombstones (FlagDeleted), not xmax.
+	if !IsVisible(10, 20, 0, 25) {
+		t.Error("non-deleted version with xmin=10 should be visible at ts=25 regardless of xmax")
 	}
-	// read at ts=25 → not visible (deletion committed)
-	if IsVisible(10, 20, 0, 25) {
-		t.Error("row deleted at 20 should not be visible at 25")
+	if !IsVisible(10, 20, 0, 15) {
+		t.Error("non-deleted version with xmin=10 should be visible at ts=15 regardless of xmax")
 	}
 }
 
@@ -103,8 +104,9 @@ func TestVisibilityExactBoundary(t *testing.T) {
 	if !IsVisible(10, 0, 0, 10) {
 		t.Error("row should be visible when readTS == xmin")
 	}
-	// xmin=10, xmax=20, read at ts=20 → not visible (deletion visible)
-	if IsVisible(10, 20, 0, 20) {
-		t.Error("row should not be visible when readTS == xmax")
+	// xmax is no longer used in visibility — a version with xmax set is still visible
+	// if xmin <= readTS and flags don't have FlagDeleted.
+	if !IsVisible(10, 20, 0, 20) {
+		t.Error("non-deleted version should be visible even when readTS == xmax (xmax ignored)")
 	}
 }

@@ -1,3 +1,5 @@
+// Package catalog 提供数据库元数据目录功能
+// 存储和管理数据库、表、列、索引等元数据
 package catalog
 
 import (
@@ -11,20 +13,22 @@ import (
 )
 
 const (
-	catalogOrder    = 64
-	catalogCache    = 256
-	dbTreeFile      = "__catalog_dbs.db"
-	tblTreeFile     = "__catalog_tables.db"
-	autoIncTreeFile = "__catalog_autoinc.db"
+	catalogOrder    = 64                     // 目录B+树的阶
+	catalogCache    = 256                    // 目录缓存大小
+	dbTreeFile      = "__catalog_dbs.db"     // 数据库元数据树文件
+	tblTreeFile     = "__catalog_tables.db"  // 表元数据树文件
+	autoIncTreeFile = "__catalog_autoinc.db" // 自增序列树文件
 )
 
+// Catalog 数据库目录
+// 存储所有数据库和表的元数据
 type Catalog struct {
 	mu      sync.RWMutex
 	dataDir string
-	dbTree  *bptree.PersistentBPTree
-	tblTree *bptree.PersistentBPTree
-	incTree *bptree.PersistentBPTree
-	cache   map[string]*TableDef // "db.table" -> def
+	dbTree  *bptree.PersistentBPTree // 数据库树
+	tblTree *bptree.PersistentBPTree // 表树
+	incTree *bptree.PersistentBPTree // 自增序列树
+	cache   map[string]*TableDef     // 表定义缓存 "db.table" -> TableDef
 }
 
 func Open(dataDir string) (*Catalog, error) {

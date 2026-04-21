@@ -1,7 +1,11 @@
+// Package txn 提供事务管理功能
+// 实现MVCC事务机制，无乐观锁验证
 package txn
 
 import (
 	"errors"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,36 +14,156 @@ import (
 	"lns.com/minidb/wal"
 )
 
-var ErrConflict = errors.New("transaction conflict: read set modified by another transaction")
+var errFinalized = errors.New("transaction is finalized")
 
-// Txn represents a single database transaction.
+// groupCommitter batches WAL fsync calls for concurrent transactions.
+//
+// When multiple transactions commit concurrently, only the first (leader)
+// performs the actual Flush+Sync. All others (followers) block on a condvar
+// until the leader finishes. This amortises fsync cost across the group.
+//
+//	 T1: Append WAL ──→ become leader ──→ Flush ──→ Sync ──→ Broadcast ──→ return
+//	 T2: Append WAL ──→ see flushing ──→ Cond.Wait ──────────────────→ return
+//	 T3: Append WAL ──→ see flushing ──→ Cond.Wait ──────────────────→ return
+//	                                                            ↑ leader done
+type groupCommitter struct {
+	wal  *wal.WAL
+	mu   sync.Mutex
+	cond *sync.Cond
+
+	// epoch is incremented after each successful Flush(+Sync).
+	// Followers record the epoch on entry and loop until it changes.
+	epoch    uint64
+	flushing bool
+
+	// syncMode: true = Flush+Sync (flush-log-at-trx-commit=1), false = Flush only (=2)
+	syncMode bool
+}
+
+func newGroupCommitter(w *wal.WAL, syncMode bool) *groupCommitter {
+	gc := &groupCommitter{wal: w, syncMode: syncMode}
+	gc.cond = sync.NewCond(&gc.mu)
+	return gc
+}
+
+// waitFlush joins the current group (or starts a new one) and blocks until
+// the WAL has been flushed (+ optionally synced) to disk.
+func (gc *groupCommitter) waitFlush() {
+	gc.mu.Lock()
+
+	// Fast path: nobody is flushing, become leader.
+	if !gc.flushing {
+		gc.flushing = true
+		gc.mu.Unlock()
+
+		// Leader does the I/O outside the lock.
+		gc.wal.Flush()
+		if gc.syncMode {
+			gc.wal.Sync()
+		}
+
+		// Wake up followers.
+		gc.mu.Lock()
+		gc.epoch++
+		gc.flushing = false
+		gc.cond.Broadcast()
+		gc.mu.Unlock()
+		return
+	}
+
+	// Slow path: a leader is already flushing — wait for it.
+	myEpoch := gc.epoch
+	for gc.epoch == myEpoch {
+		gc.cond.Wait()
+	}
+	gc.mu.Unlock()
+}
+
+// rowLock provides a per-key mutex for serializing concurrent writes to the same row.
+type rowLock struct {
+	mu sync.Mutex
+}
+
+// rowLockMgr manages row-level write locks.
+type rowLockMgr struct {
+	locks sync.Map // string -> *rowLock
+}
+
+func newRowLockMgr() *rowLockMgr {
+	return &rowLockMgr{}
+}
+
+// lock acquires write locks for all given keys, in sorted order to prevent deadlocks.
+func (r *rowLockMgr) lock(keys []string) {
+	sorted := make([]string, len(keys))
+	copy(sorted, keys)
+	sort.Strings(sorted)
+	for _, k := range sorted {
+		v, _ := r.locks.LoadOrStore(k, &rowLock{})
+		v.(*rowLock).mu.Lock()
+	}
+}
+
+// unlock releases write locks for all given keys.
+func (r *rowLockMgr) unlock(keys []string) {
+	for _, k := range keys {
+		if v, ok := r.locks.Load(k); ok {
+			v.(*rowLock).mu.Unlock()
+		}
+	}
+}
+
+// Txn 单个数据库事务
+// 使用MVCC快照隔离：
+// 1. 读取时使用startTS快照
+// 2. 写操作写入工作空间
+// 3. 提交时获取commitTS并应用写入
 type Txn struct {
 	mgr       *Manager
-	startTS   uint64 // snapshot timestamp
-	commitTS  uint64 // assigned at commit time
-	ws        *Workspace
-	finalized bool
+	startTS   uint64     // 快照时间戳（事务开始时的全局时间）
+	commitTS  uint64     // 提交时间戳（分配给提交的事务）
+	ws        *Workspace // 工作空间，存储事务的读写集
+	finalized bool       // 事务是否已结束
 }
 
-// Manager coordinates transactions with OCC.
+// Manager 事务管理器
 type Manager struct {
 	engine     *storage.StorageEngine
-	ts         *TimestampOracle
-	wal        *wal.WAL
+	ts         *TimestampOracle // 时间戳oracle
+	wal        *wal.WAL         // WAL日志
 	activeMu   sync.Mutex
-	activeTxns map[uint64]*Txn // startTS -> Txn
+	activeTxns map[uint64]*Txn // 活跃事务映射
+	rowLocks   *rowLockMgr      // 行级写锁
 	gcCounter  int
-	gcInterval int // run GC every N commits
+	gcInterval int // 每N次提交运行一次GC
+
+	// flushLogAtCommit WAL刷盘策略（类似innodb_flush_log_at_trx_commit）:
+	//   0 = 异步写，不等待刷盘（最快，断电可能丢失最近事务）
+	//   1 = 每次提交同步fsync（最安全，默认）—— 使用 group commit
+	//   2 = 每次提交等待写入OS页缓存，但不fsync —— 使用 group commit
+	flushLogAtCommit int
+
+	// groupCommit batches concurrent Flush+Sync calls. nil when flushLogAtCommit == 0.
+	groupCommit *groupCommitter
 }
 
-func NewManager(engine *storage.StorageEngine, ts *TimestampOracle, w *wal.WAL) *Manager {
-	return &Manager{
-		engine:     engine,
-		ts:         ts,
-		wal:        w,
-		activeTxns: make(map[uint64]*Txn),
-		gcInterval: 100,
+func NewManager(engine *storage.StorageEngine, ts *TimestampOracle, w *wal.WAL, flushLogAtCommit int) *Manager {
+	if flushLogAtCommit < 0 || flushLogAtCommit > 2 {
+		flushLogAtCommit = 1
 	}
+	m := &Manager{
+		engine:           engine,
+		ts:               ts,
+		wal:              w,
+		activeTxns:       make(map[uint64]*Txn),
+		rowLocks:         newRowLockMgr(),
+		gcInterval:       100,
+		flushLogAtCommit: flushLogAtCommit,
+	}
+	if flushLogAtCommit > 0 {
+		m.groupCommit = newGroupCommitter(w, flushLogAtCommit == 1)
+	}
+	return m
 }
 
 // Begin starts a new transaction with a snapshot timestamp.
@@ -62,7 +186,7 @@ func (m *Manager) Begin() *Txn {
 // then falling through to the storage engine at the snapshot timestamp.
 func (t *Txn) Get(treeKey string, cols []storage.ColumnDef, pk []byte) ([]byte, error) {
 	if t.finalized {
-		return nil, errors.New("transaction is finalized")
+		return nil, errFinalized
 	}
 
 	// Check workspace first.
@@ -74,23 +198,14 @@ func (t *Txn) Get(treeKey string, cols []storage.ColumnDef, pk []byte) ([]byte, 
 	}
 
 	// Read from engine at snapshot time.
-	rowData, commitTS, err := t.mgr.engine.GetRow(treeKey, pk, t.startTS)
-	if err != nil {
-		return nil, err
-	}
-
-	// Record read for OCC validation (skip if this txn inserted the key).
-	if !t.ws.IsInserted(treeKey, pk) {
-		t.ws.RecordRead(treeKey, pk, commitTS)
-	}
-
-	return rowData, nil
+	rowData, _, err := t.mgr.engine.GetRow(treeKey, pk, t.startTS)
+	return rowData, err
 }
 
 // Insert adds a new row to the workspace.
 func (t *Txn) Insert(treeKey string, pk []byte, rowData []byte) error {
 	if t.finalized {
-		return errors.New("transaction is finalized")
+		return errFinalized
 	}
 	t.ws.SetWrite(treeKey, pk, rowData)
 	t.ws.SetInsert(treeKey, pk)
@@ -100,15 +215,7 @@ func (t *Txn) Insert(treeKey string, pk []byte, rowData []byte) error {
 // Update buffers an update in the workspace.
 func (t *Txn) Update(treeKey string, cols []storage.ColumnDef, pk []byte, newRow []byte) error {
 	if t.finalized {
-		return errors.New("transaction is finalized")
-	}
-	// Record the current version for OCC validation.
-	if !t.ws.IsInserted(treeKey, pk) {
-		_, commitTS, err := t.mgr.engine.GetRow(treeKey, pk, t.startTS)
-		if err != nil {
-			return err
-		}
-		t.ws.RecordRead(treeKey, pk, commitTS)
+		return errFinalized
 	}
 	t.ws.SetWrite(treeKey, pk, newRow)
 	return nil
@@ -117,14 +224,7 @@ func (t *Txn) Update(treeKey string, cols []storage.ColumnDef, pk []byte, newRow
 // Delete buffers a delete in the workspace.
 func (t *Txn) Delete(treeKey string, cols []storage.ColumnDef, pk []byte) error {
 	if t.finalized {
-		return errors.New("transaction is finalized")
-	}
-	if !t.ws.IsInserted(treeKey, pk) {
-		_, commitTS, err := t.mgr.engine.GetRow(treeKey, pk, t.startTS)
-		if err != nil {
-			return err
-		}
-		t.ws.RecordRead(treeKey, pk, commitTS)
+		return errFinalized
 	}
 	t.ws.SetDelete(treeKey, pk)
 	return nil
@@ -132,9 +232,6 @@ func (t *Txn) Delete(treeKey string, cols []storage.ColumnDef, pk []byte) error 
 
 // Scan iterates over rows in a key range, merging workspace writes with engine data.
 func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, fn func(pk, row []byte) bool) {
-	if t.finalized {
-		return
-	}
 
 	// Collect workspace writes in the range.
 	wsResults := make(map[string][]byte)
@@ -150,24 +247,47 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 
 	// Scan engine and combine with workspace.
 	seen := make(map[string]bool)
-	t.mgr.engine.ScanRange(treeKey, start, end, t.startTS, func(pk, row []byte) bool {
-		pkStr := string(pk)
-		seen[pkStr] = true
-		// Check if workspace overrides this.
-		if wsData, ok := wsResults[pkStr]; ok {
-			if wsData != nil {
-				if !fn(pk, wsData) {
-					return false
+	isIndex := strings.Contains(treeKey, "__idx__")
+
+	if isIndex {
+		// Index trees use raw scan (no MVCC).
+		t.mgr.engine.ScanRaw(treeKey, start, end, func(key, value []byte) bool {
+			pkStr := string(key)
+			seen[pkStr] = true
+			if wsData, ok := wsResults[pkStr]; ok {
+				if wsData != nil {
+					if !fn(key, wsData) {
+						return false
+					}
 				}
+				return true
 			}
-			// nil = deleted, skip
+			if !fn(key, value) {
+				return false
+			}
 			return true
-		}
-		if !fn(pk, row) {
-			return false
-		}
-		return true
-	})
+		})
+	} else {
+		// Data trees use MVCC scan.
+		t.mgr.engine.ScanRange(treeKey, start, end, t.startTS, func(pk, row []byte) bool {
+			pkStr := string(pk)
+			seen[pkStr] = true
+			// Check if workspace overrides this.
+			if wsData, ok := wsResults[pkStr]; ok {
+				if wsData != nil {
+					if !fn(pk, wsData) {
+						return false
+					}
+				}
+				// nil = deleted, skip
+				return true
+			}
+			if !fn(pk, row) {
+				return false
+			}
+			return true
+		})
+	}
 
 	// Add workspace inserts that weren't in the engine scan.
 	for pkStr, data := range wsResults {
@@ -183,11 +303,10 @@ func (t *Txn) Scan(treeKey string, cols []storage.ColumnDef, start, end []byte, 
 	}
 }
 
-// Commit validates the read set, writes to WAL, and applies writes.
+// Commit writes to WAL and applies writes. No OCC validation.
 func (t *Txn) Commit() error {
-	start := time.Now()
 	if t.finalized {
-		return errors.New("transaction is finalized")
+		return errFinalized
 	}
 	t.finalized = true
 	metrics.ActiveTransactions.Dec()
@@ -195,58 +314,94 @@ func (t *Txn) Commit() error {
 	delete(t.mgr.activeTxns, t.startTS)
 	t.mgr.activeMu.Unlock()
 
-	// Validate read set: re-read each key and check commitTS hasn't changed.
-	readSet := t.ws.ReadSet()
-	validateStart := time.Now()
-	for key, origTS := range readSet {
-		pk := t.ws.readPKs[key]
-		treeKey := wsKeyToTree(key)
-		_, curTS, err := t.mgr.engine.GetRow(treeKey, pk, ^uint64(0))
-		if err != nil {
-			return err
-		}
-		if curTS != origTS {
-			metrics.TxnConflictsTotal.Inc()
-			metrics.TxnDuration.WithLabelValues("commit").Observe(time.Since(start).Seconds())
-			return ErrConflict
-		}
+	// Fast path: read-only transaction (no writes to apply).
+	t.ws.mu.RLock()
+	writeCount := len(t.ws.writes)
+	if writeCount == 0 {
+		t.ws.mu.RUnlock()
+		metrics.TxnCommitsTotal.Inc()
+		return nil
 	}
-	metrics.TxnCommitValidateDuration.Observe(time.Since(validateStart).Seconds())
+
+	// Snapshot writes under lock.
+	writeSet := make(map[string][]byte, writeCount)
+	writeKeys := make([]string, 0, writeCount)
+	for k, v := range t.ws.writes {
+		writeSet[k] = v
+		writeKeys = append(writeKeys, k)
+	}
+	inserted := make(map[string]bool, len(t.ws.inserted))
+	for k, v := range t.ws.inserted {
+		inserted[k] = v
+	}
+	t.ws.mu.RUnlock()
+
+	// Acquire row-level write locks (sorted to prevent deadlock).
+	t.mgr.rowLocks.lock(writeKeys)
 
 	// Allocate commit timestamp.
 	t.commitTS = t.mgr.ts.Next()
 
-	// Write all operations to WAL, then apply to engine.
-	writeSet := t.ws.WriteSet()
+	// Phase 1: Write WAL records + Phase 2: Prepare B+ tree batches.
+	// Combined into a single pass over the write set.
+	batches := make(map[string]*storage.TreeWriteBatch, 8)
 	for key, rowData := range writeSet {
 		treeKey, pk := wsKeyToParts(key)
+		isIndex := strings.Contains(treeKey, "__idx__")
+		isInserted := inserted[key]
+
+		// WAL record.
 		var rec wal.Record
-		if rowData == nil {
+		if rowData == nil && !isInserted {
 			rec = wal.DeleteRecord(treeKey, pk, nil)
-		} else if t.ws.IsInserted(treeKey, pk) {
-			rec = wal.InsertRecord(treeKey, pk, rowData)
-			metrics.RowsWrittenTotal.Inc()
 		} else {
-			rec = wal.UpdateRecord(treeKey, pk, nil, rowData)
-			metrics.RowsWrittenTotal.Inc()
+			rec = wal.InsertRecord(treeKey, pk, rowData)
 		}
 		rec.TxnTS = t.startTS
 		rec.CommitTS = t.commitTS
 		t.mgr.wal.Append(rec)
 
-		// Apply to engine.
-		if rowData == nil {
-			if err := t.mgr.engine.DeleteRow(treeKey, pk, t.commitTS); err != nil {
-				return err
+		// Prepare B+ tree batch.
+		var batch *storage.TreeWriteBatch
+		var err error
+
+		if isIndex {
+			batch = &storage.TreeWriteBatch{
+				TreeKey: treeKey,
+				IsIndex: true,
 			}
-		} else if t.ws.IsInserted(treeKey, pk) {
-			if err := t.mgr.engine.InsertRow(treeKey, pk, t.commitTS, rowData); err != nil {
-				return err
+			if rowData == nil && !isInserted {
+				batch.DeleteKeys = append(batch.DeleteKeys, pk)
+			} else {
+				batch.InsertPairs = append(batch.InsertPairs, [2][]byte{pk, rowData})
 			}
 		} else {
-			if err := t.mgr.engine.UpdateRow(treeKey, pk, t.commitTS, rowData); err != nil {
+			if rowData == nil {
+				batch, err = t.mgr.engine.PrepareDeleteRow(treeKey, pk, t.commitTS)
+			} else if isInserted {
+				batch, err = t.mgr.engine.PrepareInsertRow(treeKey, pk, t.commitTS, rowData)
+			} else {
+				batch, err = t.mgr.engine.PrepareUpdateRow(treeKey, pk, t.commitTS, rowData)
+			}
+			if err != nil {
+				t.mgr.rowLocks.unlock(writeKeys)
 				return err
 			}
+			metrics.RowsWrittenTotal.Inc()
+		}
+
+		if existing, ok := batches[treeKey]; ok {
+			existing.MergeBatch(batch)
+		} else {
+			batches[treeKey] = batch
+		}
+	}
+
+	// Phase 3: Apply batch writes sequentially.
+	for _, batch := range batches {
+		if err := t.mgr.engine.ApplyBatch(batch); err != nil {
+			t.mgr.rowLocks.unlock(writeKeys)
+			return err
 		}
 	}
 
@@ -255,8 +410,15 @@ func (t *Txn) Commit() error {
 	commitRec.CommitTS = t.commitTS
 	t.mgr.wal.Append(commitRec)
 
+	// Flush WAL according to flush-log-at-trx-commit setting.
+	// Uses group commit: concurrent transactions share a single Flush(+Sync).
+	if t.mgr.groupCommit != nil {
+		t.mgr.groupCommit.waitFlush()
+	}
+	// flushLogAtCommit == 0: no flush, fully async.
+
 	metrics.TxnCommitsTotal.Inc()
-	metrics.TxnDuration.WithLabelValues("commit").Observe(time.Since(start).Seconds())
+	t.mgr.rowLocks.unlock(writeKeys)
 	t.mgr.maybeRunGC()
 	return nil
 }
@@ -266,14 +428,12 @@ func (t *Txn) Rollback() {
 	if t.finalized {
 		return
 	}
-	start := time.Now()
 	t.finalized = true
 	metrics.ActiveTransactions.Dec()
 	t.mgr.activeMu.Lock()
 	delete(t.mgr.activeTxns, t.startTS)
 	t.mgr.activeMu.Unlock()
 	metrics.TxnRollbacksTotal.Inc()
-	metrics.TxnDuration.WithLabelValues("rollback").Observe(time.Since(start).Seconds())
 }
 
 // MinActiveTS returns the minimum startTS of all currently active transactions.

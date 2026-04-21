@@ -1,3 +1,4 @@
+// Package storage 提供存储引擎功能
 package storage
 
 import (
@@ -8,28 +9,29 @@ import (
 	"time"
 )
 
-// Column types.
+// ColumnType 列类型枚举
 type ColumnType uint8
 
 const (
-	ColTypeInt       ColumnType = 0x01
-	ColTypeBigInt    ColumnType = 0x02
-	ColTypeVarchar   ColumnType = 0x03
-	ColTypeDecimal   ColumnType = 0x04
-	ColTypeTimestamp ColumnType = 0x05
-	ColTypeDouble    ColumnType = 0x06
+	ColTypeInt       ColumnType = 0x01 // 32位整数
+	ColTypeBigInt    ColumnType = 0x02 // 64位整数
+	ColTypeVarchar   ColumnType = 0x03 // 可变字符串
+	ColTypeDecimal   ColumnType = 0x04 // 十进制数
+	ColTypeTimestamp ColumnType = 0x05 // 时间戳
+	ColTypeDouble    ColumnType = 0x06 // 双精度浮点数
 
-	typeTagNull = 0xFF // null marker
+	typeTagNull = 0xFF // NULL标记
 )
 
+// ColumnDef 列定义
 type ColumnDef struct {
-	Name      string
-	Type      ColumnType
-	Length    int // VARCHAR max length
-	Precision int // DECIMAL precision
-	Scale     int // DECIMAL scale
-	Nullable  bool
-	AutoInc   bool
+	Name      string     // 列名
+	Type      ColumnType // 列类型
+	Length    int        // VARCHAR最大长度
+	Precision int        // DECIMAL精度
+	Scale     int        // DECIMAL小数位
+	Nullable  bool       // 是否可空
+	AutoInc   bool       // 是否自增
 }
 
 // --- Column value encoding ---
@@ -185,6 +187,28 @@ func EncodePrimaryKey(cols []ColumnDef, pkVals ...any) []byte {
 		buf = append(buf, EncodeColumnValue(col, pkVals[i])...)
 	}
 	return buf
+}
+
+// EncodeIndexKey builds a secondary index key from index column values and
+// the primary key. Format: [idx_col_1][idx_col_2]...[idx_col_N][pk].
+func EncodeIndexKey(idxCols []ColumnDef, idxVals []any, pkCols []ColumnDef, pkVals ...any) []byte {
+	var buf []byte
+	for i, col := range idxCols {
+		buf = append(buf, EncodeColumnValue(col, idxVals[i])...)
+	}
+	buf = append(buf, EncodePrimaryKey(pkCols, pkVals...)...)
+	return buf
+}
+
+// DecodeIndexKeyPK extracts the primary key bytes from an index key by
+// skipping past the encoded index column values.
+func DecodeIndexKeyPK(indexKey []byte, idxCols []ColumnDef) []byte {
+	offset := 0
+	for _, col := range idxCols {
+		_, nextOff := DecodeColumnValue(indexKey, offset, col)
+		offset = nextOff
+	}
+	return indexKey[offset:]
 }
 
 // --- Helpers ---

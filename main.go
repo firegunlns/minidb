@@ -1,3 +1,5 @@
+// MiniDB 是一个轻量级的关系型数据库引擎
+// 特性：B+树索引、MVCC多版本并发控制、OCC乐观事务、WAL预写日志
 package main
 
 import (
@@ -19,10 +21,12 @@ import (
 	"lns.com/minidb/wal"
 )
 
+// 命令行参数
 var (
-	port        = flag.Int("port", 3307, "listen port")
-	dataDir     = flag.String("data", "./test/testdb", "data directory")
-	metricsPort = flag.Int("metrics-port", 2112, "Prometheus metrics listen port")
+	port                   = flag.Int("port", 3307, "监听端口")
+	dataDir                = flag.String("data", "./test/testdb", "数据目录")
+	metricsPort            = flag.Int("metrics-port", 2112, "Prometheus监控指标监听端口")
+	flushLogAtTrxCommit    = flag.Int("flush-log-at-trx-commit", 1, "WAL刷盘策略: 0=异步写不刷盘(最快), 1=每次提交同步刷盘(最安全,默认), 2=每次提交写OS缓存但不fsync")
 )
 
 func printUsage() {
@@ -96,7 +100,7 @@ func main() {
 
 	// Create transaction manager.
 	ts := txn.OpenTimestampOracle(*dataDir)
-	mgr := txn.NewManager(engine, ts, w)
+	mgr := txn.NewManager(engine, ts, w, *flushLogAtTrxCommit)
 
 	// Start Prometheus metrics server.
 	_ = metrics.ActiveConnections // ensure metrics init() runs
@@ -119,6 +123,7 @@ func main() {
 
 	log.Printf("minidb listening on %s", addr)
 	log.Printf("Data directory: %s", *dataDir)
+	log.Printf("flush-log-at-trx-commit: %d", *flushLogAtTrxCommit)
 
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
@@ -135,7 +140,7 @@ func main() {
 	// Ignore subsequent signals so shutdown can complete.
 	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 	svr.Close()
-	cat.Close()   // flush catalog first (small, fast)
+	cat.Close()    // flush catalog first (small, fast)
 	engine.Close() // flush all data trees
-	w.Truncate()  // data is durable, safe to truncate WAL
+	w.Truncate()   // data is durable, safe to truncate WAL
 }
