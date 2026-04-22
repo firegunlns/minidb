@@ -1197,15 +1197,18 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 		end = []byte{0xFF}
 	}
 
-	// Fast path: SELECT COUNT(1) / COUNT(*) without WHERE.
+	// Fast path: SELECT COUNT(1) / COUNT(*) without WHERE and without args.
 	if s.Where == nil && len(s.SelectExprs) == 1 {
 		var countFunc bool
+		var hasArgs bool
 		if f, ok := s.SelectExprs[0].(*FuncCallExpr); ok && strings.ToUpper(f.Name) == "COUNT" {
 			countFunc = true
+			hasArgs = len(f.Args) > 0
 		} else if f, ok := s.SelectExprs[0].(*AggregateFuncExpr); ok && strings.ToUpper(f.Name) == "COUNT" {
 			countFunc = true
+			hasArgs = len(f.Args) > 0
 		}
-		if countFunc {
+		if countFunc && !hasArgs {
 			count := e.engine.CountAll(treeKey, start, end)
 			colName := "count(1)"
 			return &SelectResult{Columns: []string{colName}, Rows: [][]any{{count}}}, nil
@@ -1275,11 +1278,12 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 	}
 
 	type aggState struct {
-		count   int64
-		sum     float64
-		minVal  any
-		maxVal  any
-		hasData bool
+		count     int64 // COUNT(*) — total rows
+		sum       float64
+		avgCount  int64 // non-null values for AVG
+		minVal    any
+		maxVal    any
+		hasData   bool
 	}
 
 	agg := &aggState{}
@@ -1289,7 +1293,6 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
 			return true
 		}
-		agg.count++
 		agg.hasData = true
 		for _, expr := range s.SelectExprs {
 			switch f := expr.(type) {
@@ -1305,7 +1308,14 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 				}
 				switch strings.ToUpper(name) {
 				case "COUNT":
-					// count already incremented above
+					if len(args) == 0 {
+						agg.count++
+					} else {
+						v := e.evalExpr(td, args[0], vals)
+						if v != nil {
+							agg.count++
+						}
+					}
 				case "SUM":
 					for _, arg := range args {
 						v := e.evalExpr(td, arg, vals)
@@ -1324,6 +1334,7 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 					for _, arg := range args {
 						v := e.evalExpr(td, arg, vals)
 						if v != nil {
+							agg.avgCount++
 							switch n := v.(type) {
 							case int64:
 								agg.sum += float64(n)
@@ -1375,8 +1386,8 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 			row[i] = agg.sum
 			colNames[i] = "sum"
 		case "AVG":
-			if agg.count > 0 {
-				row[i] = agg.sum / float64(agg.count)
+			if agg.avgCount > 0 {
+				row[i] = agg.sum / float64(agg.avgCount)
 			} else {
 				row[i] = nil
 			}
@@ -2139,6 +2150,9 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 		val := e.evalExpr(td, ex.Expr, vals)
 		low := e.evalExpr(td, ex.Low, vals)
 		high := e.evalExpr(td, ex.High, vals)
+		if val == nil || low == nil || high == nil {
+			return nil
+		}
 		cmpLow := compareValues(val, low)
 		cmpHigh := compareValues(val, high)
 		result := cmpLow >= 0 && cmpHigh <= 0
@@ -2152,7 +2166,11 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 			if ex.Value != nil {
 				val := e.evalExpr(td, ex.Value, vals)
 				cmp := e.evalExpr(td, w.Cond, vals)
-				cond = compareValues(val, cmp) == 0
+				if val == nil || cmp == nil {
+					cond = false // NULL never matches in SQL
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
 			} else {
 				cond = e.evalExpr(td, w.Cond, vals)
 			}
@@ -2388,11 +2406,12 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 	treeKey := td.DataFile()
 
 	type aggState struct {
-		count   int64
-		sum     float64
-		minVal  any
-		maxVal  any
-		hasData bool
+		count     int64 // COUNT(*) — total rows
+		sum       float64
+		avgCount  int64 // non-null values for AVG
+		minVal    any
+		maxVal    any
+		hasData   bool
 	}
 
 	agg := &aggState{}
@@ -2403,7 +2422,6 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 		if s.Where != nil && !e.evalWhereWithOuter(td, vals, s.Where, outerTd, outerVals, innerAlias, outerAlias) {
 			return true
 		}
-		agg.count++
 		agg.hasData = true
 		for _, expr := range s.SelectExprs {
 			switch f := expr.(type) {
@@ -2419,7 +2437,14 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 				}
 				switch strings.ToUpper(name) {
 				case "COUNT":
-					// count already incremented above
+					if len(args) == 0 {
+						agg.count++
+					} else {
+						v := e.evalExprWithOuter(td, vals, args[0], outerTd, outerVals, innerAlias, outerAlias)
+						if v != nil {
+							agg.count++
+						}
+					}
 				case "SUM":
 					for _, arg := range args {
 						v := e.evalExprWithOuter(td, vals, arg, outerTd, outerVals, innerAlias, outerAlias)
@@ -2438,6 +2463,7 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 					for _, arg := range args {
 						v := e.evalExprWithOuter(td, vals, arg, outerTd, outerVals, innerAlias, outerAlias)
 						if v != nil {
+							agg.avgCount++
 							switch n := v.(type) {
 							case int64:
 								agg.sum += float64(n)
@@ -2489,8 +2515,8 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 			row[i] = agg.sum
 			colNames[i] = "sum"
 		case "AVG":
-			if agg.count > 0 {
-				row[i] = agg.sum / float64(agg.count)
+			if agg.avgCount > 0 {
+				row[i] = agg.sum / float64(agg.avgCount)
 			} else {
 				row[i] = nil
 			}
@@ -2601,6 +2627,9 @@ func (e *Executor) evalExprWithOuter(td *catalog.TableDef, vals []any, expr Expr
 		val := e.evalExprWithOuter(td, vals, ex.Expr, outerTd, outerVals, innerAlias, outerAlias)
 		low := e.evalExprWithOuter(td, vals, ex.Low, outerTd, outerVals, innerAlias, outerAlias)
 		high := e.evalExprWithOuter(td, vals, ex.High, outerTd, outerVals, innerAlias, outerAlias)
+		if val == nil || low == nil || high == nil {
+			return nil
+		}
 		cmpLow := compareValues(val, low)
 		cmpHigh := compareValues(val, high)
 		result := cmpLow >= 0 && cmpHigh <= 0
@@ -2614,7 +2643,11 @@ func (e *Executor) evalExprWithOuter(td *catalog.TableDef, vals []any, expr Expr
 			if ex.Value != nil {
 				val := e.evalExprWithOuter(td, vals, ex.Value, outerTd, outerVals, innerAlias, outerAlias)
 				cmp := e.evalExprWithOuter(td, vals, w.Cond, outerTd, outerVals, innerAlias, outerAlias)
-				cond = compareValues(val, cmp) == 0
+				if val == nil || cmp == nil {
+					cond = false // NULL never matches in SQL
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
 			} else {
 				cond = e.evalExprWithOuter(td, vals, w.Cond, outerTd, outerVals, innerAlias, outerAlias)
 			}
@@ -2682,21 +2715,59 @@ func (e *Executor) evalLikeExprWithOuter(td *catalog.TableDef, vals []any, expr 
 func (e *Executor) evalBinaryOp(op string, left, right any) any {
 	switch op {
 	case "=":
+		if left == nil || right == nil {
+			return nil
+		}
 		return compareValues(left, right) == 0
 	case "!=":
+		if left == nil || right == nil {
+			return nil
+		}
 		return compareValues(left, right) != 0
 	case "<":
+		if left == nil || right == nil {
+			return nil
+		}
 		return compareValues(left, right) < 0
 	case "<=":
+		if left == nil || right == nil {
+			return nil
+		}
 		return compareValues(left, right) <= 0
 	case ">":
+		if left == nil || right == nil {
+			return nil
+		}
 		return compareValues(left, right) > 0
 	case ">=":
+		if left == nil || right == nil {
+			return nil
+		}
 		return compareValues(left, right) >= 0
 	case "AND":
-		return toBool(left) && toBool(right)
+		// SQL three-valued logic: NULL AND false = false, NULL AND true = NULL
+		lb, lok := toBoolNil(left)
+		rb, rok := toBoolNil(right)
+		if !lok || !rok {
+			// At least one is NULL
+			if (lok && !lb) || (rok && !rb) {
+				return false // NULL AND false = false
+			}
+			return nil // NULL AND true/NULL = NULL
+		}
+		return lb && rb
 	case "OR":
-		return toBool(left) || toBool(right)
+		// SQL three-valued logic: NULL OR true = true, NULL OR false = NULL
+		lb, lok := toBoolNil(left)
+		rb, rok := toBoolNil(right)
+		if !lok || !rok {
+			// At least one is NULL
+			if (lok && lb) || (rok && rb) {
+				return true // NULL OR true = true
+			}
+			return nil // NULL OR false/NULL = NULL
+		}
+		return lb || rb
 	case "IN":
 		return e.evalIn(left, right)
 	case "LIKE":
@@ -3549,18 +3620,25 @@ func compareValues(a, b any) int {
 }
 
 func toBool(v any) bool {
+	b, _ := toBoolNil(v)
+	return b
+}
+
+// toBoolNil returns (bool-value, true) for non-nil values,
+// or (false, false) for nil. Used for SQL three-valued logic.
+func toBoolNil(v any) (bool, bool) {
 	if v == nil {
-		return false
+		return false, false
 	}
 	switch b := v.(type) {
 	case bool:
-		return b
+		return b, true
 	case int32:
-		return b != 0
+		return b != 0, true
 	case int64:
-		return b != 0
+		return b != 0, true
 	}
-	return false
+	return false, false
 }
 
 func toInt64(v any) (int64, bool) {

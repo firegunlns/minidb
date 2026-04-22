@@ -109,7 +109,8 @@
       "Bash(grep query line 99\\\\|query line 100\\\\|query line 94:*)",
       "Bash(grep query line:*)",
       "Bash(./sqllogictest/runner/runner:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(cat:)"
     ]
   }
 }

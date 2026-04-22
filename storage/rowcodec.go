@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -180,11 +181,26 @@ func DecodeRow(data []byte, cols []ColumnDef) ([]any, []bool) {
 
 // --- Primary key encoding ---
 
+// nullPKCounter provides unique disambiguators for NULL primary keys.
+var nullPKCounter uint64
+
 // EncodePrimaryKey encodes a composite primary key from column values.
+// When any PK value is nil, a unique 8-byte suffix is appended so that
+// multiple rows with NULL PK don't collide in the B-tree.
 func EncodePrimaryKey(cols []ColumnDef, pkVals ...any) []byte {
 	var buf []byte
+	hasNull := false
 	for i, col := range cols {
+		if pkVals[i] == nil {
+			hasNull = true
+		}
 		buf = append(buf, EncodeColumnValue(col, pkVals[i])...)
+	}
+	if hasNull {
+		// Append a unique 8-byte counter so NULL PK rows don't collide.
+		suffix := make([]byte, 8)
+		binary.BigEndian.PutUint64(suffix, atomic.AddUint64(&nullPKCounter, 1))
+		buf = append(buf, suffix...)
 	}
 	return buf
 }
