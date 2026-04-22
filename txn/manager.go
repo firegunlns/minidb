@@ -386,6 +386,7 @@ func (t *Txn) Commit() error {
 
 	// Phase 1: Write WAL records + Phase 2: Prepare B+ tree batches.
 	// Combined into a single pass over the write set.
+	tPrep := time.Now()
 	batches := make(map[string]*storage.TreeWriteBatch, 8)
 	for key, rowData := range writeSet {
 		treeKey, pk := wsKeyToParts(key)
@@ -438,14 +439,17 @@ func (t *Txn) Commit() error {
 			batches[treeKey] = batch
 		}
 	}
+	metrics.TxnCommitWALPrepareDuration.Observe(time.Since(tPrep).Seconds())
 
 	// Phase 3: Apply batch writes sequentially.
+	tApply := time.Now()
 	for _, batch := range batches {
 		if err := t.mgr.engine.ApplyBatch(batch); err != nil {
 			t.mgr.rowLocks.unlock(writeKeys)
 			return err
 		}
 	}
+	metrics.TxnCommitApplyDuration.Observe(time.Since(tApply).Seconds())
 
 	// Write commit record to WAL.
 	commitRec := wal.CommitRecord(t.startTS)
@@ -454,9 +458,11 @@ func (t *Txn) Commit() error {
 
 	// Flush WAL according to flush-log-at-trx-commit setting.
 	// Uses group commit: concurrent transactions share a single Flush(+Sync).
+	tFlush := time.Now()
 	if t.mgr.groupCommit != nil {
 		t.mgr.groupCommit.waitFlush()
 	}
+	metrics.TxnCommitWaitFlushDuration.Observe(time.Since(tFlush).Seconds())
 	// flushLogAtCommit == 0: no flush, fully async.
 
 	metrics.TxnCommitsTotal.Inc()

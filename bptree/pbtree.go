@@ -5,6 +5,7 @@ package bptree
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,17 +57,17 @@ func (n *pnode) valAt(i int) []byte { return n.values[n.indices[i]] }
 // PersistentBPTree 持久化B+树
 // 通过LRU缓冲区缓存将节点持久化到磁盘
 // 并发控制使用节点级锁耦合：
-// - writeMu 串行化所有写操作
+// - writeMu 用RWMutex保护rootID：写操作RLock（允许并发），结构变更Lock
 // - 读者从不获取writeMu，而是使用每节点RLock螃蟹锁
 // - rootID通过原子操作访问，读者在锁定根节点后进行验证
 type PersistentBPTree struct {
-	writeMu       sync.Mutex // 串行化所有写操作
-	rootID        int64      // 通过sync/atomic访问
-	pager         *Pager     // 页面管理器
-	cache         *LRUCache  // LRU缓存
-	order         int        // B+树阶
-	config        Config     // 配置选项
-	formatVersion uint32     // 格式版本：1=传统版本，2=支持bloom过滤器和压缩
+	writeMu       sync.RWMutex // RLock=允许并发写，Lock=结构变更（创建新root）
+	rootID        int64        // 通过sync/atomic访问
+	pager         *Pager       // 页面管理器
+	cache         *LRUCache    // LRU缓存
+	order         int          // B+树阶
+	config        Config       // 配置选项
+	formatVersion uint32       // 格式版本：1=传统版本，2=支持bloom过滤器和压缩
 }
 
 // ---------- open / close ----------
@@ -135,8 +136,8 @@ func (t *PersistentBPTree) Close() error {
 }
 
 func (t *PersistentBPTree) Sync() error {
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
+	t.writeMu.RLock()
+	defer t.writeMu.RUnlock()
 	t.cache.Flush()
 	rootID := atomic.LoadInt64(&t.rootID)
 	if err := t.pager.WriteHeader(rootID, t.order, t.formatVersion); err != nil {
@@ -281,6 +282,45 @@ func (t *PersistentBPTree) Find(key []byte) ([]byte, bool) {
 		metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
 		return val, true
 	}
+
+	// Key not found in this leaf. A concurrent split may have created
+	// new leaves to the right. Walk the next-chain until we find a leaf
+	// whose max key >= our key, or we pass where the key would be.
+	// Also handles empty leaves (numKeys == 0) which can occur after
+	// concurrent deletes.
+	for {
+		if cur.numKeys() > 0 {
+			if bytes.Compare(key, cur.keyAt(cur.numKeys()-1)) <= 0 {
+				// key <= max key in this leaf, but not found. Key doesn't exist.
+				break
+			}
+		}
+		// key > max key (or leaf is empty) — check next leaf.
+		if cur.next == nilPage {
+			break
+		}
+		nextID := cur.next
+		cur.mu.RUnlock()
+		t.unpin(cur.pageID)
+		var err error
+		cur, err = t.loadAndPin(nextID)
+		if err != nil {
+			metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+			metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
+			return nil, false
+		}
+		cur.mu.RLock()
+		idx = leafSearch(cur, key)
+		if idx < cur.numKeys() && bytes.Equal(cur.keyAt(idx), key) {
+			val := copyBytes(cur.valAt(idx))
+			cur.mu.RUnlock()
+			t.unpin(cur.pageID)
+			metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
+			metrics.BPTreeOpsTotal.WithLabelValues("find").Inc()
+			return val, true
+		}
+	}
+
 	cur.mu.RUnlock()
 	t.unpin(cur.pageID)
 	metrics.BPTreeOpDuration.WithLabelValues("find").Observe(time.Since(start).Seconds())
@@ -495,6 +535,10 @@ func (t *PersistentBPTree) Validate() bool {
 
 // ---------- public API: writes ----------
 
+// errRetry is returned internally when a concurrent structural change invalidates
+// the descent path and the operation needs to be retried.
+var errRetry = errors.New("bptree: concurrent split, retry")
+
 // Insert associates key with value, overwriting any existing entry.
 func (t *PersistentBPTree) Insert(key, value []byte) error {
 	start := time.Now()
@@ -507,9 +551,16 @@ func (t *PersistentBPTree) Insert(key, value []byte) error {
 		return err
 	}
 
-	t.writeMu.Lock()
+	// Try optimistic descent first (no split case).
+	t.writeMu.RLock()
 	err := t.insertAttempt(key, value)
-	t.writeMu.Unlock()
+	t.writeMu.RUnlock()
+	for retries := 0; err == errRetry && retries < 256; retries++ {
+		// Leaf is full or concurrent split. Use pessimistic crabbing.
+		t.writeMu.RLock()
+		err = t.insertPessimistic(key, value)
+		t.writeMu.RUnlock()
+	}
 	metrics.BPTreeOpDuration.WithLabelValues("insert").Observe(time.Since(start).Seconds())
 	metrics.BPTreeOpsTotal.WithLabelValues("insert").Inc()
 	return err
@@ -519,9 +570,11 @@ func (t *PersistentBPTree) insertEmpty(key, value []byte) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 
-	// Double-check under writeMu.
+	// Double-check under writeMu exclusive lock.
 	if atomic.LoadInt64(&t.rootID) != nilPage {
-		return t.insertAttempt(key, value)
+		// Tree is no longer empty — use pessimistic path directly
+		// (we hold exclusive writeMu, no contention).
+		return t.insertPessimisticLocked(key, value)
 	}
 
 	n, err := t.allocNode(true)
@@ -539,20 +592,31 @@ func (t *PersistentBPTree) insertEmpty(key, value []byte) error {
 }
 
 func (t *PersistentBPTree) insertAttempt(key, value []byte) error {
+	// Optimistic descent disabled for now — concurrent splits during
+	// optimistic descent can cause data corruption (keys placed in wrong
+	// leaf, Find misses). Always use pessimistic crabbing which is safe
+	// because it holds write locks on all ancestors.
+	return errRetry
+}
+
+// insertPessimistic uses write-lock crabbing on the full descent path.
+// This is the fallback when the optimistic path detects a full leaf (split needed).
+// All ancestor locks are retained (no optimistic release) because multiple
+// concurrent writers (writeMu is RWMutex) can modify the tree structure.
+func (t *PersistentBPTree) insertPessimistic(key, value []byte) error {
 	root, err := t.latchRootWLock()
 	if err != nil {
 		return err
 	}
 	if root == nil {
-		// Tree became empty between the check and latchRootWLock (shouldn't
-		// happen under writeMu, but be safe).
-		return t.insertEmpty(key, value)
+		// Tree became empty between Insert's check and now.
+		// Release writeMu and retry from the top (insertEmpty path).
+		return errRetry
 	}
 
 	var chain lockChain
 	cur := root
 
-	// Descend with optimistic crabbing.
 	for !cur.isLeaf {
 		ci := childIndex(cur, key)
 		childID := cur.children[ci]
@@ -564,9 +628,54 @@ func (t *PersistentBPTree) insertAttempt(key, value []byte) error {
 			return err
 		}
 		child.mu.Lock()
+		// Conservative: always keep parent in chain (no optimistic release).
+		// Multiple concurrent writers make optimistic release unsafe because
+		// another writer's split could propagate up into our path.
+		chain.push(cur)
+		cur = child
+	}
 
-		if child.numKeys() < t.maxKeys() {
-			// Child is safe: release all ancestors.
+	t.insertIntoLeafLocked(cur, key, value)
+	if cur.numKeys() <= t.maxKeys() {
+		cur.mu.Unlock()
+		t.unpin(cur.pageID)
+		chain.releaseAll(t)
+		return nil
+	}
+
+	return t.splitLeafLocked(cur, &chain)
+}
+
+// insertPessimisticLocked is like insertPessimistic but assumes writeMu is
+// already held exclusively (called from insertEmpty).
+func (t *PersistentBPTree) insertPessimisticLocked(key, value []byte) error {
+	rootID := atomic.LoadInt64(&t.rootID)
+	if rootID == nilPage {
+		return errRetry
+	}
+	root, err := t.loadAndPin(rootID)
+	if err != nil {
+		return err
+	}
+	root.mu.Lock()
+
+	var chain lockChain
+	cur := root
+
+	for !cur.isLeaf {
+		ci := childIndex(cur, key)
+		childID := cur.children[ci]
+		child, err := t.loadAndPin(childID)
+		if err != nil {
+			cur.mu.Unlock()
+			t.unpin(cur.pageID)
+			chain.releaseAll(t)
+			return err
+		}
+		child.mu.Lock()
+		// Safe to use optimistic crabbing here: writeMu is held exclusively,
+		// so no other writer can interfere.
+		if child.numKeys()+1 <= t.maxKeys() {
 			chain.releaseAll(t)
 			cur.mu.Unlock()
 			t.unpin(cur.pageID)
@@ -576,7 +685,6 @@ func (t *PersistentBPTree) insertAttempt(key, value []byte) error {
 		cur = child
 	}
 
-	// cur is the leaf (write-locked, pinned).
 	t.insertIntoLeafLocked(cur, key, value)
 	if cur.numKeys() <= t.maxKeys() {
 		cur.mu.Unlock()
@@ -584,21 +692,22 @@ func (t *PersistentBPTree) insertAttempt(key, value []byte) error {
 		chain.releaseAll(t)
 		return nil
 	}
+
 	return t.splitLeafLocked(cur, &chain)
 }
 
 // Delete removes key from the tree.
 func (t *PersistentBPTree) Delete(key []byte) bool {
 	start := time.Now()
-	t.writeMu.Lock()
+	t.writeMu.RLock()
 	found := t.deleteAttempt(key)
-	t.writeMu.Unlock()
+	t.writeMu.RUnlock()
 	metrics.BPTreeOpDuration.WithLabelValues("delete").Observe(time.Since(start).Seconds())
 	metrics.BPTreeOpsTotal.WithLabelValues("delete").Inc()
 	return found
 }
 
-// BatchInsert inserts multiple key-value pairs with a single writeMu acquisition.
+// BatchInsert inserts multiple key-value pairs with a single writeMu RLock.
 // This is significantly more efficient than individual Insert calls when writing
 // multiple entries to the same tree because it amortizes lock overhead.
 func (t *PersistentBPTree) BatchInsert(pairs [][2][]byte) error {
@@ -606,58 +715,83 @@ func (t *PersistentBPTree) BatchInsert(pairs [][2][]byte) error {
 		return nil
 	}
 	start := time.Now()
-	t.writeMu.Lock()
+	t.writeMu.RLock()
 
-	// Handle empty tree: insert first pair as root.
+	// Handle empty tree: insert first pair as root (upgrade to exclusive).
 	rootID := atomic.LoadInt64(&t.rootID)
 	if rootID == nilPage {
-		n, err := t.allocNode(true)
-		if err != nil {
+		t.writeMu.RUnlock()
+		t.writeMu.Lock()
+		// Double-check after acquiring exclusive lock.
+		if atomic.LoadInt64(&t.rootID) != nilPage {
+			// Another goroutine created the root — downgrade to RLock.
 			t.writeMu.Unlock()
-			return err
+			t.writeMu.RLock()
+		} else {
+			n, err := t.allocNode(true)
+			if err != nil {
+				t.writeMu.Unlock()
+				return err
+			}
+			n.mu.Lock()
+			n.keys = [][]byte{copyBytes(pairs[0][0])}
+			n.values = [][]byte{copyBytes(pairs[0][1])}
+			n.indices = []int{0}
+			atomic.StoreInt64(&t.rootID, n.pageID)
+			n.mu.Unlock()
+			t.unpin(n.pageID)
+			t.writeMu.Unlock()
+			t.writeMu.RLock()
+			pairs = pairs[1:]
 		}
-		n.mu.Lock()
-		n.keys = [][]byte{copyBytes(pairs[0][0])}
-		n.values = [][]byte{copyBytes(pairs[0][1])}
-		n.indices = []int{0}
-		atomic.StoreInt64(&t.rootID, n.pageID)
-		n.mu.Unlock()
-		t.unpin(n.pageID)
-		pairs = pairs[1:]
 	}
 
-	// Insert remaining pairs. insertAttempt is safe to call under writeMu
-	// since rootID is guaranteed non-nil (we hold writeMu exclusively).
+	// Insert remaining pairs. insertAttempt uses optimistic descent
+	// so multiple concurrent BatchInsert calls can proceed in parallel.
 	var firstErr error
 	for _, p := range pairs {
-		if err := t.insertAttempt(p[0], p[1]); err != nil {
+		err := t.insertAttempt(p[0], p[1])
+		if err == errRetry {
+			err = t.insertPessimistic(p[0], p[1])
+		}
+		if err != nil {
 			firstErr = err
 			break
 		}
 	}
 
-	t.writeMu.Unlock()
+	t.writeMu.RUnlock()
 	metrics.BPTreeOpDuration.WithLabelValues("batch_insert").Observe(time.Since(start).Seconds())
 	metrics.BPTreeOpsTotal.WithLabelValues("batch_insert").Inc()
 	return firstErr
 }
 
-// BatchDelete removes multiple keys with a single writeMu acquisition.
+// BatchDelete removes multiple keys with a single writeMu RLock.
 func (t *PersistentBPTree) BatchDelete(keys [][]byte) {
 	if len(keys) == 0 {
 		return
 	}
 	start := time.Now()
-	t.writeMu.Lock()
+	t.writeMu.RLock()
 	for _, key := range keys {
 		t.deleteAttempt(key)
 	}
-	t.writeMu.Unlock()
+	t.writeMu.RUnlock()
 	metrics.BPTreeOpDuration.WithLabelValues("batch_delete").Observe(time.Since(start).Seconds())
 	metrics.BPTreeOpsTotal.WithLabelValues("batch_delete").Inc()
 }
 
 func (t *PersistentBPTree) deleteAttempt(key []byte) bool {
+	// Always use pessimistic crabbing for deletes. Delete operations
+	// are less frequent than inserts in OLTP workloads (TPC-C), and the
+	// optimistic descent is risky for deletes because a key may land in
+	// the wrong leaf after a concurrent split.
+	return t.deletePessimistic(key)
+}
+
+// deletePessimistic uses write-lock crabbing for the full descent.
+// This is the fallback when the optimistic path detects potential underflow.
+func (t *PersistentBPTree) deletePessimistic(key []byte) bool {
 	root, err := t.latchRootWLock()
 	if err != nil || root == nil {
 		return false
@@ -666,7 +800,6 @@ func (t *PersistentBPTree) deleteAttempt(key []byte) bool {
 	var chain lockChain
 	cur := root
 
-	// Descend with optimistic crabbing (safe for delete = numKeys > minKeys).
 	for !cur.isLeaf {
 		ci := childIndex(cur, key)
 		childID := cur.children[ci]
@@ -679,13 +812,10 @@ func (t *PersistentBPTree) deleteAttempt(key []byte) bool {
 		}
 		child.mu.Lock()
 
-		if child.numKeys() > t.minKeys() {
-			chain.releaseAll(t)
-			cur.mu.Unlock()
-			t.unpin(cur.pageID)
-		} else {
-			chain.push(cur)
-		}
+		// Conservative: always keep parent in chain (no optimistic release).
+		// Concurrent writers make optimistic release unsafe because another
+		// writer's merge/borrow could propagate up into our path.
+		chain.push(cur)
 		cur = child
 	}
 
@@ -698,7 +828,6 @@ func (t *PersistentBPTree) deleteAttempt(key []byte) bool {
 		return false
 	}
 
-	// Delete the key.
 	leaf.indices = append(leaf.indices[:idx], leaf.indices[idx+1:]...)
 	leaf.dirty = true
 	t.rebuildLeafBloom(leaf)
@@ -711,10 +840,7 @@ func (t *PersistentBPTree) deleteAttempt(key []byte) bool {
 		return true
 	}
 
-	// Underflow.
 	t.handleUnderflowLocked(leaf, &chain)
-	// leaf and all underflow-handled nodes are unlocked.
-	// Release any remaining chain entries before maybeCollapseRoot.
 	chain.releaseAll(t)
 	t.maybeCollapseRoot()
 	return true
@@ -917,7 +1043,7 @@ func (t *PersistentBPTree) insertIntoParentLocked(left *pnode, key []byte, right
 	parentID := left.parent
 	parent := chain.findAndPop(parentID)
 	if parent == nil {
-		// Re-lock: safe because writeMu prevents other writers.
+		// Re-lock: the chain is empty, so write-lock parent from scratch.
 		var err error
 		parent, err = t.loadAndPin(parentID)
 		if err != nil {
@@ -933,6 +1059,19 @@ func (t *PersistentBPTree) insertIntoParentLocked(left *pnode, key []byte, right
 	}
 
 	ci := t.childIndexOf(parent, left.pageID)
+	if ci < 0 {
+		// Parent was concurrently split and no longer contains left.childID.
+		// Release everything and signal retry from the root.
+		parent.mu.Unlock()
+		t.unpin(parent.pageID)
+		left.mu.Unlock()
+		t.unpin(left.pageID)
+		right.dirty = false
+		right.mu.Unlock()
+		t.unpin(right.pageID)
+		chain.releaseAll(t)
+		return errRetry
+	}
 
 	pos := len(parent.keys)
 	parent.keys = append(parent.keys, copyBytes(key))

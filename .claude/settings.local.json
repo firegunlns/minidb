@@ -94,7 +94,8 @@
       "Bash(killall:*)",
       "Bash(./runDatabaseBuild.sh:*)",
       "Bash(./runSQL.sh:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(git stash:*)"
     ]
   }
 }

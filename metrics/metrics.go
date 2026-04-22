@@ -165,6 +165,22 @@ var (
 		Help:    "execSelectSimple: sort + limit + result building duration",
 		Buckets: dbBuckets,
 	})
+	// Commit() internal stages.
+	TxnCommitWALPrepareDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_commit_wal_prepare_duration_seconds",
+		Help:    "Commit Phase 1+2: WAL append + B+ tree batch prepare duration",
+		Buckets: dbBuckets,
+	})
+	TxnCommitApplyDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_commit_apply_duration_seconds",
+		Help:    "Commit Phase 3: ApplyBatch (B+ tree writes) duration",
+		Buckets: dbBuckets,
+	})
+	TxnCommitWaitFlushDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "minidb_txn_commit_wait_flush_duration_seconds",
+		Help:    "Commit: group commit waitFlush duration (WAL Flush+Sync)",
+		Buckets: dbBuckets,
+	})
 )
 
 // --- Counters ---
@@ -286,6 +302,9 @@ func init() {
 		SelectOptPathDuration,
 		SelectScanLoopDuration,
 		SelectPostProcessDuration,
+		TxnCommitWALPrepareDuration,
+		TxnCommitApplyDuration,
+		TxnCommitWaitFlushDuration,
 		// Counters
 		QueriesTotal,
 		TxnCommitsTotal,
