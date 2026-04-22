@@ -39,6 +39,7 @@ type (
 		TableRef    TableRef
 		Columns     []string
 		SelectExprs []Expr
+		Fields      []SelectField // unified projection fields in SELECT order
 		SelectAll   bool
 		Where       Expr
 		OrderBy     []OrderByClause
@@ -146,7 +147,16 @@ type SetClause struct {
 
 type OrderByClause struct {
 	Column string
+	Expr   Expr
+	Pos    int // 1-based positional reference, 0 = not used
 	Desc   bool
+}
+
+// SelectField represents one output column in SELECT.
+type SelectField struct {
+	Column string // non-empty for simple column ref
+	Expr   Expr   // non-nil for expression
+	Alias  string // optional AS alias
 }
 
 // Expr types.
@@ -169,7 +179,7 @@ type (
 	}
 	ParamExpr   struct{}
 	NullExpr    struct{}
-	BetweenExpr struct{ Expr, Low, High Expr }
+	BetweenExpr struct{ Expr, Low, High Expr; Not bool }
 	InExpr      struct {
 		Expr   Expr
 		Values []Expr
@@ -197,6 +207,15 @@ type (
 		Args     []Expr
 		Distinct bool
 	}
+	CaseExpr struct {
+		Value Expr       // optional compare value (CASE x WHEN ...)
+		Whens []CaseWhen // WHEN condition THEN result
+		Else  Expr       // optional ELSE result
+	}
+	CaseWhen struct {
+		Cond   Expr
+		Result Expr
+	}
 )
 
 func (LiteralExpr) exprNode()       {}
@@ -213,6 +232,7 @@ func (SubqueryExpr) exprNode()      {}
 func (ExistsExpr) exprNode()        {}
 func (LikeExpr) exprNode()          {}
 func (AggregateFuncExpr) exprNode() {}
+func (CaseExpr) exprNode()          {}
 
 type Stmt any
 
@@ -486,12 +506,18 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 				result.SelectAll = true
 			} else if colName := getColumnName(field.Expr); colName != "" {
 				result.Columns = append(result.Columns, colName)
+				result.Fields = append(result.Fields, SelectField{Column: colName})
 			} else {
 				expr, err := convertExpr(field.Expr)
 				if err != nil {
 					return nil, err
 				}
 				result.SelectExprs = append(result.SelectExprs, expr)
+				alias := ""
+				if field.AsName.O != "" {
+					alias = field.AsName.O
+				}
+				result.Fields = append(result.Fields, SelectField{Expr: expr, Alias: alias})
 			}
 		}
 	}
@@ -504,10 +530,33 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 	}
 	if n.OrderBy != nil {
 		for _, item := range n.OrderBy.Items {
-			result.OrderBy = append(result.OrderBy, OrderByClause{
-				Column: getColumnName(item.Expr),
-				Desc:   item.Desc,
-			})
+			ob := OrderByClause{Desc: item.Desc}
+			// Try positional reference (ORDER BY 1).
+			if pos, ok := item.Expr.(*ast.PositionExpr); ok && pos.N > 0 {
+				ob.Pos = pos.N
+				result.OrderBy = append(result.OrderBy, ob)
+				continue
+			}
+			// Try positional integer literal.
+			if lit, ok := item.Expr.(ast.ValueExpr); ok {
+				if pos, ok := lit.GetValue().(int64); ok && pos > 0 {
+					ob.Pos = int(pos)
+					result.OrderBy = append(result.OrderBy, ob)
+					continue
+				}
+			}
+			// Try column name.
+			if colName := getColumnName(item.Expr); colName != "" {
+				ob.Column = colName
+			} else {
+				// Expression-based ORDER BY.
+				expr, err := convertExpr(item.Expr)
+				if err != nil {
+					return nil, err
+				}
+				ob.Expr = expr
+			}
+			result.OrderBy = append(result.OrderBy, ob)
 		}
 	}
 	if n.Limit != nil && n.Limit.Count != nil {
@@ -534,12 +583,18 @@ func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
 				result.SelectAll = true
 			} else if colName := getColumnName(field.Expr); colName != "" {
 				result.Columns = append(result.Columns, colName)
+				result.Fields = append(result.Fields, SelectField{Column: colName})
 			} else {
 				expr, err := convertExpr(field.Expr)
 				if err != nil {
 					return nil, err
 				}
 				result.SelectExprs = append(result.SelectExprs, expr)
+				alias := ""
+				if field.AsName.O != "" {
+					alias = field.AsName.O
+				}
+				result.Fields = append(result.Fields, SelectField{Expr: expr, Alias: alias})
 			}
 		}
 	}
@@ -549,6 +604,33 @@ func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
 			return nil, err
 		}
 		result.Where = expr
+	}
+	if n.OrderBy != nil {
+		for _, item := range n.OrderBy.Items {
+			ob := OrderByClause{Desc: item.Desc}
+			if pos, ok := item.Expr.(*ast.PositionExpr); ok && pos.N > 0 {
+				ob.Pos = pos.N
+				result.OrderBy = append(result.OrderBy, ob)
+				continue
+			}
+			if lit, ok := item.Expr.(ast.ValueExpr); ok {
+				if pos, ok := lit.GetValue().(int64); ok && pos > 0 {
+					ob.Pos = int(pos)
+					result.OrderBy = append(result.OrderBy, ob)
+					continue
+				}
+			}
+			if colName := getColumnName(item.Expr); colName != "" {
+				ob.Column = colName
+			} else {
+				expr, err := convertExpr(item.Expr)
+				if err != nil {
+					return nil, err
+				}
+				ob.Expr = expr
+			}
+			result.OrderBy = append(result.OrderBy, ob)
+		}
 	}
 	if n.Limit != nil && n.Limit.Count != nil {
 		if count, err := evalLiteralInt(n.Limit.Count); err == nil {
@@ -639,7 +721,7 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BetweenExpr{Expr: expr, Low: low, High: high}, nil
+		return &BetweenExpr{Expr: expr, Low: low, High: high, Not: n.Not}, nil
 	case *ast.PatternInExpr:
 		expr, err := convertExpr(n.Expr)
 		if err != nil {
@@ -708,6 +790,26 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 			return nil, err
 		}
 		return &LikeExpr{Expr: expr, Pattern: pattern, Not: n.Not}, nil
+	case *ast.ParenthesesExpr:
+		return convertExpr(n.Expr)
+	case *ast.PositionExpr:
+		return &LiteralExpr{Value: int64(n.N)}, nil
+	case *ast.CaseExpr:
+		var value Expr
+		if n.Value != nil {
+			value, _ = convertExpr(n.Value)
+		}
+		var whens []CaseWhen
+		for _, w := range n.WhenClauses {
+			cond, _ := convertExpr(w.Expr)
+			result, _ := convertExpr(w.Result)
+			whens = append(whens, CaseWhen{Cond: cond, Result: result})
+		}
+		var elseExpr Expr
+		if n.ElseClause != nil {
+			elseExpr, _ = convertExpr(n.ElseClause)
+		}
+		return &CaseExpr{Value: value, Whens: whens, Else: elseExpr}, nil
 	default:
 		return nil, fmt.Errorf("unsupported expr type: %T", node)
 	}

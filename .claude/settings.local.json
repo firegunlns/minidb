@@ -95,7 +95,21 @@
       "Bash(./runDatabaseBuild.sh:*)",
       "Bash(./runSQL.sh:*)",
       "Bash(bash:*)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(grep tidb:*)",
+      "Bash(go env:*)",
+      "Bash(echo:*)",
+      "Bash(sqlite3 :memory::*)",
+      "Bash(echo === $test ===:*)",
+      "Bash(./runner:*)",
+      "Bash(cd /Users/alan/work/learn/minidb && ./sqllogictest/runner/runner ./sqllogictest/select1.test 2>&1)",
+      "Bash(grep CASE WHEN:*)",
+      "Bash(grep Aggregate functions:*)",
+      "Bash(grep abs\\(a\\):*)",
+      "Bash(grep query line 99\\\\|query line 100\\\\|query line 94:*)",
+      "Bash(grep query line:*)",
+      "Bash(./sqllogictest/runner/runner:*)",
+      "Bash(wc:*)"
     ]
   }
 }
