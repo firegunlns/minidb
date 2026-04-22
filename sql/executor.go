@@ -3,6 +3,8 @@ package sql
 import (
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,6 +143,10 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execCreateIndex(s)
 	case *ExplainStmt:
 		return e.execExplain(s)
+	case *SetOprStmt:
+		return e.execDMLRead(func(txn *txn.Txn) (any, error) {
+			return e.execSetOpr(txn, s)
+		})
 	default:
 		return nil, fmt.Errorf("unsupported statement: %T", stmt)
 	}
@@ -751,6 +757,205 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported table reference")
 	}
+}
+
+func (e *Executor) execSetOpr(t *txn.Txn, s *SetOprStmt) (any, error) {
+	if len(s.Selects) == 0 {
+		return nil, fmt.Errorf("empty set operation")
+	}
+
+	// Execute first SELECT
+	firstResult, err := e.execSelect(t, s.Selects[0].Select)
+	if err != nil {
+		return nil, err
+	}
+	rows := firstResult.(*SelectResult).Rows
+	columns := firstResult.(*SelectResult).Columns
+
+	// Apply subsequent set operations left to right
+	for i := 1; i < len(s.Selects); i++ {
+		nextResult, err := e.execSelect(t, s.Selects[i].Select)
+		if err != nil {
+			return nil, err
+		}
+		nextRows := nextResult.(*SelectResult).Rows
+		rows = applySetOp(rows, nextRows, s.Selects[i].Opr)
+	}
+
+	// Apply ORDER BY
+	if len(s.OrderBy) > 0 {
+		rows = sortResultRows(rows, columns, s.OrderBy)
+	}
+
+	// Apply LIMIT
+	if s.Limit != nil && len(rows) > *s.Limit {
+		rows = rows[:*s.Limit]
+	}
+
+	return &SelectResult{Columns: columns, Rows: rows}, nil
+}
+
+func rowKey(row []any) string {
+	var buf strings.Builder
+	for i, v := range row {
+		if i > 0 {
+			buf.WriteByte(0)
+		}
+		switch v := v.(type) {
+		case nil:
+			buf.WriteByte('N')
+		case int64:
+			buf.WriteByte('I')
+			buf.WriteString(strconv.FormatInt(v, 10))
+		case float64:
+			buf.WriteByte('F')
+			buf.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
+		case string:
+			buf.WriteByte('S')
+			buf.WriteString(v)
+		default:
+			buf.WriteByte('?')
+			fmt.Fprintf(&buf, "%v", v)
+		}
+	}
+	return buf.String()
+}
+
+func applySetOp(left, right [][]any, opr SetOprType) [][]any {
+	switch opr {
+	case SetOprUnion:
+		return setUnionDistinct(left, right)
+	case SetOprUnionAll:
+		return append(left, right...)
+	case SetOprExcept:
+		return setExceptDistinct(left, right)
+	case SetOprExceptAll:
+		return setExceptAll(left, right)
+	case SetOprIntersect:
+		return setIntersectDistinct(left, right)
+	case SetOprIntersectAll:
+		return setIntersectAll(left, right)
+	}
+	return left
+}
+
+func setUnionDistinct(left, right [][]any) [][]any {
+	seen := make(map[string]bool, len(left)+len(right))
+	var result [][]any
+	for _, row := range left {
+		k := rowKey(row)
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, row)
+		}
+	}
+	for _, row := range right {
+		k := rowKey(row)
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func setExceptDistinct(left, right [][]any) [][]any {
+	rightSet := make(map[string]bool, len(right))
+	for _, row := range right {
+		rightSet[rowKey(row)] = true
+	}
+	seen := make(map[string]bool)
+	var result [][]any
+	for _, row := range left {
+		k := rowKey(row)
+		if !rightSet[k] && !seen[k] {
+			seen[k] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func setExceptAll(left, right [][]any) [][]any {
+	rightCount := make(map[string]int, len(right))
+	for _, row := range right {
+		rightCount[rowKey(row)]++
+	}
+	var result [][]any
+	for _, row := range left {
+		k := rowKey(row)
+		if rightCount[k] > 0 {
+			rightCount[k]--
+		} else {
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func setIntersectDistinct(left, right [][]any) [][]any {
+	rightSet := make(map[string]bool, len(right))
+	for _, row := range right {
+		rightSet[rowKey(row)] = true
+	}
+	seen := make(map[string]bool)
+	var result [][]any
+	for _, row := range left {
+		k := rowKey(row)
+		if rightSet[k] && !seen[k] {
+			seen[k] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func setIntersectAll(left, right [][]any) [][]any {
+	rightCount := make(map[string]int, len(right))
+	for _, row := range right {
+		rightCount[rowKey(row)]++
+	}
+	var result [][]any
+	for _, row := range left {
+		k := rowKey(row)
+		if rightCount[k] > 0 {
+			rightCount[k]--
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func sortResultRows(rows [][]any, columns []string, orderBy []OrderByClause) [][]any {
+	sort.Slice(rows, func(i, j int) bool {
+		for _, ob := range orderBy {
+			var colIdx int
+			if ob.Pos > 0 && ob.Pos <= len(columns) {
+				colIdx = ob.Pos - 1
+			} else if ob.Expr != nil {
+				continue
+			} else {
+				for k, c := range columns {
+					if c == ob.Column {
+						colIdx = k
+						break
+					}
+				}
+			}
+			if colIdx >= len(rows[i]) || colIdx >= len(rows[j]) {
+				continue
+			}
+			cmp := compareValues(rows[i][colIdx], rows[j][colIdx])
+			if ob.Desc {
+				cmp = -cmp
+			}
+			if cmp != 0 {
+				return cmp < 0
+			}
+		}
+		return false
+	})
+	return rows
 }
 
 func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef) (any, error) {

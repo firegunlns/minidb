@@ -110,7 +110,11 @@
       "Bash(grep query line:*)",
       "Bash(./sqllogictest/runner/runner:*)",
       "Bash(wc:*)",
-      "Bash(cat:)"
+      "Bash(cat:)",
+      "Bash(grep memory:*)",
+      "Bash(# Wait and check\nsleep 120 && wc -l /Users/alan/.claude/projects/-Users-alan-work-learn-minidb/tasks/b9a9a37.output 2>/dev/null; ps aux | grep runner | grep -v grep | awk '{print \"MEM:\", $6/1024, \"MB\"}' 2>/dev/null)",
+      "Bash(echo === $t ===:*)",
+      "Bash(ps aux:*)"
     ]
   }
 }

@@ -99,6 +99,19 @@ type (
 		Columns   []string
 		Unique    bool
 	}
+
+	SetOprType int
+
+	SetOprStmt struct {
+		Selects []SetOprItem
+		OrderBy []OrderByClause
+		Limit   *int
+	}
+
+	SetOprItem struct {
+		Select *SelectStmt
+		Opr    SetOprType // operator preceding this select; zero value for first item
+	}
 )
 
 const (
@@ -118,6 +131,15 @@ const (
 	JoinTypeCross JoinType = 1
 	JoinTypeLeft  JoinType = 2
 	JoinTypeRight JoinType = 3
+)
+
+const (
+	SetOprUnion SetOprType = iota
+	SetOprUnionAll
+	SetOprExcept
+	SetOprExceptAll
+	SetOprIntersect
+	SetOprIntersectAll
 )
 
 func (SimpleTableRef) tableRefNode() {}
@@ -313,6 +335,8 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 			return nil, err
 		}
 		return &ExplainStmt{Inner: inner}, nil
+	case *ast.SetOprStmt:
+		return convertSetOpr(n)
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", node)
 	}
@@ -1017,4 +1041,76 @@ func getColumnName(expr ast.ExprNode) string {
 		return col.Name.Name.O
 	}
 	return ""
+}
+
+func convertSetOpr(n *ast.SetOprStmt) (*SetOprStmt, error) {
+	result := &SetOprStmt{}
+	if n.SelectList != nil {
+		if err := flattenSetOprSelectList(n.SelectList, result); err != nil {
+			return nil, err
+		}
+	}
+	if n.OrderBy != nil {
+		for _, item := range n.OrderBy.Items {
+			ob := OrderByClause{Desc: item.Desc}
+			if pos, ok := item.Expr.(*ast.PositionExpr); ok && pos.N > 0 {
+				ob.Pos = pos.N
+			} else if colName := getColumnName(item.Expr); colName != "" {
+				ob.Column = colName
+			} else {
+				expr, err := convertExpr(item.Expr)
+				if err != nil {
+					return nil, err
+				}
+				ob.Expr = expr
+			}
+			result.OrderBy = append(result.OrderBy, ob)
+		}
+	}
+	if n.Limit != nil && n.Limit.Count != nil {
+		if count, err := evalLiteralInt(n.Limit.Count); err == nil {
+			result.Limit = &count
+		}
+	}
+	return result, nil
+}
+
+func flattenSetOprSelectList(sl *ast.SetOprSelectList, result *SetOprStmt) error {
+	for i, sel := range sl.Selects {
+		switch s := sel.(type) {
+		case *ast.SelectStmt:
+			stmt, err := convertSelectStmt(s)
+			if err != nil {
+				return err
+			}
+			var opr SetOprType
+			if i > 0 && s.AfterSetOperator != nil {
+				opr = setOprTypeFromAST(*s.AfterSetOperator)
+			}
+			result.Selects = append(result.Selects, SetOprItem{Select: stmt, Opr: opr})
+		case *ast.SetOprSelectList:
+			if err := flattenSetOprSelectList(s, result); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func setOprTypeFromAST(t ast.SetOprType) SetOprType {
+	switch t {
+	case ast.Union:
+		return SetOprUnion
+	case ast.UnionAll:
+		return SetOprUnionAll
+	case ast.Except:
+		return SetOprExcept
+	case ast.ExceptAll:
+		return SetOprExceptAll
+	case ast.Intersect:
+		return SetOprIntersect
+	case ast.IntersectAll:
+		return SetOprIntersectAll
+	}
+	return SetOprUnion
 }

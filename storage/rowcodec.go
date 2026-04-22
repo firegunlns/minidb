@@ -181,27 +181,22 @@ func DecodeRow(data []byte, cols []ColumnDef) ([]any, []bool) {
 
 // --- Primary key encoding ---
 
-// nullPKCounter provides unique disambiguators for NULL primary keys.
-var nullPKCounter uint64
+// rowIDCounter provides unique row identifiers appended to every PK encoding,
+// making every row unique in the B-tree (like SQLite's implicit rowid).
+var rowIDCounter uint64
 
 // EncodePrimaryKey encodes a composite primary key from column values.
-// When any PK value is nil, a unique 8-byte suffix is appended so that
-// multiple rows with NULL PK don't collide in the B-tree.
+// A unique 8-byte rowid suffix is always appended so that rows with
+// identical or NULL PK values don't collide in the B-tree.
 func EncodePrimaryKey(cols []ColumnDef, pkVals ...any) []byte {
 	var buf []byte
-	hasNull := false
 	for i, col := range cols {
-		if pkVals[i] == nil {
-			hasNull = true
-		}
 		buf = append(buf, EncodeColumnValue(col, pkVals[i])...)
 	}
-	if hasNull {
-		// Append a unique 8-byte counter so NULL PK rows don't collide.
-		suffix := make([]byte, 8)
-		binary.BigEndian.PutUint64(suffix, atomic.AddUint64(&nullPKCounter, 1))
-		buf = append(buf, suffix...)
-	}
+	// Always append a unique 8-byte rowid so every row has a unique B-tree key.
+	suffix := make([]byte, 8)
+	binary.BigEndian.PutUint64(suffix, atomic.AddUint64(&rowIDCounter, 1))
+	buf = append(buf, suffix...)
 	return buf
 }
 
