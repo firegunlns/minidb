@@ -8,6 +8,23 @@ type DatabaseDef struct {
 	Name string // 数据库名称
 }
 
+// TableStats 表统计信息
+type TableStats struct {
+	RowCount   int64         // 总行数
+	UpdateTime int64         // unix timestamp
+	ColStats   []ColumnStats // 每列统计信息
+}
+
+// ColumnStats 列统计信息
+type ColumnStats struct {
+	Name    string // 列名
+	NDV     int64  // 不同值的数量
+	NullCnt int64  // NULL 值数量
+	MinVal  any    // 最小值 (int64, float64, or string)
+	MaxVal  any    // 最大值
+	AvgLen  int64  // varchar 列平均字节长度
+}
+
 // TableDef 表定义
 // 存储表的完整元数据信息
 type TableDef struct {
@@ -17,6 +34,7 @@ type TableDef struct {
 	PKCols      []int               // 主键列在Columns中的索引
 	Indexes     []IndexDef          // 索引定义
 	ForeignKeys []ForeignKeyDef     // 外键定义
+	Stats       *TableStats         // 统计信息 (nil until ANALYZE TABLE)
 }
 
 // ForeignKeyDef 外键定义

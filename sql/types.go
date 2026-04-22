@@ -99,6 +99,7 @@ type (
 		Columns   []string
 		Unique    bool
 	}
+	AnalyzeTableStmt struct{ Table string }
 
 	SetOprType int
 
@@ -337,6 +338,11 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		return &ExplainStmt{Inner: inner}, nil
 	case *ast.SetOprStmt:
 		return convertSetOpr(n)
+	case *ast.AnalyzeTableStmt:
+		if len(n.TableNames) > 0 {
+			return &AnalyzeTableStmt{Table: n.TableNames[0].Name.O}, nil
+		}
+		return nil, fmt.Errorf("ANALYZE TABLE: no table specified")
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", node)
 	}

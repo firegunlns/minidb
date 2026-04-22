@@ -143,6 +143,8 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execCreateIndex(s)
 	case *ExplainStmt:
 		return e.execExplain(s)
+	case *AnalyzeTableStmt:
+		return e.execAnalyzeTable(s)
 	case *SetOprStmt:
 		return e.execDMLRead(func(txn *txn.Txn) (any, error) {
 			return e.execSetOpr(txn, s)
@@ -295,6 +297,76 @@ func idxColumnDefs(td *catalog.TableDef, idx *catalog.IndexDef) []storage.Column
 		cols[i] = td.Columns[td.ColumnIndex(name)]
 	}
 	return cols
+}
+
+func (e *Executor) execAnalyzeTable(s *AnalyzeTableStmt) (any, error) {
+	if e.dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	td, err := e.cat.GetTable(e.dbName, s.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	stats := &catalog.TableStats{UpdateTime: time.Now().Unix()}
+	treeKey := td.DataFile()
+	start := []byte{0x00}
+	end := []byte{0xFF}
+
+	// Fast row count
+	stats.RowCount = e.engine.CountAll(treeKey, start, end)
+
+	// Per-column accumulators
+	stats.ColStats = make([]catalog.ColumnStats, len(td.Columns))
+	for i, col := range td.Columns {
+		stats.ColStats[i] = catalog.ColumnStats{Name: col.Name}
+	}
+	colNDV := make([]map[string]bool, len(td.Columns))
+	colNullCnt := make([]int64, len(td.Columns))
+	colMin := make([]any, len(td.Columns))
+	colMax := make([]any, len(td.Columns))
+	colStrLen := make([]int64, len(td.Columns))
+	for i := range colNDV {
+		colNDV[i] = make(map[string]bool)
+	}
+
+	// Full scan
+	e.engine.ScanAll(treeKey, start, end, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, td.Columns)
+		for i, val := range vals {
+			if val == nil {
+				colNullCnt[i]++
+				continue
+			}
+			key := fmt.Sprintf("%v", val)
+			colNDV[i][key] = true
+			if colMin[i] == nil || compareValues(val, colMin[i]) < 0 {
+				colMin[i] = val
+			}
+			if colMax[i] == nil || compareValues(val, colMax[i]) > 0 {
+				colMax[i] = val
+			}
+			if s, ok := val.(string); ok {
+				colStrLen[i] += int64(len(s))
+			}
+		}
+		return true
+	})
+
+	// Finalize
+	nonNull := stats.RowCount
+	for i := range stats.ColStats {
+		stats.ColStats[i].NDV = int64(len(colNDV[i]))
+		stats.ColStats[i].NullCnt = colNullCnt[i]
+		stats.ColStats[i].MinVal = colMin[i]
+		stats.ColStats[i].MaxVal = colMax[i]
+		if nonNull > colNullCnt[i] && colStrLen[i] > 0 {
+			stats.ColStats[i].AvgLen = colStrLen[i] / (nonNull - colNullCnt[i])
+		}
+	}
+
+	td.Stats = stats
+	return &OKResult{}, e.cat.UpdateTable(e.dbName, s.Table, td)
 }
 
 func (e *Executor) execDropTable(s *DropTableStmt) (any, error) {
@@ -1072,16 +1144,44 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 
 	// Use opt paths only when there are no expression fields (opt paths return by colIdx).
 	if !hasExprFields {
-		if s.Where != nil {
-			if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
-				rows = inRows
+		paths := e.estimateAccessPaths(td, s)
+		best := selectBestPath(paths)
+		switch best.Type {
+		case "pk_point":
+			if s.Where != nil {
+				if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
+					rows = inRows
+				}
 			}
-		}
-
-		// Optimization: use secondary index if WHERE matches an index prefix.
-		if rows == nil && s.Where != nil && len(td.Indexes) > 0 {
-			if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
-				rows = idxRows
+			// Fallback: try index scan if PK point didn't work.
+			if rows == nil && s.Where != nil && len(td.Indexes) > 0 {
+				if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
+					rows = idxRows
+				}
+			}
+		case "index_scan", "index_covering":
+			if s.Where != nil && len(td.Indexes) > 0 {
+				if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
+					rows = idxRows
+				}
+			}
+			// Fallback: try PK point if index scan didn't work.
+			if rows == nil && s.Where != nil {
+				if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
+					rows = inRows
+				}
+			}
+		default:
+			// full_scan: try PK point then index as fallback before full scan.
+			if s.Where != nil {
+				if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
+					rows = inRows
+				}
+			}
+			if rows == nil && s.Where != nil && len(td.Indexes) > 0 {
+				if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
+					rows = idxRows
+				}
 			}
 		}
 	}
@@ -2035,7 +2135,94 @@ func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
 		selectType = "JOIN"
 	}
 
-	accessType, possibleKeys, usedKey, extra := e.explainIndexInfoForSelect(tableName, s)
+	td, _ := e.cat.GetTable(e.dbName, tableName)
+
+	// Use CBO to determine access path and row estimates.
+	var paths []AccessPath
+	if td != nil {
+		paths = e.estimateAccessPaths(td, s)
+	}
+	best := selectBestPath(paths)
+
+	// Build EXPLAIN columns.
+	var accessType string
+	var possibleKeys any
+	var usedKey any
+	var extras []string
+
+	// Base extras.
+	if s.SelectAll {
+		extras = append(extras, "select tables scan")
+	} else {
+		extras = append(extras, "select columns")
+	}
+
+	// Determine access type, keys from CBO result.
+	switch best.Type {
+	case "pk_point":
+		accessType = "eq_ref"
+		usedKey = "PRIMARY"
+		possibleKeys = "PRIMARY"
+	case "pk_range":
+		accessType = "range"
+		usedKey = "PRIMARY"
+		possibleKeys = "PRIMARY"
+	case "index_covering":
+		accessType = "ref"
+		usedKey = best.IndexName
+		extras = append(extras, "using index")
+		possibleKeys = "PRIMARY"
+		if best.IndexName != "" {
+			possibleKeys = "PRIMARY," + best.IndexName
+		}
+	case "index_scan":
+		accessType = "ref"
+		usedKey = best.IndexName
+		possibleKeys = "PRIMARY"
+		if best.IndexName != "" {
+			possibleKeys = "PRIMARY," + best.IndexName
+		}
+	default:
+		accessType = "ALL"
+		usedKey = nil
+		possibleKeys = nil
+	}
+
+	if s.Where != nil {
+		extras = append(extras, "using where")
+	}
+
+	if len(s.OrderBy) > 0 {
+		// Check if ORDER BY satisfied by chosen index.
+		needsFilesort := true
+		if td != nil && best.IndexName != "" {
+			var idx *catalog.IndexDef
+			if best.IndexName == "PRIMARY" {
+				// PK order check — if ORDER BY matches PK ASC, no filesort.
+				if e.orderByMatchesPKAsc(td, s.OrderBy, s.Where) {
+					needsFilesort = false
+				}
+			} else {
+				idx = e.findIndexByName(td, best.IndexName)
+				if idx != nil && e.orderBySatisfiedByIndex(td, idx, best.MatchCols, s) {
+					needsFilesort = false
+				}
+			}
+		}
+		if needsFilesort {
+			extras = append(extras, "using filesort")
+		}
+	}
+
+	if s.Limit != nil {
+		extras = append(extras, fmt.Sprintf("limit %d", *s.Limit))
+	}
+
+	// Add CBO estimates to Extra.
+	extras = append(extras, fmt.Sprintf("est_rows=%d, cost=%.2f", best.EstRows, best.EstCost))
+	if td != nil && td.Stats != nil {
+		extras = append(extras, fmt.Sprintf("table_rows=%d", td.Stats.RowCount))
+	}
 
 	r.Rows = append(r.Rows, []any{
 		1,
@@ -2046,8 +2233,8 @@ func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
 		usedKey,
 		nil,
 		nil,
-		"estimate",
-		extra,
+		best.EstRows,
+		strings.Join(extras, "; "),
 	})
 }
 
@@ -3911,4 +4098,322 @@ func exprToString(expr Expr) string {
 	default:
 		return "?"
 	}
+}
+
+// --- CBO Cost Model ---
+
+// AccessPath represents a possible data access strategy.
+type AccessPath struct {
+	Type        string  // "full_scan", "pk_range", "pk_point", "index_scan", "index_covering"
+	IndexName   string  // name of index used (empty for full_scan)
+	MatchCols   int     // number of matched equality columns
+	EstRows     int64   // estimated output rows
+	EstCost     float64 // estimated cost
+	IsCovering  bool    // true if covering index scan
+}
+
+// defaultSelectivity returns heuristic selectivity for an operator.
+func defaultSelectivity(op string) float64 {
+	switch {
+	case op == "=" || op == "<=>":
+		return 0.05
+	case op == "!=":
+		return 0.9
+	case op == "<" || op == "<=" || op == ">" || op == ">=":
+		return 0.33
+	default:
+		return 0.33
+	}
+}
+
+// colStatsByName returns column stats for the given column name, or nil.
+func colStatsByName(stats *catalog.TableStats, name string) *catalog.ColumnStats {
+	if stats == nil {
+		return nil
+	}
+	for i := range stats.ColStats {
+		if stats.ColStats[i].Name == name {
+			return &stats.ColStats[i]
+		}
+	}
+	return nil
+}
+
+// estimateSelectivity estimates selectivity for col op val.
+func estimateSelectivity(td *catalog.TableDef, colName, op string, val any) float64 {
+	if td.Stats == nil {
+		return defaultSelectivity(op)
+	}
+	cs := colStatsByName(td.Stats, colName)
+	if cs == nil {
+		return defaultSelectivity(op)
+	}
+	if op == "=" {
+		if cs.NDV > 0 {
+			return 1.0 / float64(cs.NDV)
+		}
+		return defaultSelectivity("=")
+	}
+	// Range selectivity via min/max interpolation.
+	if cs.MinVal != nil && cs.MaxVal != nil && val != nil {
+		cmp := compareValues(val, cs.MaxVal)
+		if cmp >= 0 {
+			return 1.0
+		}
+		cmp = compareValues(val, cs.MinVal)
+		if cmp <= 0 {
+			return 0.0
+		}
+		// Linear interpolation (works well for numeric types).
+		switch minV := cs.MinVal.(type) {
+		case int64:
+			if maxV, ok := cs.MaxVal.(int64); ok {
+				if v, ok := toInt64(val); ok {
+					return float64(v-minV) / float64(maxV-minV)
+				}
+			}
+		case float64:
+			if maxV, ok := cs.MaxVal.(float64); ok {
+				if v, ok := toFloat64(val); ok {
+					return (v - minV) / (maxV - minV)
+				}
+			}
+		}
+	}
+	return defaultSelectivity(op)
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+// estimateExprSelectivity recursively estimates selectivity of an expression.
+func estimateExprSelectivity(td *catalog.TableDef, expr Expr) float64 {
+	if expr == nil {
+		return 1.0
+	}
+	switch ex := expr.(type) {
+	case *BinaryExpr:
+		switch ex.Op {
+		case "AND":
+			return estimateExprSelectivity(td, ex.Left) * estimateExprSelectivity(td, ex.Right)
+		case "OR":
+			selL := estimateExprSelectivity(td, ex.Left)
+			selR := estimateExprSelectivity(td, ex.Right)
+			return selL + selR - selL*selR
+		case "=", "!=", "<", "<=", ">", ">=":
+			colName := ""
+			var val any
+			if col, ok := ex.Left.(*ColumnRefExpr); ok {
+				colName = col.Name
+				if lit, ok := ex.Right.(*LiteralExpr); ok {
+					val = lit.Value
+				}
+			} else if col, ok := ex.Right.(*ColumnRefExpr); ok {
+				colName = col.Name
+				if lit, ok := ex.Left.(*LiteralExpr); ok {
+					val = lit.Value
+				}
+			}
+			if colName != "" {
+				return estimateSelectivity(td, colName, ex.Op, val)
+			}
+		}
+	case *InExpr:
+		if !ex.Not {
+			if td.Stats != nil {
+				if col, ok := ex.Expr.(*ColumnRefExpr); ok {
+					cs := colStatsByName(td.Stats, col.Name)
+					if cs != nil && cs.NDV > 0 {
+						return float64(len(ex.Values)) / float64(cs.NDV)
+					}
+				}
+			}
+			return 0.05 * float64(len(ex.Values))
+		}
+		return 0.9
+	case *BetweenExpr:
+		selLow := estimateExprSelectivity(td, &BinaryExpr{Op: ">=", Left: ex.Expr, Right: ex.Low})
+		selHigh := estimateExprSelectivity(td, &BinaryExpr{Op: "<=", Left: ex.Expr, Right: ex.High})
+		return selLow * selHigh
+	case *IsNullExpr:
+		if !ex.Not {
+			if col, ok := ex.Expr.(*ColumnRefExpr); ok {
+				cs := colStatsByName(td.Stats, col.Name)
+				if cs != nil && td.Stats.RowCount > 0 {
+					return float64(cs.NullCnt) / float64(td.Stats.RowCount)
+				}
+			}
+			return 0.1
+		}
+		return 0.9
+	case *LikeExpr:
+		return 0.1
+	}
+	return 0.33
+}
+
+// estimateWHERECardinality estimates the number of rows matching a WHERE clause.
+func estimateWHERECardinality(td *catalog.TableDef, where Expr, totalRows int64) int64 {
+	if where == nil {
+		return totalRows
+	}
+	sel := estimateExprSelectivity(td, where)
+	est := float64(totalRows) * sel
+	if est < 1 {
+		if totalRows > 0 {
+			return 1
+		}
+		return 0
+	}
+	return int64(est)
+}
+
+// estimateAccessPaths enumerates possible access paths for a single-table query.
+func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []AccessPath {
+	var paths []AccessPath
+	totalRows := int64(1000) // default if no stats
+	if td.Stats != nil {
+		totalRows = td.Stats.RowCount
+	}
+	estRows := estimateWHERECardinality(td, s.Where, totalRows)
+
+	// 1. Full scan
+	paths = append(paths, AccessPath{
+		Type:    "full_scan",
+		EstRows: estRows,
+		EstCost: float64(totalRows) * 0.01,
+	})
+
+	if s.Where == nil {
+		return paths
+	}
+
+	eqMap := e.collectEqualities(s.Where)
+
+	// 2. PK point/range
+	pkEqCount := 0
+	for _, pkIdx := range td.PKCols {
+		if _, ok := eqMap[td.Columns[pkIdx].Name]; ok {
+			pkEqCount++
+		}
+	}
+
+	if pkEqCount == len(td.PKCols) && len(td.PKCols) > 0 {
+		// Full PK match — point lookup.
+		// Check for IN expression with multiple values.
+		inCount := int64(1)
+		if inExpr, ok := s.Where.(*InExpr); ok && !inExpr.Not {
+			inCount = int64(len(inExpr.Values))
+		}
+		if inCount == 0 {
+			inCount = 1
+		}
+		paths = append(paths, AccessPath{
+			Type:      "pk_point",
+			IndexName: "PRIMARY",
+			MatchCols: pkEqCount,
+			EstRows:   inCount,
+			EstCost:   float64(inCount) * 1.0,
+		})
+	} else if pkEqCount > 0 {
+		// Partial PK match — range scan.
+		pkSel := 1.0
+		for i := 0; i < pkEqCount; i++ {
+			colName := td.Columns[td.PKCols[i]].Name
+			if cs := colStatsByName(td.Stats, colName); cs != nil && cs.NDV > 0 {
+				pkSel *= 1.0 / float64(cs.NDV)
+			} else {
+				pkSel *= 0.05
+			}
+		}
+		pkEstRows := int64(float64(totalRows) * pkSel)
+		if pkEstRows < 1 {
+			pkEstRows = 1
+		}
+		paths = append(paths, AccessPath{
+			Type:      "pk_range",
+			IndexName: "PRIMARY",
+			MatchCols: pkEqCount,
+			EstRows:   pkEstRows,
+			EstCost:   float64(pkEstRows) * 0.01,
+		})
+	}
+
+	// 3. Secondary index scans
+	for i := range td.Indexes {
+		idx := &td.Indexes[i]
+		idxEqCols := 0
+		for _, colName := range idx.Columns {
+			if _, ok := eqMap[colName]; ok {
+				idxEqCols++
+			} else {
+				break
+			}
+		}
+		if idxEqCols == 0 {
+			continue
+		}
+
+		idxSel := 1.0
+		for j := 0; j < idxEqCols; j++ {
+			colName := idx.Columns[j]
+			if cs := colStatsByName(td.Stats, colName); cs != nil && cs.NDV > 0 {
+				idxSel *= 1.0 / float64(cs.NDV)
+			} else {
+				idxSel *= 0.05
+			}
+		}
+		idxEstRows := int64(float64(totalRows) * idxSel)
+		if idxEstRows < 1 {
+			idxEstRows = 1
+		}
+
+		isCovering := e.isCoveringIndex(td, idx, s)
+		var cost float64
+		if isCovering {
+			cost = float64(idxEstRows) * 0.01
+		} else {
+			cost = float64(idxEstRows) * 0.52 // index scan + table lookup
+		}
+
+		apType := "index_scan"
+		if isCovering {
+			apType = "index_covering"
+		}
+		paths = append(paths, AccessPath{
+			Type:       apType,
+			IndexName:  idx.Name,
+			MatchCols:  idxEqCols,
+			EstRows:    idxEstRows,
+			EstCost:    cost,
+			IsCovering: isCovering,
+		})
+	}
+
+	return paths
+}
+
+// selectBestPath chooses the cheapest access path.
+func selectBestPath(paths []AccessPath) AccessPath {
+	if len(paths) == 0 {
+		return AccessPath{Type: "full_scan"}
+	}
+	best := paths[0]
+	for _, p := range paths[1:] {
+		if p.EstCost < best.EstCost {
+			best = p
+		}
+	}
+	return best
 }

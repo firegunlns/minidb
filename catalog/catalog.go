@@ -5,6 +5,7 @@ package catalog
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -361,7 +362,82 @@ func encodeTableDef(td *TableDef) []byte {
 		}
 	}
 
-	return buf[:off]
+	// Stats trailer: [1B hasStats]
+	if td.Stats != nil {
+		buf = append(buf, 1) // hasStats = true
+		buf = appendStats(buf, td.Stats)
+	} else {
+		buf = append(buf, 0) // hasStats = false
+	}
+
+	return buf
+}
+
+func appendStats(buf []byte, stats *TableStats) []byte {
+	// [8B rowCount][8B updateTime][2B numColStats][per-column data...]
+	var tmp [8]byte
+	binary.BigEndian.PutUint64(tmp[:], uint64(stats.RowCount))
+	buf = append(buf, tmp[:]...)
+	binary.BigEndian.PutUint64(tmp[:], uint64(stats.UpdateTime))
+	buf = append(buf, tmp[:]...)
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(stats.ColStats)))
+	buf = append(buf, tmp[:2]...)
+	for _, cs := range stats.ColStats {
+		buf = appendColumnStats(buf, cs)
+	}
+	return buf
+}
+
+func appendColumnStats(buf []byte, cs ColumnStats) []byte {
+	// [2B nameLen][name][8B ndv][8B nullCnt][1B valType][minVal bytes][1B valType][maxVal bytes][8B avgLen]
+	var tmp [8]byte
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(cs.Name)))
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, cs.Name...)
+	binary.BigEndian.PutUint64(tmp[:], uint64(cs.NDV))
+	buf = append(buf, tmp[:]...)
+	binary.BigEndian.PutUint64(tmp[:], uint64(cs.NullCnt))
+	buf = append(buf, tmp[:]...)
+	buf = appendStatsValue(buf, cs.MinVal)
+	buf = appendStatsValue(buf, cs.MaxVal)
+	binary.BigEndian.PutUint64(tmp[:], uint64(cs.AvgLen))
+	buf = append(buf, tmp[:]...)
+	return buf
+}
+
+// stats value encoding: [1B valType: 0=nil, 1=int64, 2=float64, 3=string][value bytes]
+func appendStatsValue(buf []byte, val any) []byte {
+	if val == nil {
+		buf = append(buf, 0)
+		return buf
+	}
+	var tmp [8]byte
+	switch v := val.(type) {
+	case int64:
+		buf = append(buf, 1)
+		binary.BigEndian.PutUint64(tmp[:], uint64(v))
+		buf = append(buf, tmp[:]...)
+	case int32:
+		buf = append(buf, 1)
+		binary.BigEndian.PutUint64(tmp[:], uint64(v))
+		buf = append(buf, tmp[:]...)
+	case int:
+		buf = append(buf, 1)
+		binary.BigEndian.PutUint64(tmp[:], uint64(v))
+		buf = append(buf, tmp[:]...)
+	case float64:
+		buf = append(buf, 2)
+		binary.BigEndian.PutUint64(tmp[:], math.Float64bits(v))
+		buf = append(buf, tmp[:]...)
+	case string:
+		buf = append(buf, 3)
+		binary.BigEndian.PutUint16(tmp[:2], uint16(len(v)))
+		buf = append(buf, tmp[:2]...)
+		buf = append(buf, v...)
+	default:
+		buf = append(buf, 0)
+	}
+	return buf
 }
 
 func decodeTableDef(data []byte) *TableDef {
@@ -448,10 +524,75 @@ func decodeTableDef(data []byte) *TableDef {
 		}
 	}
 
+	// Parse stats trailer if present (backward compatible: old format has no trailer).
+	var stats *TableStats
+	if off < len(data) {
+		hasStats := data[off]
+		off++
+		if hasStats == 1 {
+			stats = &TableStats{}
+			stats.RowCount = int64(binary.BigEndian.Uint64(data[off:]))
+			off += 8
+			stats.UpdateTime = int64(binary.BigEndian.Uint64(data[off:]))
+			off += 8
+			numColStats := int(binary.BigEndian.Uint16(data[off:]))
+			off += 2
+			stats.ColStats = make([]ColumnStats, numColStats)
+			for i := range stats.ColStats {
+				cs, n := decodeColumnStats(data[off:])
+				stats.ColStats[i] = cs
+				off += n
+			}
+		}
+	}
+
 	return &TableDef{
 		Columns:     cols,
 		Indexes:     indexes,
 		PKCols:      pkCols,
 		ForeignKeys: fks,
+		Stats:       stats,
 	}
+}
+
+func decodeColumnStats(data []byte) (ColumnStats, int) {
+	off := 0
+	var cs ColumnStats
+	nameLen := int(binary.BigEndian.Uint16(data[off:]))
+	off += 2
+	cs.Name = string(data[off : off+nameLen])
+	off += nameLen
+	cs.NDV = int64(binary.BigEndian.Uint64(data[off:]))
+	off += 8
+	cs.NullCnt = int64(binary.BigEndian.Uint64(data[off:]))
+	off += 8
+	minVal, n := decodeStatsValue(data[off:])
+	cs.MinVal = minVal
+	off += n
+	maxVal, n := decodeStatsValue(data[off:])
+	cs.MaxVal = maxVal
+	off += n
+	cs.AvgLen = int64(binary.BigEndian.Uint64(data[off:]))
+	off += 8
+	return cs, off
+}
+
+func decodeStatsValue(data []byte) (any, int) {
+	valType := data[0]
+	off := 1
+	switch valType {
+	case 0: // nil
+		return nil, off
+	case 1: // int64
+		v := int64(binary.BigEndian.Uint64(data[off:]))
+		return v, off + 8
+	case 2: // float64
+		v := math.Float64frombits(binary.BigEndian.Uint64(data[off:]))
+		return v, off + 8
+	case 3: // string
+		strLen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		return string(data[off : off+strLen]), off + strLen
+	}
+	return nil, off
 }

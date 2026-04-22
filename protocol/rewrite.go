@@ -22,11 +22,6 @@ func rewriteSQL(query string) string {
 		q = re.ReplaceAllString(q, "")
 	}
 
-	// Handle ANALYZE TABLE — return a no-op.
-	if strings.HasPrefix(upper, "ANALYZE TABLE") {
-		return "SELECT 1"
-	}
-
 	return q
 }
 

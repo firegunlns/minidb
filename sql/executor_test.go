@@ -250,8 +250,8 @@ func TestExplainSelect(t *testing.T) {
 	if rows.Rows[0][1] != "SIMPLE" {
 		t.Fatalf("expected select_type SIMPLE, got %v", rows.Rows[0][1])
 	}
-	if rows.Rows[0][3] != "range" {
-		t.Fatalf("expected type range, got %v", rows.Rows[0][3])
+	if rows.Rows[0][3] != "eq_ref" {
+		t.Fatalf("expected type eq_ref, got %v", rows.Rows[0][3])
 	}
 }
 
