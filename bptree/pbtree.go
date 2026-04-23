@@ -746,13 +746,17 @@ func (t *PersistentBPTree) BatchInsert(pairs [][2][]byte) error {
 		}
 	}
 
-	// Insert remaining pairs. insertAttempt uses optimistic descent
-	// so multiple concurrent BatchInsert calls can proceed in parallel.
+	// Insert remaining pairs with retry on concurrent split.
 	var firstErr error
 	for _, p := range pairs {
 		err := t.insertAttempt(p[0], p[1])
 		if err == errRetry {
-			err = t.insertPessimistic(p[0], p[1])
+			for retries := 0; retries < 64; retries++ {
+				err = t.insertPessimistic(p[0], p[1])
+				if err != errRetry {
+					break
+				}
+			}
 		}
 		if err != nil {
 			firstErr = err

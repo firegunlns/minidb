@@ -193,11 +193,11 @@ func (h *SvrHandler) autoBegin(upper string) {
 	if h.autocommit {
 		return
 	}
-	trimmed := strings.TrimSpace(upper)
-	if strings.HasPrefix(trimmed, "INSERT") || strings.HasPrefix(trimmed, "UPDATE") || strings.HasPrefix(trimmed, "DELETE") {
-		if h.exec.ActiveTxn() == nil {
-			h.exec.Execute("BEGIN")
-		}
+	// When autocommit is off, any statement implicitly begins a transaction.
+	// This matches MySQL behavior where SET autocommit=0 means every
+	// statement is part of a transaction until COMMIT/ROLLBACK.
+	if h.exec.ActiveTxn() == nil {
+		h.exec.Execute("BEGIN")
 	}
 }
 

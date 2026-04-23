@@ -29,9 +29,34 @@ func rewriteSQL(query string) string {
 func needsSpecialHandling(query string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 
-	// Tuple IN: (col1, col2) IN ((?,?),...)
-	if strings.Contains(upper, "(") && strings.Contains(upper, ") IN (") {
-		return true
+	// Multi-column tuple IN: (col1, col2) IN ((?,?),...)
+	// Single-column (col) IN (...) should NOT be intercepted — let the executor handle it.
+	if strings.Contains(upper, ") IN (") {
+		// Find the position of ") IN (" and look backward for the matching "(".
+		inIdx := strings.Index(upper, ") IN (")
+		if inIdx > 0 {
+			// Walk backward from the ')' to find the matching '('
+			depth := 0
+			start := -1
+			for i := inIdx - 1; i >= 0; i-- {
+				if upper[i] == ')' {
+					depth++
+				} else if upper[i] == '(' {
+					if depth == 0 {
+						start = i
+						break
+					}
+					depth--
+				}
+			}
+			if start >= 0 {
+				colList := upper[start+1 : inIdx]
+				// Multi-column tuple if there's a comma in the column list.
+				if strings.Contains(colList, ",") {
+					return true
+				}
+			}
+		}
 	}
 
 	// JOIN queries.
@@ -45,6 +70,33 @@ func needsSpecialHandling(query string) bool {
 	}
 
 	return false
+}
+
+// isMultiColumnTupleIn checks if the ") IN (" pattern is a multi-column tuple IN
+// like (col1, col2) IN ((?,?),...). Single-column (col) IN (...) returns false.
+func isMultiColumnTupleIn(upper string) bool {
+	inIdx := strings.Index(upper, ") IN (")
+	if inIdx <= 0 {
+		return false
+	}
+	depth := 0
+	start := -1
+	for i := inIdx - 1; i >= 0; i-- {
+		if upper[i] == ')' {
+			depth++
+		} else if upper[i] == '(' {
+			if depth == 0 {
+				start = i
+				break
+			}
+			depth--
+		}
+	}
+	if start < 0 {
+		return false
+	}
+	colList := upper[start+1 : inIdx]
+	return strings.Contains(colList, ",")
 }
 
 // parseVal attempts to parse a string as an integer, falling back to a trimmed string.
@@ -70,7 +122,8 @@ func (h *SvrHandler) handleSpecialQuery(query string, args []any) (*mysql.Result
 	}
 
 	// Tuple IN patterns — used in delivery batch operations.
-	if strings.Contains(upper, ") IN (") {
+	// Only route to handleTupleIn if it's a multi-column tuple IN.
+	if strings.Contains(upper, ") IN (") && isMultiColumnTupleIn(upper) {
 		return h.handleTupleIn(query, args)
 	}
 

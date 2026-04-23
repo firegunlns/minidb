@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestMainGoLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine1.RecoverFromWAL(w1)
+	maxTS1, _ := engine1.RecoverFromWAL(w1)
 	engine1.RunFullGC(^uint64(0))
 
 	cat1, err := catalog.Open(dir)
@@ -35,6 +36,7 @@ func TestMainGoLifecycle(t *testing.T) {
 	}
 
 	ts1 := txn.OpenTimestampOracle(dir)
+	ts1.EnsureAtLeast(maxTS1)
 	mgr1 := txn.NewManager(engine1, ts1, w1, 0)
 	exec1 := NewExecutor(engine1, mgr1, cat1, "")
 
@@ -90,7 +92,7 @@ func TestMainGoLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine2.RecoverFromWAL(w2)
+	maxTS2, _ := engine2.RecoverFromWAL(w2)
 	engine2.RunFullGC(^uint64(0))
 
 	cat2, err := catalog.Open(dir)
@@ -113,15 +115,26 @@ func TestMainGoLifecycle(t *testing.T) {
 	// Verify data persisted via engine.
 	treeKey := td2.DataFile()
 	cols := td2.PrimaryKeyColumns()
-	pk := storage.EncodePrimaryKey(cols, int32(5))
-	row, _, err := engine2.GetRow(treeKey, pk, ^uint64(0))
-	if err != nil {
-		t.Fatalf("GetRow after restart: %v", err)
-	}
-	if row == nil {
+
+	// Scan for id=5 using a prefix range (since EncodePrimaryKey appends a unique
+	// rowid suffix, we build the PK prefix without rowid and scan a range).
+	pkPrefix := storage.EncodeColumnValue(cols[0], int32(5))
+	scanStart := append([]byte(nil), pkPrefix...)
+	scanEnd := append(append([]byte(nil), pkPrefix...), bytes.Repeat([]byte{0xFF}, 16)...)
+
+	var foundRow []byte
+	engine2.ScanRange(treeKey, scanStart, scanEnd, ^uint64(0), func(pk, row []byte) bool {
+		vals, _ := storage.DecodeRow(row, td2.Columns)
+		if v, ok := vals[0].(int32); ok && v == 5 {
+			foundRow = row
+			return false
+		}
+		return true
+	})
+	if foundRow == nil {
 		t.Fatal("row with id=5 not found after restart")
 	}
-	vals, _ := storage.DecodeRow(row, td2.Columns)
+	vals, _ := storage.DecodeRow(foundRow, td2.Columns)
 	t.Logf("Row after restart: %v", vals)
 	if vals[0].(int32) != 5 {
 		t.Errorf("expected id=5, got %v", vals[0])
@@ -129,6 +142,7 @@ func TestMainGoLifecycle(t *testing.T) {
 
 	// Also verify via SELECT.
 	ts2 := txn.OpenTimestampOracle(dir)
+	ts2.EnsureAtLeast(maxTS2)
 	mgr2 := txn.NewManager(engine2, ts2, w2, 0)
 	exec2 := NewExecutor(engine2, mgr2, cat2, "tpcc")
 	res2, err := exec2.Execute("SELECT id, name FROM users WHERE id = 5")

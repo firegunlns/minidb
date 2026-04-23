@@ -250,6 +250,11 @@ var (
 		Name: "minidb_index_scan_attempts_total",
 		Help: "Index scan attempts: index_used, index_missed, no_eq, no_idx, coerce_fail",
 	}, []string{"result"})
+
+	FullScanDebug = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "minidb_full_scan_debug_total",
+		Help: "Full table scan diagnosis: reason=where_nil|no_pk_eq|coerce_fail, table=name",
+	}, []string{"table", "reason"})
 )
 
 // --- Gauges ---
@@ -322,6 +327,7 @@ func init() {
 		TableRowsRead,
 		TableScansTotal,
 		IndexScanAttempts,
+		FullScanDebug,
 		// Gauges
 		ActiveConnections,
 		CacheSize,

@@ -43,6 +43,27 @@ func (t *TimestampOracle) Current() uint64 {
 	return atomic.LoadUint64(&t.counter)
 }
 
+// BeginTS returns a timestamp for starting a new transaction.
+// It atomically increments the counter first to ensure each Begin gets a unique timestamp.
+func (t *TimestampOracle) BeginTS() uint64 {
+	return atomic.AddUint64(&t.counter, 1)
+}
+
+// EnsureAtLeast bumps the counter to at least minVal if it's lower.
+// Used after WAL recovery to guarantee the oracle is not behind committed data.
+func (t *TimestampOracle) EnsureAtLeast(minVal uint64) {
+	for {
+		cur := atomic.LoadUint64(&t.counter)
+		if cur >= minVal {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&t.counter, cur, minVal) {
+			t.persist()
+			return
+		}
+	}
+}
+
 func (t *TimestampOracle) persist() {
 	if t.path == "" {
 		return

@@ -83,7 +83,8 @@ func main() {
 
 	// Recover from WAL if needed.
 	// Disabled due to deadlock in bptree during concurrent recovery
-	if err := engine.RecoverFromWAL(w); err != nil {
+	maxCommitTS, err := engine.RecoverFromWAL(w)
+	if err != nil {
 		log.Printf("WAL recovery warning: %v", err)
 	}
 
@@ -100,6 +101,7 @@ func main() {
 
 	// Create transaction manager.
 	ts := txn.OpenTimestampOracle(*dataDir)
+	ts.EnsureAtLeast(maxCommitTS)
 	mgr := txn.NewManager(engine, ts, w, *flushLogAtTrxCommit)
 
 	// Start Prometheus metrics server.

@@ -35,7 +35,7 @@ func TestFullLifecycle(t *testing.T) {
 	e2, _ := OpenEngine(dir, 64, 256)
 
 	// WAL is empty → RecoverFromWAL is no-op.
-	e2.RecoverFromWAL(w2)
+	e2.RecoverFromWAL(w2) //nolint:errcheck
 
 	// GC with safeTS = max → dirtyPKs is empty → no-op.
 	e2.RunFullGC(^uint64(0))
@@ -131,7 +131,7 @@ func TestWALReplayDoesNotCorruptData(t *testing.T) {
 	w2, _ := wal.Open(dir)
 	e2, _ := OpenEngine(dir, 64, 256)
 	// WAL has no COMMIT record, so replay does nothing.
-	e2.RecoverFromWAL(w2)
+	e2.RecoverFromWAL(w2) //nolint:errcheck
 
 	// Verify original data is still there.
 	r, ts, err := e2.GetRow(treeKey, pk, 200)

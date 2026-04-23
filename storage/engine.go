@@ -86,18 +86,22 @@ func OpenEngine(dataDir string, order, cacheSize int) (*StorageEngine, error) {
 }
 
 // RecoverFromWAL replays committed transactions from the WAL.
-func (e *StorageEngine) RecoverFromWAL(w *wal.WAL) error {
+func (e *StorageEngine) RecoverFromWAL(w *wal.WAL) (uint64, error) {
 	records, err := w.ReadAll()
 	if err != nil {
-		return fmt.Errorf("read WAL: %w", err)
+		return 0, fmt.Errorf("read WAL: %w", err)
 	}
 
 	committed := make(map[uint64]bool)
 	commitTSMap := make(map[uint64]uint64)
+	var maxCommitTS uint64
 	for _, r := range records {
 		if r.Type == wal.RecCommit {
 			committed[r.TxnTS] = true
 			commitTSMap[r.TxnTS] = r.CommitTS
+			if r.CommitTS > maxCommitTS {
+				maxCommitTS = r.CommitTS
+			}
 		} else if r.Type == wal.RecAbort {
 			delete(committed, r.TxnTS)
 		}
@@ -112,7 +116,7 @@ func (e *StorageEngine) RecoverFromWAL(w *wal.WAL) error {
 		}
 
 		if err := e.OpenTree(r.TreeKey); err != nil {
-			return err
+			return maxCommitTS, err
 		}
 
 		commitTS := commitTSMap[r.TxnTS]
@@ -121,21 +125,21 @@ func (e *StorageEngine) RecoverFromWAL(w *wal.WAL) error {
 		case wal.RecInsert:
 			if isIndex {
 				if err := e.InsertRaw(r.TreeKey, r.PK, r.RowData); err != nil {
-					return err
+					return maxCommitTS, err
 				}
 			} else {
 				if err := e.InsertRow(r.TreeKey, r.PK, commitTS, r.RowData); err != nil {
-					return err
+					return maxCommitTS, err
 				}
 			}
 		case wal.RecUpdate:
 			if isIndex {
 				if err := e.InsertRaw(r.TreeKey, r.PK, r.RowData); err != nil {
-					return err
+					return maxCommitTS, err
 				}
 			} else {
 				if err := e.UpdateRow(r.TreeKey, r.PK, commitTS, r.RowData); err != nil {
-					return err
+					return maxCommitTS, err
 				}
 			}
 		case wal.RecDelete:
@@ -143,13 +147,13 @@ func (e *StorageEngine) RecoverFromWAL(w *wal.WAL) error {
 				e.DeleteRaw(r.TreeKey, r.PK)
 			} else {
 				if err := e.DeleteRow(r.TreeKey, r.PK, commitTS); err != nil {
-					return err
+					return maxCommitTS, err
 				}
 			}
 		}
 	}
 
-	return nil
+	return maxCommitTS, nil
 }
 
 // Close closes all open B+ trees.
@@ -295,6 +299,8 @@ func (e *StorageEngine) GetRow(treeKey string, pk []byte, readTS uint64) ([]byte
 		metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())
 		metrics.RowsReadTotal.Inc()
 		metrics.TableRowsRead.WithLabelValues(treeKey).Inc()
+		// Update version cache with the found version to avoid repeated scans.
+		e.verCache.Store(ck, &versionCacheEntry{commitTS: commitTS, rowData: result})
 		return result, commitTS, nil
 	}
 	metrics.MVCCGetDuration.Observe(time.Since(start).Seconds())

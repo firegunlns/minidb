@@ -105,9 +105,15 @@ func DecodeColumnValue(data []byte, offset int, col ColumnDef) (any, int) {
 
 	switch ColumnType(tag) {
 	case ColTypeInt:
+		if offset+4 > len(data) {
+			return nil, len(data)
+		}
 		v := int32(binary.BigEndian.Uint32(data[offset:]) ^ 0x80000000)
 		return v, offset + 4
 	case ColTypeBigInt:
+		if offset+8 > len(data) {
+			return nil, len(data)
+		}
 		v := int64(binary.BigEndian.Uint64(data[offset:]) ^ 0x8000000000000000)
 		return v, offset + 8
 	case ColTypeVarchar:
@@ -118,17 +124,29 @@ func DecodeColumnValue(data []byte, offset int, col ColumnDef) (any, int) {
 		}
 		return string(data[start:end]), end + 1 // skip null terminator
 	case ColTypeDecimal:
+		if offset+4 > len(data) {
+			return nil, len(data)
+		}
 		length := int(binary.BigEndian.Uint32(data[offset:]))
 		offset += 4
+		if offset+length > len(data) {
+			return nil, len(data)
+		}
 		return string(data[offset : offset+length]), offset + length
 	case ColTypeTimestamp:
+		if offset+8 > len(data) {
+			return nil, len(data)
+		}
 		nano := int64(binary.BigEndian.Uint64(data[offset:]))
 		return time.Unix(0, nano).UTC(), offset + 8
 	case ColTypeDouble:
+		if offset+8 > len(data) {
+			return nil, len(data)
+		}
 		bits := binary.BigEndian.Uint64(data[offset:])
 		return math.Float64frombits(bits), offset + 8
 	default:
-		panic(fmt.Sprintf("unknown type tag: %d", tag))
+		return nil, offset
 	}
 }
 
@@ -164,17 +182,42 @@ func EncodeRow(cols []ColumnDef, vals []any) []byte {
 // DecodeRow decodes a full row from bytes.
 // Returns column values and a null bitmap.
 func DecodeRow(data []byte, cols []ColumnDef) ([]any, []bool) {
+	if len(data) < 2 {
+		vals := make([]any, len(cols))
+		nulls := make([]bool, len(cols))
+		for i := range nulls {
+			nulls[i] = true
+		}
+		return vals, nulls
+	}
 	numCols := int(binary.BigEndian.Uint16(data))
 	bitmapSize := (numCols + 7) / 8
+	if 2+bitmapSize > len(data) {
+		vals := make([]any, len(cols))
+		nulls := make([]bool, len(cols))
+		for i := range nulls {
+			nulls[i] = true
+		}
+		return vals, nulls
+	}
 	nullBitmap := data[2 : 2+bitmapSize]
 	off := 2 + bitmapSize
 
-	vals := make([]any, numCols)
-	nulls := make([]bool, numCols)
+	// Decode only up to min(numCols, len(cols)) to handle schema mismatches.
+	n := numCols
+	if n > len(cols) {
+		n = len(cols)
+	}
+	vals := make([]any, len(cols))
+	nulls := make([]bool, len(cols))
 
-	for i := 0; i < numCols; i++ {
+	for i := 0; i < n; i++ {
 		nulls[i] = (nullBitmap[i/8]>>(i%8))&1 == 1
 		vals[i], off = DecodeColumnValue(data, off, cols[i])
+	}
+	// Mark extra columns (schema has more columns than data) as null.
+	for i := n; i < len(cols); i++ {
+		nulls[i] = true
 	}
 	return vals, nulls
 }
@@ -208,6 +251,18 @@ func EncodeIndexKey(idxCols []ColumnDef, idxVals []any, pkCols []ColumnDef, pkVa
 		buf = append(buf, EncodeColumnValue(col, idxVals[i])...)
 	}
 	buf = append(buf, EncodePrimaryKey(pkCols, pkVals...)...)
+	return buf
+}
+
+// EncodeIndexKeyWithRawPK builds a secondary index key from index column values
+// and raw PK bytes (as returned by the B-tree scan). This avoids re-encoding
+// the PK which would generate a new unique rowid suffix.
+func EncodeIndexKeyWithRawPK(idxCols []ColumnDef, idxVals []any, rawPK []byte) []byte {
+	var buf []byte
+	for i, col := range idxCols {
+		buf = append(buf, EncodeColumnValue(col, idxVals[i])...)
+	}
+	buf = append(buf, rawPK...)
 	return buf
 }
 

@@ -22,10 +22,10 @@ var errFinalized = errors.New("transaction is finalized")
 // performs the actual Flush+Sync. All others (followers) block on a condvar
 // until the leader finishes. This amortises fsync cost across the group.
 //
-//	 T1: Append WAL ──→ become leader ──→ Flush ──→ Sync ──→ Broadcast ──→ return
-//	 T2: Append WAL ──→ see flushing ──→ Cond.Wait ──────────────────→ return
-//	 T3: Append WAL ──→ see flushing ──→ Cond.Wait ──────────────────→ return
-//	                                                            ↑ leader done
+//	T1: Append WAL ──→ become leader ──→ Flush ──→ Sync ──→ Broadcast ──→ return
+//	T2: Append WAL ──→ see flushing ──→ Cond.Wait ──────────────────→ return
+//	T3: Append WAL ──→ see flushing ──→ Cond.Wait ──────────────────→ return
+//	                                                           ↑ leader done
 type groupCommitter struct {
 	wal  *wal.WAL
 	mu   sync.Mutex
@@ -133,7 +133,7 @@ type Manager struct {
 	wal        *wal.WAL         // WAL日志
 	activeMu   sync.Mutex
 	activeTxns map[uint64]*Txn // 活跃事务映射
-	rowLocks   *rowLockMgr      // 行级写锁
+	rowLocks   *rowLockMgr     // 行级写锁
 
 	// flushLogAtCommit WAL刷盘策略（类似innodb_flush_log_at_trx_commit）:
 	//   0 = 异步写，不等待刷盘（最快，断电可能丢失最近事务）
@@ -203,7 +203,7 @@ func (m *Manager) Begin() *Txn {
 	start := time.Now()
 	txn := &Txn{
 		mgr:     m,
-		startTS: m.ts.Current(), // snapshot at current time
+		startTS: m.ts.BeginTS(), // use BeginTS() to ensure unique startTS for each txn
 		ws:      NewWorkspace(),
 	}
 	m.activeMu.Lock()

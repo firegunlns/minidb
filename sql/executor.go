@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -266,15 +267,11 @@ func (e *Executor) execCreateIndex(s *CreateIndexStmt) (any, error) {
 	txn := e.mgr.Begin()
 	txn.Scan(td.DataFile(), pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
 		vals, _ := storage.DecodeRow(rowData, td.Columns)
-		pkVals := make([]any, len(td.PKCols))
-		for i, colIdx := range td.PKCols {
-			pkVals[i] = vals[colIdx]
-		}
 		idxVals := make([]any, len(idxDef.Columns))
 		for j, colName := range idxDef.Columns {
 			idxVals[j] = vals[td.ColumnIndex(colName)]
 		}
-		idxKey := storage.EncodeIndexKey(idxColDefs, idxVals, pkCols, pkVals...)
+		idxKey := storage.EncodeIndexKeyWithRawPK(idxColDefs, idxVals, pk)
 		txn.Insert(idxTreeKey, idxKey, nil)
 		return true
 	})
@@ -809,7 +806,7 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 			for j, colName := range idx.Columns {
 				idxVals[j] = coerced[td.ColumnIndex(colName)]
 			}
-			idxKey := storage.EncodeIndexKey(idxColDefs, idxVals, pkCols, pkVals...)
+			idxKey := storage.EncodeIndexKeyWithRawPK(idxColDefs, idxVals, pk)
 			t.Insert(idxTreeKey, idxKey, nil)
 		}
 	}
@@ -1148,41 +1145,27 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 		best := selectBestPath(paths)
 		switch best.Type {
 		case "pk_point":
+			// CBO chose PK point lookup.
 			if s.Where != nil {
 				if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
 					rows = inRows
+				} else if ptRows, ok := e.tryPointLookupOnPK(t, td, treeKey, s.Where, colIndices); ok {
+					rows = ptRows
 				}
 			}
-			// Fallback: try index scan if PK point didn't work.
-			if rows == nil && s.Where != nil && len(td.Indexes) > 0 {
-				if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
-					rows = idxRows
-				}
-			}
+		case "pk_range":
+			// CBO chose PK range scan. Let Stage 3 handle it via extractPKRange.
+			// Don't try any fast paths — go straight to the range scan loop.
 		case "index_scan", "index_covering":
+			// CBO chose secondary index scan. Only try index path.
 			if s.Where != nil && len(td.Indexes) > 0 {
 				if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
 					rows = idxRows
 				}
 			}
-			// Fallback: try PK point if index scan didn't work.
-			if rows == nil && s.Where != nil {
-				if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
-					rows = inRows
-				}
-			}
 		default:
-			// full_scan: try PK point then index as fallback before full scan.
-			if s.Where != nil {
-				if inRows, ok := e.tryINOnPK(t, td, treeKey, s.Where, colIndices); ok {
-					rows = inRows
-				}
-			}
-			if rows == nil && s.Where != nil && len(td.Indexes) > 0 {
-				if idxRows, ok := e.tryIndexScan(t, td, s, colIndices, colNames); ok {
-					rows = idxRows
-				}
-			}
+			// CBO chose full_scan. Skip all optimization paths.
+			// Fall through to Stage 3 scan loop.
 		}
 	}
 	metrics.SelectOptPathDuration.Observe(time.Since(t1).Seconds())
@@ -1211,6 +1194,31 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 		if start == nil {
 			start = []byte{0x00}
 			end = []byte{0xFF}
+			// Diagnose full table scans on large tables.
+			if td.Stats != nil && td.Stats.RowCount > 10000 {
+				reason := "where_nil"
+				if s.Where != nil {
+					eqMap := e.collectEqualities(s.Where)
+					hasPKEq := false
+					for _, pkIdx := range td.PKCols {
+						if _, ok := eqMap[td.Columns[pkIdx].Name]; ok {
+							hasPKEq = true
+							break
+						}
+					}
+					if hasPKEq {
+						reason = "coerce_fail"
+					} else {
+						exprType := fmt.Sprintf("%T", s.Where)
+						reason = "no_pk_eq:" + exprType
+						// Also record the top-level operator for BinaryExpr.
+						if bin, ok := s.Where.(*BinaryExpr); ok {
+							reason += "_" + bin.Op
+						}
+					}
+				}
+				metrics.FullScanDebug.WithLabelValues(td.Name, reason).Inc()
+			}
 		}
 
 		// Check if ORDER BY matches PK ascending order and we can stop early.
@@ -1284,26 +1292,13 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 // single-column primary key. If so, it performs point lookups for each value
 // and returns (rows, true). Otherwise returns (nil, false).
 func (e *Executor) tryINOnPK(t *txn.Txn, td *catalog.TableDef, treeKey string, where Expr, colIndices []int) ([][]any, bool) {
-	inExpr, ok := where.(*InExpr)
-	if !ok || inExpr.Not || len(inExpr.Values) == 0 {
-		return nil, false
-	}
-
-	// Check that the IN target is a column reference.
-	col, ok := inExpr.Expr.(*ColumnRefExpr)
+	// Search for IN-on-PK anywhere in the AND tree.
+	inExpr, ok := e.findINOnPK(where, td)
 	if !ok {
 		return nil, false
 	}
 
-	// Must be a single-column PK and the column must be that PK.
-	if len(td.PKCols) != 1 {
-		return nil, false
-	}
 	pkColIdx := td.PKCols[0]
-	if td.Columns[pkColIdx].Name != col.Name {
-		return nil, false
-	}
-
 	pkCol := td.Columns[pkColIdx]
 
 	// Extract literal values from the IN list.
@@ -1337,6 +1332,42 @@ func (e *Executor) tryINOnPK(t *txn.Txn, td *catalog.TableDef, treeKey string, w
 		rows = append(rows, row)
 	}
 	return rows, true
+}
+
+// tryPointLookupOnPK performs a single PK point lookup for equality queries.
+// Extracts PK column values from AND-connected equalities and does t.Get().
+func (e *Executor) tryPointLookupOnPK(t *txn.Txn, td *catalog.TableDef, treeKey string, where Expr, colIndices []int) ([][]any, bool) {
+	eqMap := e.collectEqualities(where)
+
+	// Check that all PK columns have equalities.
+	pkVals := make([]any, len(td.PKCols))
+	pkCols := make([]storage.ColumnDef, len(td.PKCols))
+	for i, colIdx := range td.PKCols {
+		col := td.Columns[colIdx]
+		pkCols[i] = col
+		val, ok := eqMap[col.Name]
+		if !ok {
+			return nil, false
+		}
+		coerced, err := storage.CoerceValue(col, val)
+		if err != nil {
+			return nil, false
+		}
+		pkVals[i] = coerced
+	}
+
+	// Point lookup.
+	pk := storage.EncodePrimaryKey(pkCols, pkVals...)
+	rowData, err := t.Get(treeKey, td.Columns, pk)
+	if err != nil || rowData == nil {
+		return nil, true // query handled, but no row found
+	}
+	decoded, _ := storage.DecodeRow(rowData, td.Columns)
+	row := make([]any, len(colIndices))
+	for i, ci := range colIndices {
+		row[i] = decoded[ci]
+	}
+	return [][]any{row}, true
 }
 
 // tryIndexScan checks if a secondary index can be used for the query.
@@ -1710,20 +1741,28 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 }
 
 func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
-	leftRows, err := e.collectRows(t, ref.Left)
-	if err != nil {
-		return nil, err
-	}
-	rightRows, err := e.collectRows(t, ref.Right)
-	if err != nil {
-		return nil, err
-	}
-
 	leftTd, err := e.getTableDef(ref.Left)
 	if err != nil {
 		return nil, err
 	}
 	rightTd, err := e.getTableDef(ref.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	plan := e.planJoin(ref, s)
+
+	// Use hash join when equi keys are available.
+	if plan.method == "hash_join" {
+		return e.execHashJoin(t, s, ref, leftTd, rightTd, plan)
+	}
+
+	// Nested loop fallback with WHERE pushdown.
+	leftRows, err := e.collectRowsWithWhere(t, ref.Left, leftTd, plan.leftWhere)
+	if err != nil {
+		return nil, err
+	}
+	rightRows, err := e.collectRowsWithWhere(t, ref.Right, rightTd, plan.rightWhere)
 	if err != nil {
 		return nil, err
 	}
@@ -1736,6 +1775,8 @@ func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) 
 	isRightJoin := ref.Type == JoinTypeRight
 	leftNullRow := make([]any, len(leftTd.Columns))
 
+	effectiveWhere := plan.remainWhere
+
 	if isRightJoin {
 		rightMatched := make(map[int]bool)
 		for ri, rightRow := range rightRows {
@@ -1745,7 +1786,7 @@ func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) 
 					matched = true
 					rightMatched[ri] = true
 					joined := append(append([]any{}, leftRow...), rightRow...)
-					if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+					if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
 						rows = append(rows, joined)
 					}
 					_ = li
@@ -1753,7 +1794,7 @@ func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) 
 			}
 			if !matched {
 				joined := append(append([]any{}, leftNullRow...), rightRow...)
-				if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+				if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
 					rows = append(rows, joined)
 				}
 			}
@@ -1767,14 +1808,14 @@ func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) 
 				if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
 					matched = true
 					joined := append(append([]any{}, leftRow...), rightRow...)
-					if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+					if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
 						rows = append(rows, joined)
 					}
 				}
 			}
 			if !matched && isLeftJoin {
 				joined := append(append([]any{}, leftRow...), rightNullRow...)
-				if s.Where == nil || e.evalJoinWhere(leftTd, rightTd, joined, s.Where) {
+				if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
 					rows = append(rows, joined)
 				}
 			}
@@ -1972,10 +2013,6 @@ func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (any, error) {
 
 		// Update secondary indexes if any indexed columns changed.
 		if len(td.Indexes) > 0 {
-			pkVals := make([]any, len(td.PKCols))
-			for i, colIdx := range td.PKCols {
-				pkVals[i] = vals[colIdx]
-			}
 			for j := range td.Indexes {
 				idx := &td.Indexes[j]
 				// Check if any index column changed.
@@ -1993,20 +2030,20 @@ func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (any, error) {
 				idxTreeKey := td.IndexFile(idx)
 				idxColDefs := idxColumnDefs(td, idx)
 
-				// Delete old index entry.
+				// Delete old index entry using raw pk from scan.
 				oldIdxVals := make([]any, len(idx.Columns))
 				for k, colName := range idx.Columns {
 					oldIdxVals[k] = vals[td.ColumnIndex(colName)]
 				}
-				oldKey := storage.EncodeIndexKey(idxColDefs, oldIdxVals, pkCols, pkVals...)
+				oldKey := storage.EncodeIndexKeyWithRawPK(idxColDefs, oldIdxVals, pk)
 				t.Delete(idxTreeKey, pkCols, oldKey)
 
-				// Insert new index entry.
+				// Insert new index entry using raw pk from scan.
 				newIdxVals := make([]any, len(idx.Columns))
 				for k, colName := range idx.Columns {
 					newIdxVals[k] = newVals[td.ColumnIndex(colName)]
 				}
-				newKey := storage.EncodeIndexKey(idxColDefs, newIdxVals, pkCols, pkVals...)
+				newKey := storage.EncodeIndexKeyWithRawPK(idxColDefs, newIdxVals, pk)
 				t.Insert(idxTreeKey, newKey, nil)
 			}
 		}
@@ -2045,10 +2082,6 @@ func (e *Executor) execDelete(t *txn.Txn, s *DeleteStmt) (any, error) {
 
 		// Delete from secondary indexes.
 		if len(td.Indexes) > 0 {
-			pkVals := make([]any, len(td.PKCols))
-			for i, colIdx := range td.PKCols {
-				pkVals[i] = vals[colIdx]
-			}
 			for j := range td.Indexes {
 				idx := &td.Indexes[j]
 				idxTreeKey := td.IndexFile(idx)
@@ -2057,7 +2090,7 @@ func (e *Executor) execDelete(t *txn.Txn, s *DeleteStmt) (any, error) {
 				for k, colName := range idx.Columns {
 					idxVals[k] = vals[td.ColumnIndex(colName)]
 				}
-				idxKey := storage.EncodeIndexKey(idxColDefs, idxVals, pkCols, pkVals...)
+				idxKey := storage.EncodeIndexKeyWithRawPK(idxColDefs, idxVals, pk)
 				t.Delete(idxTreeKey, pkCols, idxKey)
 			}
 		}
@@ -2126,13 +2159,15 @@ func (e *Executor) execExplain(s *ExplainStmt) (any, error) {
 }
 
 func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
+	// Handle join explain separately.
+	if jRef, ok := s.TableRef.(*JoinTableRef); ok {
+		e.explainJoin(r, s, jRef)
+		return
+	}
+
 	tableName := e.getTableAlias(s.TableRef)
 	if tableName == "" {
 		tableName = "unknown"
-	}
-	selectType := "SIMPLE"
-	if _, ok := s.TableRef.(*JoinTableRef); ok {
-		selectType = "JOIN"
 	}
 
 	td, _ := e.cat.GetTable(e.dbName, tableName)
@@ -2219,14 +2254,29 @@ func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
 	}
 
 	// Add CBO estimates to Extra.
-	extras = append(extras, fmt.Sprintf("est_rows=%d, cost=%.2f", best.EstRows, best.EstCost))
+	// Show all considered paths for transparency.
+	var cboParts []string
+	cboParts = append(cboParts, fmt.Sprintf("est_rows=%d, cost=%.2f", best.EstRows, best.EstCost))
 	if td != nil && td.Stats != nil {
-		extras = append(extras, fmt.Sprintf("table_rows=%d", td.Stats.RowCount))
+		cboParts = append(cboParts, fmt.Sprintf("table_rows=%d", td.Stats.RowCount))
 	}
+	// Show candidate paths with their costs.
+	if len(paths) > 1 {
+		var candidates []string
+		for _, p := range paths {
+			label := p.Type
+			if p.IndexName != "" {
+				label = p.IndexName + "(" + p.Type + ")"
+			}
+			candidates = append(candidates, fmt.Sprintf("%s: rows=%d cost=%.2f", label, p.EstRows, p.EstCost))
+		}
+		cboParts = append(cboParts, "candidates: "+strings.Join(candidates, ", "))
+	}
+	extras = append(extras, strings.Join(cboParts, "; "))
 
 	r.Rows = append(r.Rows, []any{
 		1,
-		selectType,
+		"SIMPLE",
 		tableName,
 		accessType,
 		possibleKeys,
@@ -2236,6 +2286,78 @@ func (e *Executor) explainSelect(r *SelectResult, s *SelectStmt) {
 		best.EstRows,
 		strings.Join(extras, "; "),
 	})
+}
+
+// explainJoin adds EXPLAIN rows for a join query.
+func (e *Executor) explainJoin(r *SelectResult, s *SelectStmt, ref *JoinTableRef) {
+	plan := e.planJoin(ref, s)
+	leftAlias := e.getTableAlias(ref.Left)
+	rightAlias := e.getTableAlias(ref.Right)
+
+	if plan.method == "hash_join" {
+		// Build side row.
+		var buildExtras []string
+		buildExtras = append(buildExtras, fmt.Sprintf("hash_join(build); est_rows=%d, cost=%.2f", plan.estRows, plan.estCost))
+		if plan.buildTd != nil && plan.buildTd.Stats != nil {
+			buildExtras = append(buildExtras, fmt.Sprintf("table_rows=%d", plan.buildTd.Stats.RowCount))
+		}
+		r.Rows = append(r.Rows, []any{
+			1, "JOIN", plan.buildAlias, "hash_build",
+			nil, nil, nil, nil,
+			plan.estBuildRows,
+			strings.Join(buildExtras, "; "),
+		})
+
+		// Probe side row.
+		var probeExtras []string
+		probeExtras = append(probeExtras, fmt.Sprintf("hash_join(probe); est_rows=%d, cost=%.2f", plan.estRows, plan.estCost))
+		if plan.probeTd != nil && plan.probeTd.Stats != nil {
+			probeExtras = append(probeExtras, fmt.Sprintf("table_rows=%d", plan.probeTd.Stats.RowCount))
+		}
+		// Show the join key reference.
+		var refParts []string
+		for _, k := range plan.equiKeys {
+			refParts = append(refParts, fmt.Sprintf("%s.%s", plan.buildAlias, k.leftName))
+		}
+		var refVal any
+		if len(refParts) > 0 {
+			refVal = strings.Join(refParts, ", ")
+		}
+		r.Rows = append(r.Rows, []any{
+			1, "JOIN", plan.probeAlias, "hash_probe",
+			nil, nil, nil, refVal,
+			plan.estProbeRows,
+			strings.Join(probeExtras, "; "),
+		})
+	} else {
+		// Nested loop — show two rows with the original table order.
+		leftTd, _ := e.getTableDef(ref.Left)
+		rightTd, _ := e.getTableDef(ref.Right)
+
+		var leftExtras []string
+		leftExtras = append(leftExtras, fmt.Sprintf("nested_loop_join; est_rows=%d, cost=%.2f", plan.estRows, plan.estCost))
+		if leftTd != nil && leftTd.Stats != nil {
+			leftExtras = append(leftExtras, fmt.Sprintf("table_rows=%d", leftTd.Stats.RowCount))
+		}
+		r.Rows = append(r.Rows, []any{
+			1, "JOIN", leftAlias, "ALL",
+			nil, nil, nil, nil,
+			plan.estBuildRows,
+			strings.Join(leftExtras, "; "),
+		})
+
+		var rightExtras []string
+		rightExtras = append(rightExtras, fmt.Sprintf("nested_loop_join; est_rows=%d, cost=%.2f", plan.estRows, plan.estCost))
+		if rightTd != nil && rightTd.Stats != nil {
+			rightExtras = append(rightExtras, fmt.Sprintf("table_rows=%d", rightTd.Stats.RowCount))
+		}
+		r.Rows = append(r.Rows, []any{
+			1, "JOIN", rightAlias, "ALL",
+			nil, nil, nil, nil,
+			plan.estProbeRows,
+			strings.Join(rightExtras, "; "),
+		})
+	}
 }
 
 func (e *Executor) explainInsert(r *SelectResult, s *InsertStmt) {
@@ -3677,6 +3799,46 @@ func encodeNextValue(encoded []byte) []byte {
 	return append(append([]byte(nil), encoded...), 0x00)
 }
 
+// findINOnPK searches the WHERE expression tree (handling AND) for an InExpr
+// whose column covers all PK columns. For single-column PKs, this matches
+// `col IN (v1, v2, ...)`. Returns the InExpr and true if found.
+func (e *Executor) findINOnPK(where Expr, td *catalog.TableDef) (*InExpr, bool) {
+	if where == nil {
+		return nil, false
+	}
+	if inExpr, ok := where.(*InExpr); ok {
+		if e.inExprMatchesPK(inExpr, td) {
+			return inExpr, true
+		}
+		return nil, false
+	}
+	bin, ok := where.(*BinaryExpr)
+	if !ok || bin.Op != "AND" {
+		return nil, false
+	}
+	if found, ok := e.findINOnPK(bin.Left, td); ok {
+		return found, true
+	}
+	return e.findINOnPK(bin.Right, td)
+}
+
+// inExprMatchesPK checks if an InExpr references all PK columns.
+// For single-column PK: col IN (...) where col is the PK column.
+func (e *Executor) inExprMatchesPK(inExpr *InExpr, td *catalog.TableDef) bool {
+	if inExpr.Not || len(inExpr.Values) == 0 {
+		return false
+	}
+	col, ok := inExpr.Expr.(*ColumnRefExpr)
+	if !ok {
+		return false
+	}
+	// Single-column PK check
+	if len(td.PKCols) != 1 {
+		return false
+	}
+	return td.Columns[td.PKCols[0]].Name == col.Name
+}
+
 // collectEqualities extracts col=val pairs from AND-connected equalities.
 func (e *Executor) collectEqualities(expr Expr) map[string]any {
 	result := make(map[string]any)
@@ -4279,6 +4441,16 @@ func estimateWHERECardinality(td *catalog.TableDef, where Expr, totalRows int64)
 	return int64(est)
 }
 
+// Cost model constants
+const (
+	costSeqIO       = 1.0  // cost of a sequential I/O (read one page)
+	costRandIO      = 4.0  // cost of a random I/O (seek + read)
+	costCPURow      = 0.01 // cost of evaluating WHERE on one row
+	costCPUIndexRow = 0.005 // cost per index entry scan
+	costTableLookup = 5.0  // cost of one table lookup from index (random I/O + decode)
+	rowsPerPage     = 100  // estimated rows per data page
+)
+
 // estimateAccessPaths enumerates possible access paths for a single-table query.
 func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []AccessPath {
 	var paths []AccessPath
@@ -4288,11 +4460,16 @@ func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []Ac
 	}
 	estRows := estimateWHERECardinality(td, s.Where, totalRows)
 
-	// 1. Full scan
+	// 1. Full scan: cost = I/O pages + CPU per row
+	pages := float64(totalRows) / rowsPerPage
+	if pages < 1 {
+		pages = 1
+	}
+	fullScanCost := pages*costSeqIO + float64(totalRows)*costCPURow
 	paths = append(paths, AccessPath{
 		Type:    "full_scan",
 		EstRows: estRows,
-		EstCost: float64(totalRows) * 0.01,
+		EstCost: fullScanCost,
 	})
 
 	if s.Where == nil {
@@ -4309,9 +4486,11 @@ func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []Ac
 		}
 	}
 
+	// Also check for IN-on-PK: WHERE col IN (v1, v2, ...) where col is the PK.
+	inOnPK, hasINOnPK := e.findINOnPK(s.Where, td)
+
 	if pkEqCount == len(td.PKCols) && len(td.PKCols) > 0 {
-		// Full PK match — point lookup.
-		// Check for IN expression with multiple values.
+		// Full PK match — point lookup. Each lookup = 1 random I/O.
 		inCount := int64(1)
 		if inExpr, ok := s.Where.(*InExpr); ok && !inExpr.Not {
 			inCount = int64(len(inExpr.Values))
@@ -4319,12 +4498,35 @@ func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []Ac
 		if inCount == 0 {
 			inCount = 1
 		}
+		// AND chain with all PK cols = single point lookup
+		if inCount == 1 {
+			// Check if it's really an AND chain of PK equalities (not IN)
+			if _, ok := s.Where.(*InExpr); !ok {
+				inCount = 1
+			}
+		}
+		pkPointCost := float64(inCount) * costRandIO
+		// Even for small N, PK point is cheap. But for very large N, table scan wins.
 		paths = append(paths, AccessPath{
 			Type:      "pk_point",
 			IndexName: "PRIMARY",
 			MatchCols: pkEqCount,
 			EstRows:   inCount,
-			EstCost:   float64(inCount) * 1.0,
+			EstCost:   pkPointCost,
+		})
+	} else if hasINOnPK {
+		// IN on all PK columns — multiple point lookups.
+		inCount := int64(len(inOnPK.Values))
+		if inCount == 0 {
+			inCount = 1
+		}
+		pkPointCost := float64(inCount) * costRandIO
+		paths = append(paths, AccessPath{
+			Type:      "pk_point",
+			IndexName: "PRIMARY",
+			MatchCols: len(td.PKCols),
+			EstRows:   inCount,
+			EstCost:   pkPointCost,
 		})
 	} else if pkEqCount > 0 {
 		// Partial PK match — range scan.
@@ -4341,12 +4543,18 @@ func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []Ac
 		if pkEstRows < 1 {
 			pkEstRows = 1
 		}
+		// Range scan: sequential I/O for the range + CPU per row
+		pkPages := float64(pkEstRows) / rowsPerPage
+		if pkPages < 1 {
+			pkPages = 1
+		}
+		pkRangeCost := pkPages*costSeqIO + float64(pkEstRows)*costCPURow
 		paths = append(paths, AccessPath{
 			Type:      "pk_range",
 			IndexName: "PRIMARY",
 			MatchCols: pkEqCount,
 			EstRows:   pkEstRows,
-			EstCost:   float64(pkEstRows) * 0.01,
+			EstCost:   pkRangeCost,
 		})
 	}
 
@@ -4382,9 +4590,15 @@ func (e *Executor) estimateAccessPaths(td *catalog.TableDef, s *SelectStmt) []Ac
 		isCovering := e.isCoveringIndex(td, idx, s)
 		var cost float64
 		if isCovering {
-			cost = float64(idxEstRows) * 0.01
+			// Covering: only scan index, no table lookups
+			idxPages := float64(idxEstRows) / rowsPerPage
+			if idxPages < 1 {
+				idxPages = 1
+			}
+			cost = idxPages*costSeqIO + float64(idxEstRows)*costCPUIndexRow
 		} else {
-			cost = float64(idxEstRows) * 0.52 // index scan + table lookup
+			// Non-covering: scan index + random I/O per matching row for table lookup
+			cost = float64(idxEstRows)*costCPUIndexRow + float64(idxEstRows)*costTableLookup
 		}
 
 		apType := "index_scan"
@@ -4416,4 +4630,606 @@ func selectBestPath(paths []AccessPath) AccessPath {
 		}
 	}
 	return best
+}
+
+// ─── Join optimization: types, helpers, cost model ─────────────────────
+
+// joinEquiKey represents one equality column pair in an equi-join.
+type joinEquiKey struct {
+	leftColIdx  int // left table column index
+	rightColIdx int // right table column index
+	leftName    string
+	rightName   string
+}
+
+// joinPlan holds the optimizer's decisions for executing a join.
+type joinPlan struct {
+	method      string // "hash_join" | "nested_loop"
+	buildSide   TableRef
+	probeSide   TableRef
+	buildTd     *catalog.TableDef
+	probeTd     *catalog.TableDef
+	buildAlias  string
+	probeAlias  string
+	equiKeys    []joinEquiKey // build side key column indices
+	probeKeyIdx []int         // probe side column indices
+	residualOn  Expr          // non-equi residual from ON
+	leftWhere   Expr          // WHERE predicates for left table
+	rightWhere  Expr          // WHERE predicates for right table
+	remainWhere Expr          // cross-table WHERE (evaluated after join)
+	swapped     bool          // true if INNER join swapped left/right
+	estCost     float64
+	estRows     int64
+	estBuildRows int64
+	estProbeRows int64
+}
+
+// colBelongsTo checks whether a column reference belongs to a given table.
+func colBelongsTo(col *ColumnRefExpr, td *catalog.TableDef, alias string) bool {
+	if col.Table != "" {
+		return col.Table == td.Name || col.Table == alias
+	}
+	// No table prefix: check if column name exists in table def.
+	return td.ColumnIndex(col.Name) >= 0
+}
+
+// andExpr combines two expressions with AND, handling nil.
+func andExpr(a, b Expr) Expr {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &BinaryExpr{Op: "AND", Left: a, Right: b}
+}
+
+// collectTableRefs gathers all table prefixes from ColumnRefExprs in an expression.
+func collectTableRefs(expr Expr) map[string]bool {
+	refs := make(map[string]bool)
+	var walk func(Expr)
+	walk = func(e Expr) {
+		if e == nil {
+			return
+		}
+		switch ex := e.(type) {
+		case *ColumnRefExpr:
+			if ex.Table != "" {
+				refs[ex.Table] = true
+			} else {
+				refs[""] = true // unqualified column
+			}
+		case *BinaryExpr:
+			walk(ex.Left)
+			walk(ex.Right)
+		case *UnaryExpr:
+			walk(ex.Operand)
+		case *BetweenExpr:
+			walk(ex.Expr)
+			walk(ex.Low)
+			walk(ex.High)
+		case *InExpr:
+			walk(ex.Expr)
+			for _, v := range ex.Values {
+				walk(v)
+			}
+		case *IsNullExpr:
+			walk(ex.Expr)
+		case *LikeExpr:
+			walk(ex.Expr)
+			walk(ex.Pattern)
+		case *FuncCallExpr:
+			for _, a := range ex.Args {
+				walk(a)
+			}
+		}
+	}
+	walk(expr)
+	return refs
+}
+
+// extractEquiJoinKeys extracts equality join conditions from an ON expression.
+// Returns equi-join keys and a residual expression for non-equi conditions.
+func extractEquiJoinKeys(on Expr, leftTd, rightTd *catalog.TableDef, leftAlias, rightAlias string) (keys []joinEquiKey, residual Expr) {
+	if on == nil {
+		return nil, nil
+	}
+	bin, ok := on.(*BinaryExpr)
+	if !ok {
+		return nil, on
+	}
+	if bin.Op == "AND" {
+		leftKeys, leftRes := extractEquiJoinKeys(bin.Left, leftTd, rightTd, leftAlias, rightAlias)
+		rightKeys, rightRes := extractEquiJoinKeys(bin.Right, leftTd, rightTd, leftAlias, rightAlias)
+		keys = append(leftKeys, rightKeys...)
+		residual = andExpr(leftRes, rightRes)
+		return keys, residual
+	}
+	if bin.Op == "=" {
+		lCol, lOk := bin.Left.(*ColumnRefExpr)
+		rCol, rOk := bin.Right.(*ColumnRefExpr)
+		if lOk && rOk {
+			lLeft := colBelongsTo(lCol, leftTd, leftAlias)
+			lRight := colBelongsTo(lCol, rightTd, rightAlias)
+			rLeft := colBelongsTo(rCol, leftTd, leftAlias)
+			rRight := colBelongsTo(rCol, rightTd, rightAlias)
+
+			if (lLeft && rRight) && !(lRight && rLeft) {
+				li := leftTd.ColumnIndex(lCol.Name)
+				ri := rightTd.ColumnIndex(rCol.Name)
+				if li >= 0 && ri >= 0 {
+					return []joinEquiKey{{leftColIdx: li, rightColIdx: ri, leftName: lCol.Name, rightName: rCol.Name}}, nil
+				}
+			}
+			if (rLeft && lRight) && !(rRight && lLeft) {
+				li := leftTd.ColumnIndex(rCol.Name)
+				ri := rightTd.ColumnIndex(lCol.Name)
+				if li >= 0 && ri >= 0 {
+					return []joinEquiKey{{leftColIdx: li, rightColIdx: ri, leftName: rCol.Name, rightName: lCol.Name}}, nil
+				}
+			}
+		}
+	}
+	return nil, on
+}
+
+// splitWhereByTable splits a WHERE expression into per-table and cross-table parts.
+func splitWhereByTable(where Expr, leftTd, rightTd *catalog.TableDef, leftAlias, rightAlias string) (leftWhere, rightWhere, remainWhere Expr) {
+	if where == nil {
+		return nil, nil, nil
+	}
+	bin, ok := where.(*BinaryExpr)
+	if ok && bin.Op == "AND" {
+		lw, rw, remw := splitWhereByTable(bin.Left, leftTd, rightTd, leftAlias, rightAlias)
+		lw2, rw2, remw2 := splitWhereByTable(bin.Right, leftTd, rightTd, leftAlias, rightAlias)
+		return andExpr(lw, lw2), andExpr(rw, rw2), andExpr(remw, remw2)
+	}
+
+	refs := collectTableRefs(where)
+	hasLeft := false
+	hasRight := false
+	for ref := range refs {
+		if ref == "" {
+			// Unqualified column: check both tables.
+			// These go to remainWhere since we can't safely attribute them.
+			hasLeft = true
+			hasRight = true
+			continue
+		}
+		if ref == leftTd.Name || ref == leftAlias {
+			hasLeft = true
+		}
+		if ref == rightTd.Name || ref == rightAlias {
+			hasRight = true
+		}
+	}
+
+	// If the expression only references column names without table prefix,
+	// try to determine if all columns belong to one table.
+	if refs[""] && len(refs) == 1 {
+		allLeft := allColsBelongTo(where, leftTd)
+		allRight := allColsBelongTo(where, rightTd)
+		if allLeft && !allRight {
+			return where, nil, nil
+		}
+		if allRight && !allLeft {
+			return nil, where, nil
+		}
+		// Both tables have matching columns or ambiguous → remain
+		return nil, nil, where
+	}
+
+	if hasLeft && !hasRight {
+		return where, nil, nil
+	}
+	if hasRight && !hasLeft {
+		return nil, where, nil
+	}
+	return nil, nil, where
+}
+
+// allColsBelongTo checks if all ColumnRefExprs (without table prefix) in an expression
+// can be resolved in the given table definition.
+func allColsBelongTo(expr Expr, td *catalog.TableDef) bool {
+	switch ex := expr.(type) {
+	case *ColumnRefExpr:
+		if ex.Table != "" {
+			return ex.Table == td.Name
+		}
+		return td.ColumnIndex(ex.Name) >= 0
+	case *BinaryExpr:
+		return allColsBelongTo(ex.Left, td) && allColsBelongTo(ex.Right, td)
+	case *UnaryExpr:
+		return allColsBelongTo(ex.Operand, td)
+	case *BetweenExpr:
+		return allColsBelongTo(ex.Expr, td) && allColsBelongTo(ex.Low, td) && allColsBelongTo(ex.High, td)
+	case *InExpr:
+		if !allColsBelongTo(ex.Expr, td) {
+			return false
+		}
+		for _, v := range ex.Values {
+			if !allColsBelongTo(v, td) {
+				return false
+			}
+		}
+		return true
+	case *IsNullExpr:
+		return allColsBelongTo(ex.Expr, td)
+	case *LikeExpr:
+		return allColsBelongTo(ex.Expr, td) && allColsBelongTo(ex.Pattern, td)
+	case *FuncCallExpr:
+		for _, a := range ex.Args {
+			if !allColsBelongTo(a, td) {
+				return false
+			}
+		}
+		return true
+	case *LiteralExpr:
+		return true
+	case *NullExpr:
+		return true
+	}
+	return true
+}
+
+// ─── Join cost model ───────────────────────────────────────────────────
+
+func estimateHashJoinCost(buildRows, probeRows int64) float64 {
+	buildScan := math.Max(1, float64(buildRows)/float64(rowsPerPage)) * costSeqIO + float64(buildRows)*costCPURow
+	probeScan := math.Max(1, float64(probeRows)/float64(rowsPerPage)) * costSeqIO + float64(probeRows)*costCPURow
+	hashBuild := float64(buildRows) * 0.011
+	hashProbe := float64(probeRows) * 0.01
+	return buildScan + probeScan + hashBuild + hashProbe
+}
+
+func estimateNestedLoopCost(leftRows, rightRows int64) float64 {
+	outerScan := math.Max(1, float64(leftRows)/float64(rowsPerPage)) * costSeqIO
+	innerScan := float64(leftRows) * math.Max(1, float64(rightRows)/float64(rowsPerPage)) * costSeqIO
+	cpuCompare := float64(leftRows) * float64(rightRows) * costCPURow
+	return outerScan + innerScan + cpuCompare
+}
+
+func estimateJoinCardinality(leftRows, rightRows int64, keys []joinEquiKey, leftTd, rightTd *catalog.TableDef) int64 {
+	if len(keys) == 0 {
+		return leftRows * rightRows
+	}
+	card := float64(leftRows) * float64(rightRows)
+	for _, k := range keys {
+		leftNDV := ndvForColumn(leftTd, k.leftName, leftRows)
+		rightNDV := ndvForColumn(rightTd, k.rightName, rightRows)
+		maxNDV := math.Max(float64(leftNDV), float64(rightNDV))
+		if maxNDV > 0 {
+			card /= maxNDV
+		}
+	}
+	if card < 1 {
+		if leftRows > 0 && rightRows > 0 {
+			return 1
+		}
+		return 0
+	}
+	return int64(card)
+}
+
+func ndvForColumn(td *catalog.TableDef, colName string, rows int64) int64 {
+	if td.Stats != nil {
+		cs := colStatsByName(td.Stats, colName)
+		if cs != nil && cs.NDV > 0 {
+			return cs.NDV
+		}
+	}
+	// Default: max(100, rows/10)
+	def := rows / 10
+	if def < 100 {
+		def = 100
+	}
+	return def
+}
+
+// ─── planJoin — join optimizer ─────────────────────────────────────────
+
+func (e *Executor) planJoin(ref *JoinTableRef, s *SelectStmt) *joinPlan {
+	leftTd, _ := e.getTableDef(ref.Left)
+	rightTd, _ := e.getTableDef(ref.Right)
+	leftAlias := e.getTableAlias(ref.Left)
+	rightAlias := e.getTableAlias(ref.Right)
+
+	// 1. Extract equi-join keys + residual ON.
+	keys, residualOn := extractEquiJoinKeys(ref.On, leftTd, rightTd, leftAlias, rightAlias)
+
+	// 2. Split WHERE.
+	leftWhere, rightWhere, remainWhere := splitWhereByTable(s.Where, leftTd, rightTd, leftAlias, rightAlias)
+
+	// 3. Estimate row counts with pushdown.
+	leftRows := tableRowCount(leftTd)
+	rightRows := tableRowCount(rightTd)
+	leftEstRows := estimateWHERECardinality(leftTd, leftWhere, leftRows)
+	rightEstRows := estimateWHERECardinality(rightTd, rightWhere, rightRows)
+
+	plan := &joinPlan{
+		residualOn:  residualOn,
+		leftWhere:   leftWhere,
+		rightWhere:  rightWhere,
+		remainWhere: remainWhere,
+	}
+
+	// 4. Determine build/probe sides based on join type.
+	switch ref.Type {
+	case JoinTypeLeft:
+		// LEFT JOIN: build=right (inner), probe=left (outer)
+		plan.buildSide = ref.Right
+		plan.probeSide = ref.Left
+		plan.buildTd = rightTd
+		plan.probeTd = leftTd
+		plan.buildAlias = rightAlias
+		plan.probeAlias = leftAlias
+		plan.estBuildRows = rightEstRows
+		plan.estProbeRows = leftEstRows
+		plan.swapped = false
+	case JoinTypeRight:
+		// RIGHT JOIN: build=left (inner), probe=right (outer)
+		plan.buildSide = ref.Left
+		plan.probeSide = ref.Right
+		plan.buildTd = leftTd
+		plan.probeTd = rightTd
+		plan.buildAlias = leftAlias
+		plan.probeAlias = rightAlias
+		plan.estBuildRows = leftEstRows
+		plan.estProbeRows = rightEstRows
+		plan.swapped = false
+	default:
+		// INNER / CROSS: pick smaller table as build side.
+		if leftEstRows <= rightEstRows {
+			plan.buildSide = ref.Left
+			plan.probeSide = ref.Right
+			plan.buildTd = leftTd
+			plan.probeTd = rightTd
+			plan.buildAlias = leftAlias
+			plan.probeAlias = rightAlias
+			plan.estBuildRows = leftEstRows
+			plan.estProbeRows = rightEstRows
+			plan.swapped = false
+		} else {
+			plan.buildSide = ref.Right
+			plan.probeSide = ref.Left
+			plan.buildTd = rightTd
+			plan.probeTd = leftTd
+			plan.buildAlias = rightAlias
+			plan.probeAlias = leftAlias
+			plan.estBuildRows = rightEstRows
+			plan.estProbeRows = leftEstRows
+			plan.swapped = true
+		}
+	}
+
+	// 5. Choose method: hash join if equi keys exist, else nested loop.
+	if len(keys) > 0 {
+		plan.method = "hash_join"
+		// Map equi keys to build/probe column indices.
+		remappedKeys := make([]joinEquiKey, 0, len(keys))
+		for _, k := range keys {
+			if plan.swapped {
+				plan.probeKeyIdx = append(plan.probeKeyIdx, k.leftColIdx)
+				remappedKeys = append(remappedKeys, joinEquiKey{
+					leftColIdx:  k.rightColIdx, // build col
+					rightColIdx: k.leftColIdx,  // probe col
+					leftName:    k.rightName,
+					rightName:   k.leftName,
+				})
+			} else {
+				remappedKeys = append(remappedKeys, k)
+				plan.probeKeyIdx = append(plan.probeKeyIdx, k.rightColIdx)
+			}
+		}
+		plan.equiKeys = remappedKeys
+		plan.estCost = estimateHashJoinCost(plan.estBuildRows, plan.estProbeRows)
+	} else {
+		plan.method = "nested_loop"
+		plan.estCost = estimateNestedLoopCost(leftEstRows, rightEstRows)
+	}
+
+	// 6. Estimate output cardinality.
+	plan.estRows = estimateJoinCardinality(leftEstRows, rightEstRows, keys, leftTd, rightTd)
+
+	return plan
+}
+
+func tableRowCount(td *catalog.TableDef) int64 {
+	if td == nil || td.Stats == nil {
+		return 1000
+	}
+	return td.Stats.RowCount
+}
+
+// ─── collectRowsWithWhere — WHERE pushdown ─────────────────────────────
+
+func (e *Executor) collectRowsWithWhere(t *txn.Txn, ref TableRef, td *catalog.TableDef, where Expr) ([][]any, error) {
+	if where == nil {
+		return e.collectRows(t, ref)
+	}
+	// Only apply WHERE filtering for simple table refs.
+	if _, ok := ref.(*SimpleTableRef); !ok {
+		return e.collectRows(t, ref)
+	}
+	storedTd, err := e.cat.GetTable(e.dbName, td.Name)
+	if err != nil {
+		return nil, err
+	}
+	treeKey := storedTd.DataFile()
+	pkCols := storedTd.PrimaryKeyColumns()
+	var rows [][]any
+	t.Scan(treeKey, pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, storedTd.Columns)
+		if e.evalWhere(storedTd, where, vals) {
+			rows = append(rows, vals)
+		}
+		return true
+	})
+	return rows, nil
+}
+
+// ─── execHashJoin — hash join execution ────────────────────────────────
+
+func (e *Executor) execHashJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, leftTd, rightTd *catalog.TableDef, plan *joinPlan) (any, error) {
+	// Build phase: collect build side rows into hash table.
+	buildRows, err := e.collectRowsWithWhere(t, plan.buildSide, plan.buildTd, buildWhereForSide(plan, ref.Type))
+	if err != nil {
+		return nil, err
+	}
+
+	// Probe phase: collect probe side rows.
+	var probeWhere Expr
+	if ref.Type == JoinTypeLeft {
+		probeWhere = plan.leftWhere
+	} else if ref.Type == JoinTypeRight {
+		probeWhere = plan.rightWhere
+	} else {
+		// INNER: probe side might be left or right depending on swapped.
+		if plan.swapped {
+			probeWhere = plan.leftWhere
+		} else {
+			probeWhere = plan.rightWhere
+		}
+	}
+	probeRows, err := e.collectRowsWithWhere(t, plan.probeSide, plan.probeTd, probeWhere)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build hash table: key → list of rows.
+	hashTable := make(map[string][][]any)
+	for _, row := range buildRows {
+		key, skip := hashJoinKey(row, plan.equiKeys, true)
+		if skip {
+			continue
+		}
+		hashTable[key] = append(hashTable[key], row)
+	}
+
+	// Determine actual left/right td and aliases.
+	leftAlias := e.getTableAlias(ref.Left)
+	rightAlias := e.getTableAlias(ref.Right)
+
+	var resultRows [][]any
+
+	for pi, probeRow := range probeRows {
+		key, skip := hashJoinKey(probeRow, plan.equiKeys, false)
+		if skip {
+			// NULL in join key: for LEFT/RIGHT join, output with NULLs on other side.
+			if ref.Type == JoinTypeLeft || ref.Type == JoinTypeRight {
+				var joined []any
+				if ref.Type == JoinTypeLeft {
+					// probe = left, build = right → (left, NULL_right)
+					joined = append(append([]any{}, probeRow...), make([]any, len(plan.buildTd.Columns))...)
+				} else {
+					// probe = right, build = left → (NULL_left, right)
+					joined = append(append([]any{}, make([]any, len(plan.buildTd.Columns))...), probeRow...)
+				}
+				if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, plan.remainWhere) {
+					resultRows = append(resultRows, joined)
+				}
+			}
+			continue
+		}
+
+		matches := hashTable[key]
+		anyMatched := false
+		for _, buildRow := range matches {
+			// Reassemble left+right order.
+			var joined []any
+			if plan.swapped {
+				// build=right, probe=left → probe|build = left|right
+				joined = append(append([]any{}, probeRow...), buildRow...)
+			} else if ref.Type == JoinTypeLeft {
+				// probe=left, build=right → probe|build = left|right
+				joined = append(append([]any{}, probeRow...), buildRow...)
+			} else if ref.Type == JoinTypeRight {
+				// probe=right, build=left → build|probe = left|right
+				joined = append(append([]any{}, buildRow...), probeRow...)
+			} else {
+				// INNER, not swapped: build=left, probe=right → build|probe = left|right
+				joined = append(append([]any{}, buildRow...), probeRow...)
+			}
+
+			// Check residual ON condition.
+			if plan.residualOn != nil {
+				if !e.evalJoinCondition(leftTd, rightTd, joined[:len(leftTd.Columns)], joined[len(leftTd.Columns):], plan.residualOn) {
+					continue
+				}
+			}
+
+			anyMatched = true
+
+			// Check remaining WHERE.
+			if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, plan.remainWhere) {
+				resultRows = append(resultRows, joined)
+			}
+		}
+
+		// Handle unmatched probe rows for LEFT/RIGHT join.
+		if !anyMatched {
+			var joined []any
+			if ref.Type == JoinTypeLeft {
+				// probe=left → (left, NULL_right)
+				joined = append(append([]any{}, probeRow...), make([]any, len(plan.buildTd.Columns))...)
+			} else if ref.Type == JoinTypeRight {
+				// probe=right → (NULL_left, right)
+				joined = append(append([]any{}, make([]any, len(plan.buildTd.Columns))...), probeRow...)
+			}
+			if joined != nil {
+				if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, plan.remainWhere) {
+					resultRows = append(resultRows, joined)
+				}
+			}
+		}
+		_ = pi
+	}
+
+	colNames := make([]string, 0, len(leftTd.Columns)+len(rightTd.Columns))
+	for _, col := range leftTd.Columns {
+		colNames = append(colNames, leftAlias+"."+col.Name)
+	}
+	for _, col := range rightTd.Columns {
+		colNames = append(colNames, rightAlias+"."+col.Name)
+	}
+
+	return &SelectResult{Columns: colNames, Rows: resultRows, TableAlias: leftAlias + " join " + rightAlias}, nil
+}
+
+// buildWhereForSide returns the pushdown WHERE for the build side.
+func buildWhereForSide(plan *joinPlan, joinType JoinType) Expr {
+	if joinType == JoinTypeLeft {
+		return plan.rightWhere // build = right
+	}
+	if joinType == JoinTypeRight {
+		return plan.leftWhere // build = left
+	}
+	// INNER: swapped means build=right, else build=left
+	if plan.swapped {
+		return plan.rightWhere
+	}
+	return plan.leftWhere
+}
+
+// hashJoinKey serializes a row's join key columns into a string for the hash table.
+// Returns skip=true if any key column is NULL.
+func hashJoinKey(row []any, keys []joinEquiKey, isBuild bool) (string, bool) {
+	var parts []string
+	for _, k := range keys {
+		var idx int
+		if isBuild {
+			idx = k.leftColIdx // build key index
+		} else {
+			idx = k.rightColIdx // probe key index (stored as rightColIdx)
+		}
+		if idx >= len(row) {
+			return "", true
+		}
+		val := row[idx]
+		if val == nil {
+			return "", true // NULL keys don't match
+		}
+		parts = append(parts, fmt.Sprintf("%v", val))
+	}
+	return strings.Join(parts, "\x00"), false
 }
