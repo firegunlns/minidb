@@ -114,7 +114,13 @@
       "Bash(grep memory:*)",
       "Bash(# Wait and check\nsleep 120 && wc -l /Users/alan/.claude/projects/-Users-alan-work-learn-minidb/tasks/b9a9a37.output 2>/dev/null; ps aux | grep runner | grep -v grep | awk '{print \"MEM:\", $6/1024, \"MB\"}' 2>/dev/null)",
       "Bash(echo === $t ===:*)",
-      "Bash(ps aux:*)"
+      "Bash(ps aux:*)",
+      "Bash(timeout 60 /Users/alan/work/learn/minidb/sqllogictest/runner/runner:*)",
+      "Bash(/Users/alan/work/learn/minidb/sqllogictest/runner/runner:*)",
+      "Bash(echo done:*)",
+      "Bash(grep ^query:*)",
+      "Bash(rm:*)",
+      "Bash(gtimeout 60:*)"
     ]
   }
 }

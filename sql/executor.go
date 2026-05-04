@@ -194,8 +194,18 @@ func (e *Executor) execCreateTable(s *CreateTableStmt) (any, error) {
 			pkCols = append(pkCols, i)
 		}
 	}
+	// When no PRIMARY KEY is specified, add a hidden _rowid column as PK
+	// instead of using the first column. This prevents duplicate rows from
+	// being overwritten when the first column has duplicate values.
 	if len(pkCols) == 0 {
-		pkCols = []int{0}
+		rowidCol := storage.ColumnDef{
+			Name:    "_rowid",
+			Type:    storage.ColTypeInt,
+			AutoInc: true,
+			Hidden:  true,
+		}
+		cols = append(cols, rowidCol)
+		pkCols = []int{len(cols) - 1}
 	}
 
 	td := &catalog.TableDef{
@@ -758,10 +768,30 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 				}
 			}
 		} else {
-			if len(rowVals) != len(td.Columns) {
-				return nil, fmt.Errorf("column count mismatch: got %d, expected %d", len(rowVals), len(td.Columns))
+			// Count visible (non-hidden) columns for mismatch check.
+			visibleCount := 0
+			for _, col := range td.Columns {
+				if !col.Hidden {
+					visibleCount++
+				}
 			}
-			fullVals = rowVals
+			if len(rowVals) != visibleCount && len(rowVals) != len(td.Columns) {
+				return nil, fmt.Errorf("column count mismatch: got %d, expected %d", len(rowVals), visibleCount)
+			}
+			if len(rowVals) == visibleCount && visibleCount < len(td.Columns) {
+				// Provided values for visible columns only; hidden columns get nil (auto-filled by AutoInc).
+				fullVals = make([]any, len(td.Columns))
+				visIdx := 0
+				for colIdx, col := range td.Columns {
+					if col.Hidden {
+						continue
+					}
+					fullVals[colIdx] = rowVals[visIdx]
+					visIdx++
+				}
+			} else {
+				fullVals = rowVals
+			}
 		}
 
 		// Coerce values.
@@ -1079,11 +1109,12 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 	var colNames []string
 
 	if s.SelectAll {
-		colNames = make([]string, len(td.Columns))
-		colIndices = make([]int, len(td.Columns))
 		for i, col := range td.Columns {
-			colNames[i] = col.Name
-			colIndices[i] = i
+			if col.Hidden {
+				continue
+			}
+			colNames = append(colNames, col.Name)
+			colIndices = append(colIndices, i)
 			outFields = append(outFields, outputField{colIdx: i, colName: col.Name})
 		}
 	} else if len(s.Fields) > 0 {
@@ -1741,6 +1772,35 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 }
 
 func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
+	// For cross joins (comma-separated FROM, no ON condition), use the unified
+	// flatten+left-deep path which supports N tables, WHERE pushdown, and projection.
+	if isAllCrossJoin(ref) {
+		return e.execMultiTableJoin(t, s, ref)
+	}
+
+	// For explicit JOIN with ON / LEFT / RIGHT, use the original 2-table path.
+	return e.execSelectJoinLegacy(t, s, ref)
+}
+
+// isAllCrossJoin returns true if the join tree consists entirely of cross joins
+// (no ON conditions, no LEFT/RIGHT join types) — i.e. comma-separated FROM.
+func isAllCrossJoin(ref TableRef) bool {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		return true
+	case *JoinTableRef:
+		if r.Type != JoinTypeCross {
+			return false
+		}
+		if r.On != nil {
+			return false
+		}
+		return isAllCrossJoin(r.Left) && isAllCrossJoin(r.Right)
+	}
+	return false
+}
+
+func (e *Executor) execSelectJoinLegacy(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
 	leftTd, err := e.getTableDef(ref.Left)
 	if err != nil {
 		return nil, err
@@ -4664,6 +4724,236 @@ type joinPlan struct {
 	estProbeRows int64
 }
 
+// flatTableEntry represents one table in a flattened join tree.
+type flatTableEntry struct {
+	tableName string            // actual table name
+	alias     string            // alias or table name if no alias
+	td        *catalog.TableDef // table definition
+	colOffset int               // starting column offset in the joined row
+	colCount  int               // len(td.Columns)
+}
+
+// countTables counts the number of leaf tables in a TableRef tree.
+func countTables(ref TableRef) int {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		return 1
+	case *JoinTableRef:
+		return countTables(r.Left) + countTables(r.Right)
+	}
+	return 0
+}
+
+// flattenJoinTree flattens a nested JoinTableRef tree into an ordered list of
+// flatTableEntry with computed column offsets.
+func (e *Executor) flattenJoinTree(ref TableRef) ([]flatTableEntry, error) {
+	var entries []flatTableEntry
+	e.walkJoinTree(ref, &entries)
+
+	// Compute column offsets.
+	offset := 0
+	for i := range entries {
+		entries[i].colOffset = offset
+		entries[i].colCount = len(entries[i].td.Columns)
+		offset += entries[i].colCount
+	}
+	return entries, nil
+}
+
+func (e *Executor) walkJoinTree(ref TableRef, entries *[]flatTableEntry) {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		td, err := e.cat.GetTable(e.dbName, r.Table)
+		if err != nil {
+			return
+		}
+		alias := r.Alias
+		if alias == "" {
+			alias = r.Table
+		}
+		*entries = append(*entries, flatTableEntry{
+			tableName: r.Table,
+			alias:     alias,
+			td:        td,
+		})
+	case *JoinTableRef:
+		e.walkJoinTree(r.Left, entries)
+		e.walkJoinTree(r.Right, entries)
+	}
+}
+
+// resolveColumnOffset finds the absolute column index in a joined row.
+func resolveColumnOffset(col *ColumnRefExpr, tables []flatTableEntry) (int, error) {
+	if col.Table != "" {
+		for _, entry := range tables {
+			if entry.tableName == col.Table || entry.alias == col.Table {
+				idx := entry.td.ColumnIndex(col.Name)
+				if idx >= 0 {
+					return entry.colOffset + idx, nil
+				}
+			}
+		}
+		return -1, fmt.Errorf("column %s.%s not found in join", col.Table, col.Name)
+	}
+	// Unqualified: search all tables.
+	for _, entry := range tables {
+		idx := entry.td.ColumnIndex(col.Name)
+		if idx >= 0 {
+			return entry.colOffset + idx, nil
+		}
+	}
+	return -1, fmt.Errorf("column %s not found in any join table", col.Name)
+}
+
+// evalExprMultiJoin evaluates an expression over a fully-joined row using the
+// flat table list for column resolution.
+func (e *Executor) evalExprMultiJoin(expr Expr, tables []flatTableEntry, joinedRow []any) any {
+	switch ex := expr.(type) {
+	case *LiteralExpr:
+		return ex.Value
+	case *ColumnRefExpr:
+		idx, err := resolveColumnOffset(ex, tables)
+		if err != nil || idx < 0 || idx >= len(joinedRow) {
+			return nil
+		}
+		return joinedRow[idx]
+	case *BinaryExpr:
+		left := e.evalExprMultiJoin(ex.Left, tables, joinedRow)
+		right := e.evalExprMultiJoin(ex.Right, tables, joinedRow)
+		return e.evalBinaryOp(ex.Op, left, right)
+	case *UnaryExpr:
+		operand := e.evalExprMultiJoin(ex.Operand, tables, joinedRow)
+		return e.evalUnaryOp(ex.Op, operand)
+	case *NullExpr:
+		return nil
+	case *IsNullExpr:
+		v := e.evalExprMultiJoin(ex.Expr, tables, joinedRow)
+		if ex.Not {
+			return v != nil
+		}
+		return v == nil
+	case *InExpr:
+		return e.evalInExprMultiJoin(tables, ex, joinedRow)
+	case *LikeExpr:
+		val := e.evalExprMultiJoin(ex.Expr, tables, joinedRow)
+		pattern := e.evalExprMultiJoin(ex.Pattern, tables, joinedRow)
+		result := e.evalLike(val, pattern)
+		if ex.Not {
+			return !result
+		}
+		return result
+	case *BetweenExpr:
+		val := e.evalExprMultiJoin(ex.Expr, tables, joinedRow)
+		low := e.evalExprMultiJoin(ex.Low, tables, joinedRow)
+		high := e.evalExprMultiJoin(ex.High, tables, joinedRow)
+		if val == nil || low == nil || high == nil {
+			return nil
+		}
+		cmpLow := compareValues(val, low)
+		cmpHigh := compareValues(val, high)
+		result := cmpLow >= 0 && cmpHigh <= 0
+		if ex.Not {
+			result = !result
+		}
+		return result
+	case *CaseExpr:
+		for _, w := range ex.Whens {
+			var cond any
+			if ex.Value != nil {
+				val := e.evalExprMultiJoin(ex.Value, tables, joinedRow)
+				cmp := e.evalExprMultiJoin(w.Cond, tables, joinedRow)
+				if val == nil || cmp == nil {
+					cond = false
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
+			} else {
+				cond = e.evalExprMultiJoin(w.Cond, tables, joinedRow)
+			}
+			if b, ok := cond.(bool); ok && b {
+				return e.evalExprMultiJoin(w.Result, tables, joinedRow)
+			}
+		}
+		if ex.Else != nil {
+			return e.evalExprMultiJoin(ex.Else, tables, joinedRow)
+		}
+		return nil
+	case *FuncCallExpr:
+		return e.evalFuncCallMultiJoin(tables, ex, joinedRow)
+	default:
+		return nil
+	}
+}
+
+func (e *Executor) evalInExprMultiJoin(tables []flatTableEntry, expr *InExpr, joinedRow []any) bool {
+	val := e.evalExprMultiJoin(expr.Expr, tables, joinedRow)
+	for _, v := range expr.Values {
+		if sq, ok := v.(*SubqueryExpr); ok {
+			result := e.execSubquery(sq.Query)
+			if rs, ok := result.(*SelectResult); ok {
+				for _, row := range rs.Rows {
+					if len(row) > 0 && compareValues(val, row[0]) == 0 {
+						return !expr.Not
+					}
+				}
+				return expr.Not
+			}
+		} else {
+			ev := e.evalExprMultiJoin(v, tables, joinedRow)
+			if compareValues(val, ev) == 0 {
+				return !expr.Not
+			}
+		}
+	}
+	return expr.Not
+}
+
+func (e *Executor) evalFuncCallMultiJoin(tables []flatTableEntry, f *FuncCallExpr, joinedRow []any) any {
+	switch strings.ToUpper(f.Name) {
+	case "COALESCE":
+		for _, arg := range f.Args {
+			v := e.evalExprMultiJoin(arg, tables, joinedRow)
+			if v != nil {
+				return v
+			}
+		}
+		return nil
+	case "IFNULL":
+		if len(f.Args) >= 2 {
+			v := e.evalExprMultiJoin(f.Args[0], tables, joinedRow)
+			if v == nil {
+				return e.evalExprMultiJoin(f.Args[1], tables, joinedRow)
+			}
+			return v
+		}
+	}
+	return nil
+}
+
+// evalWhereMultiJoin evaluates a WHERE expression and returns a boolean.
+func (e *Executor) evalWhereMultiJoin(expr Expr, tables []flatTableEntry, joinedRow []any) bool {
+	result := e.evalExprMultiJoin(expr, tables, joinedRow)
+	if b, ok := result.(bool); ok {
+		return b
+	}
+	if result == nil {
+		return false
+	}
+	return true
+}
+
+// flattenAND flattens a tree of AND-connected expressions into a flat list.
+func flattenAND(expr Expr) []Expr {
+	if expr == nil {
+		return nil
+	}
+	bin, ok := expr.(*BinaryExpr)
+	if !ok || bin.Op != "AND" {
+		return []Expr{expr}
+	}
+	return append(flattenAND(bin.Left), flattenAND(bin.Right)...)
+}
+
 // colBelongsTo checks whether a column reference belongs to a given table.
 func colBelongsTo(col *ColumnRefExpr, td *catalog.TableDef, alias string) bool {
 	if col.Table != "" {
@@ -4870,6 +5160,553 @@ func allColsBelongTo(expr Expr, td *catalog.TableDef) bool {
 		return true
 	}
 	return true
+}
+
+// splitWhereNTables splits a WHERE expression into per-table predicates and
+// cross-table (remain) predicates for N tables.
+func splitWhereNTables(where Expr, tables []flatTableEntry) ([]Expr, Expr) {
+	if where == nil {
+		return make([]Expr, len(tables)), nil
+	}
+	conjuncts := flattenAND(where)
+	tableWheres := make([]Expr, len(tables))
+	var remain []Expr
+
+	for _, conj := range conjuncts {
+		assigned := false
+		for i, entry := range tables {
+			if allColsBelongTo(conj, entry.td) {
+				// Check that no other table also claims it.
+				claimed := false
+				for j, other := range tables {
+					if j != i && allColsBelongTo(conj, other.td) {
+						claimed = true
+						break
+					}
+				}
+				if !claimed {
+					tableWheres[i] = andExpr(tableWheres[i], conj)
+					assigned = true
+					break
+				}
+			}
+		}
+		if !assigned {
+			remain = append(remain, conj)
+		}
+	}
+
+	var remainWhere Expr
+	for _, r := range remain {
+		remainWhere = andExpr(remainWhere, r)
+	}
+	return tableWheres, remainWhere
+}
+
+// collectTableRows collects rows from a single table with optional WHERE pushdown.
+func (e *Executor) collectTableRows(t *txn.Txn, entry flatTableEntry, where Expr) ([][]any, error) {
+	storedTd, err := e.cat.GetTable(e.dbName, entry.tableName)
+	if err != nil {
+		return nil, err
+	}
+	treeKey := storedTd.DataFile()
+	pkCols := storedTd.PrimaryKeyColumns()
+
+	if where == nil {
+		// Full scan, no filter.
+		var rows [][]any
+		t.Scan(treeKey, pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
+			vals, _ := storage.DecodeRow(rowData, storedTd.Columns)
+			rows = append(rows, vals)
+			return true
+		})
+		return rows, nil
+	}
+
+	// Scan with WHERE pushdown.
+	var rows [][]any
+	t.Scan(treeKey, pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, storedTd.Columns)
+		if e.evalWhere(storedTd, where, vals) {
+			rows = append(rows, vals)
+		}
+		return true
+	})
+	return rows, nil
+}
+
+// ─── Multi-table join execution ─────────────────────────────────────────
+
+func (e *Executor) execMultiTableJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
+	// Step 1: Flatten the join tree.
+	tables, err := e.flattenJoinTree(ref)
+	if err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		return nil, fmt.Errorf("no tables in join")
+	}
+
+	// Step 1.5: Reorder tables using greedy on equi-join graph for hash join efficiency.
+	// Build adjacency by table name for flexibility.
+	conjuncts := flattenAND(s.Where)
+	nameToIdx := make(map[string]int, len(tables))
+	for i, entry := range tables {
+		nameToIdx[entry.tableName] = i
+	}
+	adjByName := make(map[string][]string) // tableName -> list of neighbor tableNames
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryExpr)
+		if !ok || bin.Op != "=" {
+			continue
+		}
+		leftCol, lok := bin.Left.(*ColumnRefExpr)
+		rightCol, rok := bin.Right.(*ColumnRefExpr)
+		if !lok || !rok {
+			continue
+		}
+		li := resolveTableIndex(leftCol, tables)
+		ri := resolveTableIndex(rightCol, tables)
+		if li >= 0 && ri >= 0 && li != ri {
+			ln := tables[li].tableName
+			rn := tables[ri].tableName
+			adjByName[ln] = append(adjByName[ln], rn)
+			adjByName[rn] = append(adjByName[rn], ln)
+		}
+	}
+
+	if len(adjByName) > 0 {
+		// Pick start table with most connections.
+		startName := tables[0].tableName
+		maxConn := len(adjByName[startName])
+		for _, entry := range tables {
+			if len(adjByName[entry.tableName]) > maxConn {
+				maxConn = len(adjByName[entry.tableName])
+				startName = entry.tableName
+			}
+		}
+
+		if maxConn > 0 {
+			// Greedy: always pick the unvisited table with the most connections to visited set.
+			visited := make(map[string]bool, len(tables))
+			var orderNames []string
+			visited[startName] = true
+			orderNames = append(orderNames, startName)
+			for len(orderNames) < len(tables) {
+				bestName := ""
+				bestScore := 0
+				for _, entry := range tables {
+					n := entry.tableName
+					if visited[n] {
+						continue
+					}
+					score := 0
+					for _, nb := range adjByName[n] {
+						if visited[nb] {
+							score++
+						}
+					}
+					if score > bestScore || (bestName == "" && bestScore == 0) {
+						bestScore = score
+						bestName = n
+					}
+				}
+				orderNames = append(orderNames, bestName)
+				visited[bestName] = true
+			}
+
+			// Build reordered tables slice from orderNames.
+			nameToEntry := make(map[string]flatTableEntry, len(tables))
+			for _, entry := range tables {
+				nameToEntry[entry.tableName] = entry
+			}
+			reordered := make([]flatTableEntry, len(tables))
+			for i, name := range orderNames {
+				reordered[i] = nameToEntry[name]
+			}
+			offset := 0
+			for i := range reordered {
+				reordered[i].colOffset = offset
+				offset += reordered[i].colCount
+			}
+			tables = reordered
+		}
+	}
+
+	// Step 2: Split WHERE into per-table and cross-table predicates.
+	tableWheres, remainWhere := splitWhereNTables(s.Where, tables)
+
+	// Step 3: Collect rows per table with WHERE pushdown.
+	tableRows := make([][][]any, len(tables))
+	for i, entry := range tables {
+		tableRows[i], err = e.collectTableRows(t, entry, tableWheres[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Step 4: Split remainWhere into individual conjuncts for early filtering.
+	var remainConjuncts []Expr
+	if remainWhere != nil {
+		remainConjuncts = flattenAND(remainWhere)
+	}
+
+	// Step 5: Left-deep join with hash join optimization.
+	resultRows := tableRows[0]
+	joinedSet := map[int]bool{0: true}
+
+	// Debug: detect slow queries
+
+	for i := 1; i < len(tables); i++ {
+		newRows := tableRows[i]
+
+		// Determine which remain conjuncts can be applied now (all referenced tables joined).
+		var applicableConjuncts []Expr
+		var deferredConjuncts []Expr
+		for _, conj := range remainConjuncts {
+			refs := collectConjunctTableRefs(conj, tables)
+			allJoined := true
+			for idx := range refs {
+				if idx <= i && !joinedSet[idx] && idx != i {
+					allJoined = false
+					break
+				}
+				if idx > i {
+					allJoined = false
+					break
+				}
+			}
+			if allJoined {
+				applicableConjuncts = append(applicableConjuncts, conj)
+			} else {
+				deferredConjuncts = append(deferredConjuncts, conj)
+			}
+		}
+
+		// Extract equi-join keys for hash join.
+		buildLocalOffsets, probeOffsets, residualConjs := extractEquiKeysForTable(applicableConjuncts, i, tables)
+
+		var nextResult [][]any
+
+		if len(buildLocalOffsets) > 0 {
+			// HASH JOIN: build hash table on newRows (table i).
+			hashTable := make(map[string][][]any, len(newRows))
+			for _, newRow := range newRows {
+				key, skip := hashKeyMultiTable(newRow, buildLocalOffsets)
+				if skip {
+					continue
+				}
+				hashTable[key] = append(hashTable[key], newRow)
+			}
+
+			// Probe: for each accumulated row, look up matching new rows.
+			for _, existingRow := range resultRows {
+				key, skip := hashKeyMultiTable(existingRow, probeOffsets)
+				if skip {
+					continue
+				}
+				matches := hashTable[key]
+				for _, newRow := range matches {
+					joined := make([]any, 0, len(existingRow)+len(newRow))
+					joined = append(joined, existingRow...)
+					joined = append(joined, newRow...)
+
+					// Apply residual conjuncts (non-equi conditions).
+					pass := true
+					for _, conj := range residualConjs {
+						if !e.evalWhereMultiJoin(conj, tables, joined) {
+							pass = false
+							break
+						}
+					}
+					if pass {
+						nextResult = append(nextResult, joined)
+					}
+				}
+			}
+		} else {
+			// FALLBACK: Nested loop join (no equi-join condition available).
+			for _, existingRow := range resultRows {
+				for _, newRow := range newRows {
+					joined := make([]any, 0, len(existingRow)+len(newRow))
+					joined = append(joined, existingRow...)
+					joined = append(joined, newRow...)
+
+					pass := true
+					for _, conj := range applicableConjuncts {
+						if !e.evalWhereMultiJoin(conj, tables, joined) {
+							pass = false
+							break
+						}
+					}
+					if pass {
+						nextResult = append(nextResult, joined)
+					}
+				}
+			}
+		}
+
+		resultRows = nextResult
+		joinedSet[i] = true
+		remainConjuncts = deferredConjuncts
+	}
+
+	// Step 6: Project result columns.
+	resultRows, colNames := e.projectMultiJoinResult(s, tables, resultRows)
+
+	return &SelectResult{Columns: colNames, Rows: resultRows}, nil
+}
+
+// collectConjunctTableRefs returns the set of table indices referenced by an expression.
+func collectConjunctTableRefs(expr Expr, tables []flatTableEntry) map[int]bool {
+	refs := make(map[int]bool)
+	collectTableRefsInExpr(expr, tables, refs)
+	return refs
+}
+
+func collectTableRefsInExpr(expr Expr, tables []flatTableEntry, refs map[int]bool) {
+	switch ex := expr.(type) {
+	case *ColumnRefExpr:
+		if ex.Table != "" {
+			for i, entry := range tables {
+				if entry.tableName == ex.Table || entry.alias == ex.Table {
+					if entry.td.ColumnIndex(ex.Name) >= 0 {
+						refs[i] = true
+						return
+					}
+				}
+			}
+		} else {
+			for i, entry := range tables {
+				if entry.td.ColumnIndex(ex.Name) >= 0 {
+					refs[i] = true
+					return
+				}
+			}
+		}
+	case *BinaryExpr:
+		collectTableRefsInExpr(ex.Left, tables, refs)
+		collectTableRefsInExpr(ex.Right, tables, refs)
+	case *UnaryExpr:
+		collectTableRefsInExpr(ex.Operand, tables, refs)
+	case *InExpr:
+		collectTableRefsInExpr(ex.Expr, tables, refs)
+		for _, v := range ex.Values {
+			collectTableRefsInExpr(v, tables, refs)
+		}
+	case *BetweenExpr:
+		collectTableRefsInExpr(ex.Expr, tables, refs)
+		collectTableRefsInExpr(ex.Low, tables, refs)
+		collectTableRefsInExpr(ex.High, tables, refs)
+	case *IsNullExpr:
+		collectTableRefsInExpr(ex.Expr, tables, refs)
+	case *LikeExpr:
+		collectTableRefsInExpr(ex.Expr, tables, refs)
+		collectTableRefsInExpr(ex.Pattern, tables, refs)
+	case *FuncCallExpr:
+		for _, a := range ex.Args {
+			collectTableRefsInExpr(a, tables, refs)
+		}
+	case *CaseExpr:
+		if ex.Value != nil {
+			collectTableRefsInExpr(ex.Value, tables, refs)
+		}
+		for _, w := range ex.Whens {
+			collectTableRefsInExpr(w.Cond, tables, refs)
+			collectTableRefsInExpr(w.Result, tables, refs)
+		}
+		if ex.Else != nil {
+			collectTableRefsInExpr(ex.Else, tables, refs)
+		}
+	}
+}
+
+// resolveTableIndex returns the index in tables that a ColumnRefExpr belongs to, or -1.
+func resolveTableIndex(col *ColumnRefExpr, tables []flatTableEntry) int {
+	if col.Table != "" {
+		for i, entry := range tables {
+			if entry.tableName == col.Table || entry.alias == col.Table {
+				if entry.td.ColumnIndex(col.Name) >= 0 {
+					return i
+				}
+			}
+		}
+	} else {
+		for i, entry := range tables {
+			if entry.td.ColumnIndex(col.Name) >= 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// extractEquiKeysForTable splits applicable conjuncts into equi-join keys
+// (buildLocalOffsets = local column indices within the new table's row,
+//  probeOffsets = absolute column offsets in the accumulated joined row)
+// and residual conjuncts (non-equi or same-table conditions).
+func extractEquiKeysForTable(conjuncts []Expr, tableIdx int, tables []flatTableEntry) (
+	buildLocalOffsets []int, probeOffsets []int, residualConjuncts []Expr) {
+
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryExpr)
+		if !ok || bin.Op != "=" {
+			residualConjuncts = append(residualConjuncts, conj)
+			continue
+		}
+		leftCol, leftOk := bin.Left.(*ColumnRefExpr)
+		rightCol, rightOk := bin.Right.(*ColumnRefExpr)
+		if !leftOk || !rightOk {
+			residualConjuncts = append(residualConjuncts, conj)
+			continue
+		}
+
+		leftIdx := resolveTableIndex(leftCol, tables)
+		rightIdx := resolveTableIndex(rightCol, tables)
+		if leftIdx < 0 || rightIdx < 0 || leftIdx == rightIdx {
+			residualConjuncts = append(residualConjuncts, conj)
+			continue
+		}
+
+		var buildCol, probeCol *ColumnRefExpr
+		if leftIdx == tableIdx && rightIdx < tableIdx {
+			buildCol = leftCol
+			probeCol = rightCol
+		} else if rightIdx == tableIdx && leftIdx < tableIdx {
+			buildCol = rightCol
+			probeCol = leftCol
+		} else {
+			residualConjuncts = append(residualConjuncts, conj)
+			continue
+		}
+
+		// Build offset: local index within the single table row.
+		buildLocalOff := tables[tableIdx].td.ColumnIndex(buildCol.Name)
+		if buildLocalOff < 0 {
+			residualConjuncts = append(residualConjuncts, conj)
+			continue
+		}
+		// Probe offset: absolute index in the accumulated joined row.
+		probeOff, err := resolveColumnOffset(probeCol, tables)
+		if err != nil {
+			residualConjuncts = append(residualConjuncts, conj)
+			continue
+		}
+		buildLocalOffsets = append(buildLocalOffsets, buildLocalOff)
+		probeOffsets = append(probeOffsets, probeOff)
+	}
+	return
+}
+
+// hashKeyMultiTable extracts a hash key string from row values at the given offsets.
+// Returns ("", true) if any value is nil (skip).
+func hashKeyMultiTable(row []any, offsets []int) (string, bool) {
+	var buf strings.Builder
+	for _, off := range offsets {
+		if off >= len(row) {
+			return "", true
+		}
+		v := row[off]
+		if v == nil {
+			return "", true
+		}
+		fmt.Fprintf(&buf, "%v\x00", v)
+	}
+	return buf.String(), false
+}
+
+func (e *Executor) projectMultiJoinResult(s *SelectStmt, tables []flatTableEntry, rows [][]any) ([][]any, []string) {
+	if s.SelectAll {
+		// Return all non-hidden columns with qualified names.
+		colNames := make([]string, 0)
+		for _, entry := range tables {
+			for _, col := range entry.td.Columns {
+				if col.Hidden {
+					continue
+				}
+				colNames = append(colNames, entry.alias+"."+col.Name)
+			}
+		}
+		return rows, colNames
+	}
+
+	// Build projection descriptors from Fields.
+	type projField struct {
+		colIdx int   // absolute index in joined row, -1 for expression
+		expr   Expr  // expression to evaluate
+		name   string
+	}
+	var fields []projField
+
+	if len(s.Fields) > 0 {
+		for _, f := range s.Fields {
+			if f.Column != "" {
+				// Simple column reference.
+				idx, err := resolveColumnOffset(&ColumnRefExpr{Name: f.Column}, tables)
+				name := f.Column
+				if f.Alias != "" {
+					name = f.Alias
+				}
+				if err == nil && idx >= 0 {
+					fields = append(fields, projField{colIdx: idx, name: name})
+				}
+			} else if f.Expr != nil {
+				name := f.Alias
+				if name == "" {
+					name = exprToString(f.Expr)
+				}
+				fields = append(fields, projField{colIdx: -1, expr: f.Expr, name: name})
+			}
+		}
+	} else if len(s.SelectExprs) > 0 {
+		for _, expr := range s.SelectExprs {
+			if col, ok := expr.(*ColumnRefExpr); ok {
+				idx, err := resolveColumnOffset(col, tables)
+				if err == nil && idx >= 0 {
+					fields = append(fields, projField{colIdx: idx, name: col.Name})
+				}
+			} else {
+				name := exprToString(expr)
+				fields = append(fields, projField{colIdx: -1, expr: expr, name: name})
+			}
+		}
+	}
+
+	if len(fields) == 0 {
+		// Fallback: return all non-hidden columns.
+		colNames := make([]string, 0)
+		for _, entry := range tables {
+			for _, col := range entry.td.Columns {
+				if col.Hidden {
+					continue
+				}
+				colNames = append(colNames, entry.alias+"."+col.Name)
+			}
+		}
+		return rows, colNames
+	}
+
+	// Apply projection.
+	colNames := make([]string, len(fields))
+	for i, f := range fields {
+		colNames[i] = f.name
+	}
+
+	projected := make([][]any, len(rows))
+	for i, row := range rows {
+		out := make([]any, len(fields))
+		for j, f := range fields {
+			if f.colIdx >= 0 {
+				if f.colIdx < len(row) {
+					out[j] = row[f.colIdx]
+				}
+			} else if f.expr != nil {
+				out[j] = e.evalExprMultiJoin(f.expr, tables, row)
+			}
+		}
+		projected[i] = out
+	}
+	return projected, colNames
 }
 
 // ─── Join cost model ───────────────────────────────────────────────────

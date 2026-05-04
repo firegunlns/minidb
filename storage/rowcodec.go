@@ -33,6 +33,7 @@ type ColumnDef struct {
 	Scale     int        // DECIMAL小数位
 	Nullable  bool       // 是否可空
 	AutoInc   bool       // 是否自增
+	Hidden    bool       // 是否隐藏列(不显示在SELECT *中)
 }
 
 // --- Column value encoding ---
