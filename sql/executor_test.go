@@ -1341,3 +1341,50 @@ func TestCustomerIndexSimulatedTPCC(t *testing.T) {
 	}
 }
 
+
+func TestTextType(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+	_, err := env.exec.Execute("CREATE TABLE tt(x INTEGER, y TEXT)")
+	if err != nil {
+		t.Fatal("create:", err)
+	}
+	_, err = env.exec.Execute("INSERT INTO tt VALUES(1, 'hello')")
+	if err != nil {
+		t.Fatal("insert:", err)
+	}
+	res, _ := env.exec.Execute("SELECT y FROM tt")
+	r := res.(*SelectResult)
+	if len(r.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(r.Rows))
+	}
+	if r.Rows[0][0] != "hello" {
+		t.Fatalf("expected 'hello', got %v", r.Rows[0][0])
+	}
+}
+
+func TestInSubquery(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+	_, err := env.exec.Execute("CREATE TABLE t1(x INTEGER, y VARCHAR(8))")
+	if err != nil {
+		t.Fatal("create:", err)
+	}
+	_, err = env.exec.Execute("INSERT INTO t1 VALUES(1,'a')")
+	if err != nil {
+		t.Fatal("insert:", err)
+	}
+	_, err = env.exec.Execute("INSERT INTO t1 VALUES(2,'b')")
+	if err != nil {
+		t.Fatal("insert:", err)
+	}
+	res, err := env.exec.Execute("SELECT x FROM t1 WHERE 1 IN (SELECT 1)")
+	if err != nil {
+		t.Fatal("select:", err)
+	}
+	r := res.(*SelectResult)
+	t.Logf("rows: %v", r.Rows)
+	if len(r.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(r.Rows))
+	}
+}

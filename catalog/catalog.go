@@ -20,6 +20,7 @@ const (
 	dbTreeFile      = "__catalog_dbs.db"     // 数据库元数据树文件
 	tblTreeFile     = "__catalog_tables.db"  // 表元数据树文件
 	autoIncTreeFile = "__catalog_autoinc.db" // 自增序列树文件
+	viewTreeFile    = "__catalog_views.db"   // 视图元数据树文件
 )
 
 // Catalog 数据库目录
@@ -31,15 +32,18 @@ type Catalog struct {
 	dbTree   *bptree.PersistentBPTree // 数据库树
 	tblTree  *bptree.PersistentBPTree // 表树
 	incTree  *bptree.PersistentBPTree // 自增序列树（仅 Close 时持久化）
+	viewTree *bptree.PersistentBPTree // 视图树
 	cache    map[string]*TableDef     // 表定义缓存 "db.table" -> TableDef
 	incCache map[string]int64         // 自增序列内存缓存 "db\x00table\x00col" -> 当前值
+	viewCache map[string]string       // 视图定义缓存 "db.view" -> SELECT SQL
 }
 
 func Open(dataDir string) (*Catalog, error) {
 	c := &Catalog{
-		dataDir:  dataDir,
-		cache:    make(map[string]*TableDef),
-		incCache: make(map[string]int64),
+		dataDir:   dataDir,
+		cache:     make(map[string]*TableDef),
+		incCache:  make(map[string]int64),
+		viewCache: make(map[string]string),
 	}
 
 	var err error
@@ -55,12 +59,19 @@ func Open(dataDir string) (*Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.viewTree, err = bptree.OpenPersistentBPTree(filepath.Join(dataDir, viewTreeFile), catalogOrder, catalogCache)
+	if err != nil {
+		return nil, err
+	}
 
 	// Load all tables into cache.
 	c.loadCache()
 
 	// Load all auto-inc values into memory.
 	c.loadIncCache()
+
+	// Load all views into cache.
+	c.loadViewCache()
 
 	return c, nil
 }
@@ -74,6 +85,81 @@ func (c *Catalog) Close() {
 	c.dbTree.Close()
 	c.tblTree.Close()
 	c.incTree.Close()
+	c.viewTree.Close()
+}
+
+func (c *Catalog) loadViewCache() {
+	start := []byte{0x00}
+	end := []byte{0xFF}
+	kvs := c.viewTree.RangeScan(start, end)
+	for _, kv := range kvs {
+		key := string(kv.Key)
+		idx := 0
+		for i, b := range key {
+			if b == 0 {
+				idx = i
+				break
+			}
+		}
+		db := key[:idx]
+		view := key[idx+1:]
+		c.viewCache[db+"."+view] = string(kv.Value)
+	}
+}
+
+// --- View operations ---
+
+func (c *Catalog) CreateView(db, name string, selectSQL string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := []byte(db + "\x00" + name)
+	if _, found := c.viewTree.Find(key); found {
+		return fmt.Errorf("view %s.%s already exists", db, name)
+	}
+	if err := c.viewTree.Insert(key, []byte(selectSQL)); err != nil {
+		return err
+	}
+	c.viewCache[db+"."+name] = selectSQL
+	return c.viewTree.Sync()
+}
+
+func (c *Catalog) DropView(db, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := []byte(db + "\x00" + name)
+	if _, found := c.viewTree.Find(key); !found {
+		return fmt.Errorf("view %s.%s does not exist", db, name)
+	}
+	c.viewTree.Delete(key)
+	delete(c.viewCache, db+"."+name)
+	c.viewTree.Sync()
+	return nil
+}
+
+func (c *Catalog) GetView(db, name string) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if sql, ok := c.viewCache[db+"."+name]; ok {
+		return sql, nil
+	}
+	return "", fmt.Errorf("view %s.%s not found", db, name)
+}
+
+func (c *Catalog) DropDatabaseViews(name string) {
+	// Remove all views in this database (called from DropDatabase).
+	var toDelete []string
+	for k := range c.viewCache {
+		parts := strings.SplitN(k, ".", 2)
+		if parts[0] == name {
+			toDelete = append(toDelete, k)
+		}
+	}
+	for _, k := range toDelete {
+		delete(c.viewCache, k)
+		// Also delete from tree
+		parts := strings.SplitN(k, ".", 2)
+		c.viewTree.Delete([]byte(parts[0] + "\x00" + parts[1]))
+	}
 }
 
 func (c *Catalog) loadCache() {
@@ -130,6 +216,19 @@ func (c *Catalog) DropDatabase(name string) error {
 		prefix := tableKeyPrefix(td.Database, td.Name)
 		c.tblTree.Delete(prefix)
 		delete(c.cache, k)
+	}
+	// Remove all views in this database.
+	var viewDelete []string
+	for k := range c.viewCache {
+		parts := strings.SplitN(k, ".", 2)
+		if parts[0] == name {
+			viewDelete = append(viewDelete, k)
+		}
+	}
+	for _, k := range viewDelete {
+		parts := strings.SplitN(k, ".", 2)
+		c.viewTree.Delete([]byte(parts[0] + "\x00" + parts[1]))
+		delete(c.viewCache, k)
 	}
 	c.dbTree.Delete([]byte(name))
 	return nil
@@ -192,6 +291,9 @@ func (c *Catalog) DropTable(db, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := tableKeyPrefix(db, name)
+	if _, found := c.tblTree.Find(key); !found {
+		return fmt.Errorf("table %s.%s does not exist", db, name)
+	}
 	c.tblTree.Delete(key)
 	delete(c.cache, db+"."+name)
 	c.tblTree.Sync()
@@ -209,6 +311,55 @@ func (c *Catalog) UpdateTable(db, name string, td *TableDef) error {
 	c.cache[db+"."+name] = td
 	c.tblTree.Sync()
 	return nil
+}
+
+// DropIndex removes an index by name, searching all tables in the database.
+func (c *Catalog) DropIndex(db, indexName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, td := range c.cache {
+		if td.Database != db {
+			continue
+		}
+		for i, idx := range td.Indexes {
+			if idx.Name == indexName {
+				td.Indexes = append(td.Indexes[:i], td.Indexes[i+1:]...)
+				key := tableKeyPrefix(db, td.Name)
+				data := encodeTableDef(td)
+				if err := c.tblTree.Insert(key, data); err != nil {
+					return err
+				}
+				c.cache[k] = td
+				c.tblTree.Sync()
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("index %s not found in database %s", indexName, db)
+}
+
+// DropIndexFromTable removes an index from a specific table.
+func (c *Catalog) DropIndexFromTable(db, tableName, indexName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	td, ok := c.cache[db+"."+tableName]
+	if !ok {
+		return fmt.Errorf("table %s.%s does not exist", db, tableName)
+	}
+	for i, idx := range td.Indexes {
+		if idx.Name == indexName {
+			td.Indexes = append(td.Indexes[:i], td.Indexes[i+1:]...)
+			key := tableKeyPrefix(db, td.Name)
+			data := encodeTableDef(td)
+			if err := c.tblTree.Insert(key, data); err != nil {
+				return err
+			}
+			c.cache[db+"."+tableName] = td
+			c.tblTree.Sync()
+			return nil
+		}
+	}
+	return fmt.Errorf("index %s not found in table %s.%s", indexName, db, tableName)
 }
 
 // --- Auto-increment ---

@@ -120,7 +120,14 @@
       "Bash(echo done:*)",
       "Bash(grep ^query:*)",
       "Bash(rm:*)",
-      "Bash(gtimeout 60:*)"
+      "Bash(gtimeout 60:*)",
+      "Bash(echo === $\\(basename $f\\) ===:*)",
+      "Bash(echo === $file ===:*)",
+      "Bash(timeout 30s ./minidb run:*)",
+      "Bash(./minidb run:*)",
+      "Bash(./minidb:*)",
+      "Bash(grep queries::*)",
+      "Bash(echo === $f ===:*)"
     ]
   }
 }

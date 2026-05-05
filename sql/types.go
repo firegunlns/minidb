@@ -21,7 +21,19 @@ type (
 		Columns []ColumnDef
 		Indexes []IndexDef
 	}
-	DropTableStmt     struct{ Table string }
+	DropTableStmt     struct {
+		Table    string
+		IfExists bool
+		IsView   bool
+	}
+	DropIndexStmt struct {
+		IndexName string
+		Table     string // may be empty for SQLite-style DROP INDEX
+	}
+	CreateViewStmt struct {
+		ViewName string
+		Select   *SelectStmt
+	}
 	ShowTablesStmt    struct{}
 	ShowDatabasesStmt struct{}
 	DescTableStmt     struct{ Table string }
@@ -34,6 +46,7 @@ type (
 		Table   string
 		Columns []string
 		Values  [][]any
+		Select  *SelectStmt // INSERT ... SELECT
 	}
 	SelectStmt struct {
 		TableRef    TableRef
@@ -41,7 +54,10 @@ type (
 		SelectExprs []Expr
 		Fields      []SelectField // unified projection fields in SELECT order
 		SelectAll   bool
+		Distinct    bool
 		Where       Expr
+		GroupBy     []Expr
+		Having      Expr
 		OrderBy     []OrderByClause
 		Limit       *int
 		ForUpdate   bool
@@ -178,6 +194,7 @@ type OrderByClause struct {
 // SelectField represents one output column in SELECT.
 type SelectField struct {
 	Column string // non-empty for simple column ref
+	Table  string // table qualifier (e.g., "cor0" in "cor0.col2")
 	Expr   Expr   // non-nil for expression
 	Alias  string // optional AS alias
 }
@@ -207,6 +224,7 @@ type (
 		Expr   Expr
 		Values []Expr
 		Not    bool
+		Empty  bool // true if original list was empty (IN () / NOT IN ())
 	}
 	IsNullExpr struct {
 		Expr Expr
@@ -239,6 +257,10 @@ type (
 		Cond   Expr
 		Result Expr
 	}
+	CastExpr struct {
+		Expr Expr
+		Type string // "SIGNED", "UNSIGNED", etc.
+	}
 )
 
 func (LiteralExpr) exprNode()       {}
@@ -256,6 +278,7 @@ func (ExistsExpr) exprNode()        {}
 func (LikeExpr) exprNode()          {}
 func (AggregateFuncExpr) exprNode() {}
 func (CaseExpr) exprNode()          {}
+func (CastExpr) exprNode()           {}
 
 type Stmt any
 
@@ -306,7 +329,7 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		return convertCreateTable(n)
 	case *ast.DropTableStmt:
 		if len(n.Tables) > 0 {
-			return &DropTableStmt{Table: n.Tables[0].Name.O}, nil
+			return &DropTableStmt{Table: n.Tables[0].Name.O, IfExists: n.IfExists, IsView: n.IsView}, nil
 		}
 		return nil, fmt.Errorf("DROP TABLE: no table specified")
 	case *ast.InsertStmt:
@@ -327,6 +350,27 @@ func convertStmt(node ast.StmtNode) (Stmt, error) {
 		return convertAlterTable(n)
 	case *ast.CreateIndexStmt:
 		return convertCreateIndex(n)
+	case *ast.DropIndexStmt:
+		s := &DropIndexStmt{IndexName: n.IndexName}
+		if n.Table != nil {
+			tbl := n.Table.Name.O
+			if tbl != "__lookup__" {
+				s.Table = tbl
+			}
+		}
+		return s, nil
+	case *ast.CreateViewStmt:
+		if n.ViewName == nil {
+			return nil, fmt.Errorf("CREATE VIEW: no view name specified")
+		}
+		sel, err := convertSelect(n.Select.(*ast.SelectStmt))
+		if err != nil {
+			return nil, fmt.Errorf("CREATE VIEW: %w", err)
+		}
+		return &CreateViewStmt{
+			ViewName: n.ViewName.Name.O,
+			Select:   sel,
+		}, nil
 	case *ast.ExplainStmt:
 		if show, ok := n.Stmt.(*ast.ShowStmt); ok {
 			return &DescTableStmt{Table: show.Table.Name.O}, nil
@@ -490,6 +534,8 @@ func getTypeName(tp *types.FieldType) string {
 		return "BIGINT"
 	case mysql.TypeVarchar, mysql.TypeString, mysql.TypeVarString:
 		return "VARCHAR"
+	case mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
+		return "VARCHAR"
 	case mysql.TypeNewDecimal:
 		return "DECIMAL"
 	case mysql.TypeDouble, mysql.TypeFloat:
@@ -507,22 +553,30 @@ func convertInsert(n *ast.InsertStmt) (*InsertStmt, error) {
 	for _, col := range n.Columns {
 		result.Columns = append(result.Columns, col.Name.O)
 	}
-	for _, row := range n.Lists {
-		var vals []any
-		for _, expr := range row {
-			v, err := evalLiteral(expr)
-			if err != nil {
-				return nil, err
-			}
-			vals = append(vals, v)
+	if n.Select != nil {
+		sel, err := convertSelect(n.Select.(*ast.SelectStmt))
+		if err != nil {
+			return nil, err
 		}
-		result.Values = append(result.Values, vals)
+		result.Select = sel
+	} else {
+		for _, row := range n.Lists {
+			var vals []any
+			for _, expr := range row {
+				v, err := evalLiteral(expr)
+				if err != nil {
+					return nil, err
+				}
+				vals = append(vals, v)
+			}
+			result.Values = append(result.Values, vals)
+		}
 	}
 	return result, nil
 }
 
 func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
-	result := &SelectStmt{}
+	result := &SelectStmt{Distinct: n.Distinct}
 	if n.From != nil && n.From.TableRefs != nil {
 		ref, err := convertTableRef(n.From.TableRefs)
 		if err != nil {
@@ -534,9 +588,9 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 		for _, field := range n.Fields.Fields {
 			if field.WildCard != nil {
 				result.SelectAll = true
-			} else if colName := getColumnName(field.Expr); colName != "" {
+			} else if colName, colTable := getColumnName(field.Expr); colName != "" {
 				result.Columns = append(result.Columns, colName)
-				result.Fields = append(result.Fields, SelectField{Column: colName})
+				result.Fields = append(result.Fields, SelectField{Column: colName, Table: colTable})
 			} else {
 				expr, err := convertExpr(field.Expr)
 				if err != nil {
@@ -558,6 +612,22 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 		}
 		result.Where = expr
 	}
+	if n.GroupBy != nil {
+		for _, item := range n.GroupBy.Items {
+			g, err := convertExpr(item.Expr)
+			if err != nil {
+				return nil, err
+			}
+			result.GroupBy = append(result.GroupBy, g)
+		}
+	}
+	if n.Having != nil {
+		h, err := convertExpr(n.Having.Expr)
+		if err != nil {
+			return nil, err
+		}
+		result.Having = h
+	}
 	if n.OrderBy != nil {
 		for _, item := range n.OrderBy.Items {
 			ob := OrderByClause{Desc: item.Desc}
@@ -576,7 +646,7 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 				}
 			}
 			// Try column name.
-			if colName := getColumnName(item.Expr); colName != "" {
+			if colName, _ := getColumnName(item.Expr); colName != "" {
 				ob.Column = colName
 			} else {
 				// Expression-based ORDER BY.
@@ -599,7 +669,7 @@ func convertSelect(n *ast.SelectStmt) (*SelectStmt, error) {
 }
 
 func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
-	result := &SelectStmt{}
+	result := &SelectStmt{Distinct: n.Distinct}
 	if n.From != nil && n.From.TableRefs != nil {
 		ref, err := convertTableRef(n.From.TableRefs)
 		if err != nil {
@@ -611,9 +681,9 @@ func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
 		for _, field := range n.Fields.Fields {
 			if field.WildCard != nil {
 				result.SelectAll = true
-			} else if colName := getColumnName(field.Expr); colName != "" {
+			} else if colName, colTable := getColumnName(field.Expr); colName != "" {
 				result.Columns = append(result.Columns, colName)
-				result.Fields = append(result.Fields, SelectField{Column: colName})
+				result.Fields = append(result.Fields, SelectField{Column: colName, Table: colTable})
 			} else {
 				expr, err := convertExpr(field.Expr)
 				if err != nil {
@@ -635,6 +705,22 @@ func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
 		}
 		result.Where = expr
 	}
+	if n.GroupBy != nil {
+		for _, item := range n.GroupBy.Items {
+			g, err := convertExpr(item.Expr)
+			if err != nil {
+				return nil, err
+			}
+			result.GroupBy = append(result.GroupBy, g)
+		}
+	}
+	if n.Having != nil {
+		h, err := convertExpr(n.Having.Expr)
+		if err != nil {
+			return nil, err
+		}
+		result.Having = h
+	}
 	if n.OrderBy != nil {
 		for _, item := range n.OrderBy.Items {
 			ob := OrderByClause{Desc: item.Desc}
@@ -650,7 +736,7 @@ func convertSelectStmt(n *ast.SelectStmt) (*SelectStmt, error) {
 					continue
 				}
 			}
-			if colName := getColumnName(item.Expr); colName != "" {
+			if colName, _ := getColumnName(item.Expr); colName != "" {
 				ob.Column = colName
 			} else {
 				expr, err := convertExpr(item.Expr)
@@ -711,7 +797,21 @@ func convertDelete(n *ast.DeleteStmt) (*DeleteStmt, error) {
 func convertExpr(node ast.ExprNode) (Expr, error) {
 	switch n := node.(type) {
 	case ast.ValueExpr:
-		return &LiteralExpr{Value: n.GetValue()}, nil
+		val := n.GetValue()
+		// Convert TiDB-specific types to standard Go types.
+		switch v := val.(type) {
+		case []byte:
+			val = string(v)
+		case fmt.Stringer:
+			// MyDecimal and similar types: convert to float64 or string.
+			s := v.String()
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				val = f
+			} else {
+				val = s
+			}
+		}
+		return &LiteralExpr{Value: val}, nil
 	case ast.ParamMarkerExpr:
 		return &ParamExpr{}, nil
 	case *ast.ColumnNameExpr:
@@ -758,12 +858,21 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 			return nil, err
 		}
 		var vals []Expr
+		emptyList := false
 		for _, v := range n.List {
 			e, err := convertExpr(v)
 			if err != nil {
 				return nil, err
 			}
+			// Detect sentinel for empty IN list.
+			if lit, ok := e.(*LiteralExpr); ok && lit.Value == emptyInSentinel {
+				emptyList = true
+				continue
+			}
 			vals = append(vals, e)
+		}
+		if emptyList {
+			return &InExpr{Expr: expr, Not: n.Not, Empty: true}, nil
 		}
 		if n.Sel != nil {
 			if subquery, ok := n.Sel.(*ast.SubqueryExpr); ok {
@@ -824,6 +933,16 @@ func convertExpr(node ast.ExprNode) (Expr, error) {
 		return convertExpr(n.Expr)
 	case *ast.PositionExpr:
 		return &LiteralExpr{Value: int64(n.N)}, nil
+	case *ast.FuncCastExpr:
+		expr, err := convertExpr(n.Expr)
+		if err != nil {
+			return nil, err
+		}
+		typeName := ""
+		if n.Tp != nil {
+			typeName = n.Tp.String()
+		}
+		return &CastExpr{Expr: expr, Type: typeName}, nil
 	case *ast.CaseExpr:
 		var value Expr
 		if n.Value != nil {
@@ -1042,11 +1161,11 @@ func convertTableRef(node ast.ResultSetNode) (TableRef, error) {
 	return nil, fmt.Errorf("unsupported table reference: %T", node)
 }
 
-func getColumnName(expr ast.ExprNode) string {
+func getColumnName(expr ast.ExprNode) (name string, table string) {
 	if col, ok := expr.(*ast.ColumnNameExpr); ok {
-		return col.Name.Name.O
+		return col.Name.Name.O, col.Name.Table.O
 	}
-	return ""
+	return "", ""
 }
 
 func convertSetOpr(n *ast.SetOprStmt) (*SetOprStmt, error) {
@@ -1061,7 +1180,7 @@ func convertSetOpr(n *ast.SetOprStmt) (*SetOprStmt, error) {
 			ob := OrderByClause{Desc: item.Desc}
 			if pos, ok := item.Expr.(*ast.PositionExpr); ok && pos.N > 0 {
 				ob.Pos = pos.N
-			} else if colName := getColumnName(item.Expr); colName != "" {
+			} else if colName, _ := getColumnName(item.Expr); colName != "" {
 				ob.Column = colName
 			} else {
 				expr, err := convertExpr(item.Expr)

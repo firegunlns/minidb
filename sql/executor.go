@@ -15,7 +15,12 @@ import (
 	"lns.com/minidb/txn"
 )
 
-// Result types.
+// evalError is used to propagate errors from expression evaluation
+// back to the execution layer.
+type evalError struct {
+	err error
+}
+
 type (
 	SelectResult struct {
 		Columns    []string
@@ -60,6 +65,15 @@ func (e *Executor) Database() string {
 
 // Execute parses and executes a SQL statement.
 func (e *Executor) Execute(sql string) (any, error) {
+	// Pre-process: replace empty IN () with always-false, NOT IN () with always-true.
+	sql = rewriteEmptyInLists(sql)
+	// Pre-process: handle SQLite-style DROP INDEX (without ON table clause).
+	sql = rewriteDropIndex(sql)
+	// Pre-process: rewrite CAST(... AS INTEGER) to CAST(... AS SIGNED) for TiDB parser.
+	sql = rewriteCastInteger(sql)
+	// Pre-process: remove space between function name and ( for TiDB parser.
+	sql = rewriteFuncSpaces(sql)
+
 	parseStart := time.Now()
 	p := NewParser()
 	stmt, err := p.Parse(sql)
@@ -72,6 +86,158 @@ func (e *Executor) Execute(sql string) (any, error) {
 	result, err := e.executeStmt(stmt)
 	metrics.ExecuteDuration.WithLabelValues(stmtLabel(stmt)).Observe(time.Since(execStart).Seconds())
 	return result, err
+}
+
+// rewriteEmptyInLists replaces "IN ()" and "NOT IN ()" with equivalent expressions
+// since the TiDB parser doesn't accept empty IN lists. Uses a sentinel string
+// that is detected after parsing to handle the empty-list semantics correctly:
+// "x IN ()" → false, "x NOT IN ()" → true (regardless of x, even NULL).
+const emptyInSentinel = "__EMPTY_IN__"
+
+func rewriteEmptyInLists(sql string) string {
+	var buf strings.Builder
+	i := 0
+	inQuote := false
+	for i < len(sql) {
+		ch := sql[i]
+		if ch == '\'' {
+			if inQuote && i+1 < len(sql) && sql[i+1] == '\'' {
+				buf.WriteString("''")
+				i += 2
+				continue
+			}
+			inQuote = !inQuote
+			buf.WriteByte(ch)
+			i++
+			continue
+		}
+		if inQuote {
+			buf.WriteByte(ch)
+			i++
+			continue
+		}
+		// Outside quotes: check for NOT IN () or IN ().
+		upper := sql[i:]
+		if len(upper) >= 10 && strings.EqualFold(upper[:10], "NOT IN ()") {
+			buf.WriteString("NOT IN ('")
+			buf.WriteString(emptyInSentinel)
+			buf.WriteString("')")
+			i += 10
+			continue
+		}
+		if len(upper) >= 5 && strings.EqualFold(upper[:5], "IN ()") {
+			buf.WriteString("IN ('")
+			buf.WriteString(emptyInSentinel)
+			buf.WriteString("')")
+			i += 5
+			continue
+		}
+		buf.WriteByte(ch)
+		i++
+	}
+	return buf.String()
+}
+
+// rewriteDropIndex handles SQLite-style "DROP INDEX idx;" by adding "ON __lookup__" so
+// the MySQL-style parser accepts it. The __lookup__ table name is detected after parsing
+// to trigger a catalog-wide index search.
+func rewriteDropIndex(sql string) string {
+	trimmed := strings.TrimSpace(sql)
+	upper := strings.ToUpper(trimmed)
+
+	// Match "DROP INDEX <name>;" or "DROP INDEX <name>" (no ON clause)
+	if !strings.HasPrefix(upper, "DROP INDEX ") {
+		return sql
+	}
+	// Check if it already has ON
+	rest := trimmed[11:] // after "DROP INDEX "
+	if strings.Contains(strings.ToUpper(rest), " ON ") {
+		return sql
+	}
+	// Extract index name (remove trailing semicolon)
+	idxName := strings.TrimSuffix(strings.TrimSpace(rest), ";")
+	// Rewrite to MySQL syntax with a placeholder table name
+	return "DROP INDEX " + idxName + " ON __lookup__"
+}
+
+// rewriteCastInteger rewrites "CAST(... AS INTEGER)" to "CAST(... AS SIGNED)"
+// since TiDB's MySQL parser doesn't accept INTEGER as a cast target.
+func rewriteCastInteger(sql string) string {
+	// Simple regex-free approach: replace AS INTEGER) with AS SIGNED INTEGER)
+	// We need to handle AS INTEGER, AS INT, AS BIGINT, AS SMALLINT, AS TINYINT
+	// Also handle whitespace between the type name and closing paren.
+	upper := sql
+	replacements := []struct{ from, to string }{
+		{" AS INTEGER)", " AS SIGNED)"},
+		{" AS INTEGER )", " AS SIGNED )"},
+		{" AS INT)", " AS SIGNED)"},
+		{" AS INT )", " AS SIGNED )"},
+		{" AS BIGINT)", " AS SIGNED)"},
+		{" AS BIGINT )", " AS SIGNED )"},
+		{" AS SMALLINT)", " AS SIGNED)"},
+		{" AS SMALLINT )", " AS SIGNED )"},
+		{" AS TINYINT)", " AS SIGNED)"},
+		{" AS TINYINT )", " AS SIGNED )"},
+		{" AS REAL)", " AS SIGNED)"},
+		{" AS REAL )", " AS SIGNED )"},
+	}
+	// Case-insensitive replacement
+	for _, r := range replacements {
+		idx := 0
+		for {
+			pos := findCaseInsensitive(upper[idx:], r.from)
+			if pos < 0 {
+				break
+			}
+			actualPos := idx + pos
+			sql = sql[:actualPos] + r.to + sql[actualPos+len(r.from):]
+			upper = strings.ToUpper(sql)
+			idx = actualPos + len(r.to)
+		}
+	}
+	return sql
+}
+
+func findCaseInsensitive(s, target string) int {
+	sUpper := strings.ToUpper(s)
+	tUpper := strings.ToUpper(target)
+	return strings.Index(sUpper, tUpper)
+}
+
+// rewriteFuncSpaces removes spaces between known function names and ( for
+// TiDB parser compatibility. TiDB requires no space for CAST and aggregate
+// functions: "SUM (...)" → "SUM(...)", "CAST (..." → "CAST(..."
+func rewriteFuncSpaces(sql string) string {
+	// Functions that require no space before ( in TiDB parser.
+	funcs := []string{
+		"CAST", "SUM", "COUNT", "MIN", "MAX", "AVG",
+		"GROUP_CONCAT",
+	}
+	upper := strings.ToUpper(sql)
+	for _, fn := range funcs {
+		pattern := fn + " ("
+		idx := 0
+		for {
+			pos := strings.Index(upper[idx:], pattern)
+			if pos < 0 {
+				break
+			}
+			actualPos := idx + pos
+			// Make sure this is a word boundary (not part of a larger word).
+			if actualPos > 0 {
+				ch := upper[actualPos-1]
+				if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+					idx = actualPos + len(fn)
+					continue
+				}
+			}
+			// Remove the space.
+			sql = sql[:actualPos+len(fn)] + sql[actualPos+len(fn)+1:]
+			upper = strings.ToUpper(sql)
+			idx = actualPos + len(fn) + 1
+		}
+	}
+	return sql
 }
 
 // ExecuteStmt executes a pre-parsed statement.
@@ -142,6 +308,10 @@ func (e *Executor) executeStmt(stmt Stmt) (any, error) {
 		return e.execAlterTable(s)
 	case *CreateIndexStmt:
 		return e.execCreateIndex(s)
+	case *DropIndexStmt:
+		return e.execDropIndex(s)
+	case *CreateViewStmt:
+		return e.execCreateView(s)
 	case *ExplainStmt:
 		return e.execExplain(s)
 	case *AnalyzeTableStmt:
@@ -380,7 +550,194 @@ func (e *Executor) execDropTable(s *DropTableStmt) (any, error) {
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
-	return &OKResult{}, e.cat.DropTable(e.dbName, s.Table)
+	if s.IsView {
+		err := e.cat.DropView(e.dbName, s.Table)
+		if err != nil {
+			if s.IfExists {
+				return &OKResult{}, nil
+			}
+			return nil, err
+		}
+		return &OKResult{}, nil
+	}
+	err := e.cat.DropTable(e.dbName, s.Table)
+	if err != nil {
+		if s.IfExists {
+			return &OKResult{}, nil
+		}
+		return nil, err
+	}
+	return &OKResult{}, nil
+}
+
+func (e *Executor) execDropIndex(s *DropIndexStmt) (any, error) {
+	if e.dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	if s.Table != "" {
+		return nil, e.cat.DropIndexFromTable(e.dbName, s.Table, s.IndexName)
+	}
+	return nil, e.cat.DropIndex(e.dbName, s.IndexName)
+}
+
+func (e *Executor) execCreateView(s *CreateViewStmt) (any, error) {
+	if e.dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	// Serialize the SELECT statement back to SQL for storage.
+	// We store the view's SELECT query so it can be re-parsed and executed when referenced.
+	selectSQL := viewSelectToSQL(s.Select)
+	if err := e.cat.CreateView(e.dbName, s.ViewName, selectSQL); err != nil {
+		return nil, err
+	}
+	return &OKResult{}, nil
+}
+
+// viewSelectToSQL reconstructs a SQL string from a SelectStmt for view storage.
+func viewSelectToSQL(s *SelectStmt) string {
+	var buf strings.Builder
+	buf.WriteString("SELECT ")
+	if s.SelectAll {
+		buf.WriteString("*")
+	} else {
+		for i, f := range s.Fields {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			if f.Expr != nil {
+				buf.WriteString(exprToSQL(f.Expr))
+			} else if f.Column != "" {
+				buf.WriteString(f.Column)
+			}
+			if f.Alias != "" {
+				buf.WriteString(" AS ")
+				buf.WriteString(f.Alias)
+			}
+		}
+	}
+	if s.TableRef != nil {
+		buf.WriteString(" FROM ")
+		tableRefToSQL(&buf, s.TableRef)
+	}
+	if s.Where != nil {
+		buf.WriteString(" WHERE ")
+		buf.WriteString(exprToSQL(s.Where))
+	}
+	if len(s.OrderBy) > 0 {
+		buf.WriteString(" ORDER BY ")
+		for i, o := range s.OrderBy {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(exprToSQL(o.Expr))
+			if o.Desc {
+				buf.WriteString(" DESC")
+			}
+		}
+	}
+	if s.Limit != nil {
+		buf.WriteString(" LIMIT ")
+		buf.WriteString(strconv.Itoa(*s.Limit))
+	}
+	return buf.String()
+}
+
+func tableRefToSQL(buf *strings.Builder, ref TableRef) {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		buf.WriteString(r.Table)
+		if r.Alias != "" {
+			buf.WriteString(" AS ")
+			buf.WriteString(r.Alias)
+		}
+	case *JoinTableRef:
+		tableRefToSQL(buf, r.Left)
+		switch r.Type {
+		case JoinTypeCross:
+			buf.WriteString(" JOIN ")
+		case JoinTypeLeft:
+			buf.WriteString(" LEFT JOIN ")
+		case JoinTypeRight:
+			buf.WriteString(" RIGHT JOIN ")
+		}
+		tableRefToSQL(buf, r.Right)
+		if r.On != nil {
+			buf.WriteString(" ON ")
+			buf.WriteString(exprToSQL(r.On))
+		}
+	}
+}
+
+func exprToSQL(e Expr) string {
+	switch v := e.(type) {
+	case *LiteralExpr:
+		if v.Value == nil {
+			return "NULL"
+		}
+		switch val := v.Value.(type) {
+		case string:
+			return "'" + val + "'"
+		default:
+			return fmt.Sprintf("%v", val)
+		}
+	case *ColumnRefExpr:
+		if v.Table != "" {
+			return v.Table + "." + v.Name
+		}
+		return v.Name
+	case *BinaryExpr:
+		return exprToSQL(v.Left) + " " + v.Op + " " + exprToSQL(v.Right)
+	case *UnaryExpr:
+		return v.Op + " " + exprToSQL(v.Operand)
+	case *IsNullExpr:
+		return exprToSQL(v.Expr) + " IS NULL"
+	case *InExpr:
+		base := exprToSQL(v.Expr)
+		if v.Not {
+			base += " NOT IN ("
+		} else {
+			base += " IN ("
+		}
+		for i, val := range v.Values {
+			if i > 0 {
+				base += ", "
+			}
+			base += exprToSQL(val)
+		}
+		return base + ")"
+	case *FuncCallExpr:
+		name := v.Name
+		name += "("
+		for i, arg := range v.Args {
+			if i > 0 {
+				name += ", "
+			}
+			name += exprToSQL(arg)
+		}
+		return name + ")"
+	case *SubqueryExpr:
+		return "(" + viewSelectToSQL(v.Query) + ")"
+	case *ExistsExpr:
+		return "EXISTS (" + viewSelectToSQL(v.Query) + ")"
+	case *BetweenExpr:
+		return exprToSQL(v.Expr) + " BETWEEN " + exprToSQL(v.Low) + " AND " + exprToSQL(v.High)
+	case *LikeExpr:
+		return exprToSQL(v.Expr) + " LIKE " + exprToSQL(v.Pattern)
+	case *CaseExpr:
+		s := "CASE"
+		if v.Value != nil {
+			s += " " + exprToSQL(v.Value)
+		}
+		for _, w := range v.Whens {
+			s += " WHEN " + exprToSQL(w.Cond) + " THEN " + exprToSQL(w.Result)
+		}
+		if v.Else != nil {
+			s += " ELSE " + exprToSQL(v.Else)
+		}
+		return s + " END"
+	default:
+		return "?"
+	}
 }
 
 func (e *Executor) execShowTables() (any, error) {
@@ -690,7 +1047,16 @@ func columnTypeName(ct storage.ColumnType, length, precision, scale int) string 
 
 // --- DML ---
 
-func (e *Executor) execDML(fn func(*txn.Txn) (any, error)) (any, error) {
+func (e *Executor) execDML(fn func(*txn.Txn) (any, error)) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ee, ok := r.(evalError); ok {
+				err = ee.err
+			} else {
+				panic(r)
+			}
+		}
+	}()
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
@@ -707,7 +1073,7 @@ func (e *Executor) execDML(fn func(*txn.Txn) (any, error)) (any, error) {
 		txn = e.txn
 	}
 
-	result, err := fn(txn)
+	result, err = fn(txn)
 	if err != nil {
 		if autocommit {
 			txn.Rollback()
@@ -726,7 +1092,16 @@ func (e *Executor) execDML(fn func(*txn.Txn) (any, error)) (any, error) {
 	return result, nil
 }
 
-func (e *Executor) execDMLRead(fn func(*txn.Txn) (any, error)) (any, error) {
+func (e *Executor) execDMLRead(fn func(*txn.Txn) (any, error)) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ee, ok := r.(evalError); ok {
+				err = ee.err
+			} else {
+				panic(r)
+			}
+		}
+	}()
 	if e.dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
@@ -742,6 +1117,22 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 	td, err := e.cat.GetTable(e.dbName, s.Table)
 	if err != nil {
 		return nil, err
+	}
+
+	// If INSERT ... SELECT, execute the SELECT first to get rows.
+	if s.Select != nil {
+		res, err := e.execSelect(t, s.Select)
+		if err != nil {
+			return nil, err
+		}
+		sr, ok := res.(*SelectResult)
+		if !ok {
+			return nil, fmt.Errorf("INSERT SELECT: unexpected result type")
+		}
+		// Convert SelectResult rows into Values format.
+		for _, row := range sr.Rows {
+			s.Values = append(s.Values, row)
+		}
 	}
 
 	treeKey := td.DataFile()
@@ -846,7 +1237,7 @@ func (e *Executor) execInsert(t *txn.Txn, s *InsertStmt) (any, error) {
 
 func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 	if s.TableRef == nil {
-		return nil, fmt.Errorf("no table specified")
+		return e.execSelectNoTable(s)
 	}
 	switch ref := s.TableRef.(type) {
 	case *SimpleTableRef:
@@ -856,6 +1247,55 @@ func (e *Executor) execSelect(t *txn.Txn, s *SelectStmt) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported table reference")
 	}
+}
+
+// execSelectNoTable handles SELECT without a FROM clause (e.g., SELECT 1+2, SELECT MAX(1)).
+func (e *Executor) execSelectNoTable(s *SelectStmt) (any, error) {
+	// Evaluate each field expression without a table context.
+	var row []any
+	var colNames []string
+	for _, f := range s.Fields {
+		if f.Expr != nil {
+			val := e.evalExprNoTable(f.Expr)
+			row = append(row, val)
+			name := f.Alias
+			if name == "" {
+				name = exprToString(f.Expr)
+			}
+			colNames = append(colNames, name)
+		} else if f.Column != "" {
+			row = append(row, nil)
+			colNames = append(colNames, f.Column)
+		}
+	}
+
+	rows := [][]any{row}
+
+	// Handle DISTINCT
+	if s.Distinct {
+		rows = dedupRows(rows)
+	}
+
+	// Apply LIMIT
+	if s.Limit != nil && *s.Limit < len(rows) {
+		rows = rows[:*s.Limit]
+	}
+
+	return &SelectResult{Rows: rows, Columns: colNames}, nil
+}
+
+// dedupRows removes duplicate rows.
+func dedupRows(rows [][]any) [][]any {
+	seen := make(map[string]bool)
+	var result [][]any
+	for _, row := range rows {
+		key := rowKey(row)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, row)
+		}
+	}
+	return result
 }
 
 func (e *Executor) execSetOpr(t *txn.Txn, s *SetOprStmt) (any, error) {
@@ -903,6 +1343,15 @@ func rowKey(row []any) string {
 		switch v := v.(type) {
 		case nil:
 			buf.WriteByte('N')
+		case bool:
+			if v {
+				buf.WriteByte('T')
+			} else {
+				buf.WriteByte('F')
+			}
+		case int32:
+			buf.WriteByte('I')
+			buf.WriteString(strconv.FormatInt(int64(v), 10))
 		case int64:
 			buf.WriteByte('I')
 			buf.WriteString(strconv.FormatInt(v, 10))
@@ -1057,11 +1506,118 @@ func sortResultRows(rows [][]any, columns []string, orderBy []OrderByClause) [][
 	return rows
 }
 
+// execViewSelect handles SELECT from a view by executing the view's stored query
+// and then applying the outer query's WHERE, projection, ORDER BY, LIMIT on top.
+func (e *Executor) execViewSelect(t *txn.Txn, outer *SelectStmt, ref *SimpleTableRef, viewSQL string) (any, error) {
+	// Parse the view's SELECT statement
+	p := NewParser()
+	viewStmt, err := p.Parse(viewSQL)
+	if err != nil {
+		return nil, fmt.Errorf("view %s: parse error in stored query: %w", ref.Table, err)
+	}
+	viewSel, ok := viewStmt.(*SelectStmt)
+	if !ok {
+		return nil, fmt.Errorf("view %s: stored query is not a SELECT", ref.Table)
+	}
+
+	// Execute the view's query
+	viewResult, err := e.execSelect(t, viewSel)
+	if err != nil {
+		return nil, err
+	}
+	selRes, ok := viewResult.(*SelectResult)
+	if !ok {
+		return nil, fmt.Errorf("view %s: unexpected result type", ref.Table)
+	}
+
+	// Build a pseudo tabledef from the view result columns
+	alias := ref.Table
+	if ref.Alias != "" {
+		alias = ref.Alias
+	}
+	colNames := selRes.Columns
+	td := &catalog.TableDef{
+		Database: e.dbName,
+		Name:     alias,
+	}
+	for _, colName := range colNames {
+		td.Columns = append(td.Columns, storage.ColumnDef{Name: colName, Type: storage.ColTypeInt})
+	}
+
+	// Apply outer query's WHERE and projection on the view result rows
+	var filteredRows [][]any
+	for _, row := range selRes.Rows {
+		if outer.Where != nil {
+			if !toBool(e.evalExpr(td, outer.Where, row)) {
+				continue
+			}
+		}
+		filteredRows = append(filteredRows, row)
+	}
+
+	// Apply projection
+	var resultRows [][]any
+	for _, row := range filteredRows {
+		if outer.SelectAll {
+			resultRows = append(resultRows, row)
+		} else {
+			var projected []any
+			for _, f := range outer.Fields {
+				if f.Expr != nil {
+					val := e.evalExpr(td, f.Expr, row)
+					projected = append(projected, val)
+				} else if f.Column != "" {
+					idx := td.ColumnIndex(f.Column)
+					if idx >= 0 && idx < len(row) {
+						projected = append(projected, row[idx])
+					} else {
+						projected = append(projected, nil)
+					}
+				}
+			}
+			resultRows = append(resultRows, projected)
+		}
+	}
+
+	// Apply ORDER BY
+	if len(outer.OrderBy) > 0 {
+		e.sortRowsWithFields(resultRows, colNames, outer.OrderBy, td)
+	}
+
+	// Apply LIMIT
+	if outer.Limit != nil && *outer.Limit < len(resultRows) {
+		resultRows = resultRows[:*outer.Limit]
+	}
+
+	// Build result columns
+	var resultCols []string
+	if outer.SelectAll {
+		resultCols = colNames
+	} else {
+		for _, f := range outer.Fields {
+			if f.Alias != "" {
+				resultCols = append(resultCols, f.Alias)
+			} else if f.Column != "" {
+				resultCols = append(resultCols, f.Column)
+			} else {
+				resultCols = append(resultCols, "?column?")
+			}
+		}
+	}
+
+	return &SelectResult{Rows: resultRows, Columns: resultCols}, nil
+}
+
 func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef) (any, error) {
 	totalStart := time.Now()
 	defer func() {
 		metrics.SelectSimpleDuration.Observe(time.Since(totalStart).Seconds())
 	}()
+
+	// Check if this is a view reference
+	if viewSQL, err := e.cat.GetView(e.dbName, ref.Table); err == nil {
+		return e.execViewSelect(t, s, ref, viewSQL)
+	}
 
 	tableName := ref.Table
 	if ref.Alias != "" {
@@ -1077,23 +1633,22 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 
 	treeKey := td.DataFile()
 
-	// Check if this is a pure aggregate query (all fields are aggregate funcs, no columns).
+	// GROUP BY handling — route to dedicated function.
+	if len(s.GroupBy) > 0 {
+		return e.execSelectGroupBy(t, s, ref, td)
+	}
+
+	// Check if this is a pure aggregate query (any field contains aggregate funcs).
 	if len(s.Fields) > 0 && !s.SelectAll {
-		allAgg := true
+		hasAgg := false
 		for _, f := range s.Fields {
-			if f.Column != "" {
-				allAgg = false
+			if f.Expr != nil && exprContainsAgg(f.Expr) {
+				hasAgg = true
 				break
 			}
-			if f.Expr != nil {
-				if _, ok := f.Expr.(*AggregateFuncExpr); !ok {
-					allAgg = false
-					break
-				}
-			}
 		}
-		if allAgg && len(s.SelectExprs) > 0 && len(s.Columns) == 0 {
-			return e.execSelectAggregate(t, s, ref, td)
+		if hasAgg {
+			return e.execSelectAggregateExpr(t, s, ref, td)
 		}
 	}
 
@@ -1313,6 +1868,10 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 	}
 	if s.Limit != nil && *s.Limit < len(rows) {
 		rows = rows[:*s.Limit]
+	}
+	// Apply DISTINCT
+	if s.Distinct {
+		rows = dedupRows(rows)
 	}
 	metrics.SelectPostProcessDuration.Observe(time.Since(t3).Seconds())
 
@@ -1645,12 +2204,13 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 	}
 
 	type aggState struct {
-		count     int64 // COUNT(*) — total rows
-		sum       float64
-		avgCount  int64 // non-null values for AVG
-		minVal    any
-		maxVal    any
-		hasData   bool
+		count       int64 // COUNT(*) — total rows
+		sum         float64
+		sumHasValue bool // true if any non-NULL value was added to SUM
+		avgCount    int64 // non-null values for AVG
+		minVal      any
+		maxVal      any
+		hasData     bool
 	}
 
 	agg := &aggState{}
@@ -1687,6 +2247,7 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 					for _, arg := range args {
 						v := e.evalExpr(td, arg, vals)
 						if v != nil {
+							agg.sumHasValue = true
 							switch n := v.(type) {
 							case int64:
 								agg.sum += float64(n)
@@ -1750,8 +2311,11 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 			row[i] = agg.count
 			colNames[i] = "count(1)"
 		case "SUM":
-			row[i] = agg.sum
-			colNames[i] = "sum"
+			if agg.sumHasValue {
+				row[i] = agg.sum
+			} else {
+				row[i] = nil
+			}
 		case "AVG":
 			if agg.avgCount > 0 {
 				row[i] = agg.sum / float64(agg.avgCount)
@@ -1771,7 +2335,875 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 	return &SelectResult{Columns: colNames, Rows: [][]any{row}}, nil
 }
 
+// execSelectAggregateExpr handles SELECT queries where result expressions
+// contain aggregate functions mixed with arithmetic (e.g. COUNT(*) * -31).
+// It collects all unique aggregate expressions, computes them over all rows,
+// then evaluates each result expression with the aggregate values substituted.
+func (e *Executor) execSelectAggregateExpr(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, td *catalog.TableDef) (any, error) {
+	treeKey := td.DataFile()
+
+	var start, end []byte
+	if s.Where != nil {
+		start, end = e.extractPKRange(td, s.Where)
+	}
+	if start == nil {
+		start = []byte{0x00}
+		end = []byte{0xFF}
+	}
+
+	// 1. Collect all unique AggregateFuncExpr nodes from result expressions.
+	type aggKey struct {
+		name string
+		args string // serialized args for identity
+		distinct bool
+	}
+	type aggState struct {
+		count       int64
+		sum         float64
+		sumHasValue bool
+		avgCount    int64
+		minVal      any
+		maxVal      any
+		distinctSet map[string]bool
+	}
+
+	var aggExprs []*AggregateFuncExpr
+	seenPtr := make(map[*AggregateFuncExpr]bool)
+	var collectAggs func(Expr)
+	collectAggs = func(expr Expr) {
+		switch ex := expr.(type) {
+		case *AggregateFuncExpr:
+			if !seenPtr[ex] {
+				seenPtr[ex] = true
+				aggExprs = append(aggExprs, ex)
+			}
+		case *BinaryExpr:
+			collectAggs(ex.Left)
+			collectAggs(ex.Right)
+		case *UnaryExpr:
+			collectAggs(ex.Operand)
+		case *CastExpr:
+			collectAggs(ex.Expr)
+		case *CaseExpr:
+			if ex.Value != nil {
+				collectAggs(ex.Value)
+			}
+			for _, w := range ex.Whens {
+				collectAggs(w.Cond)
+				collectAggs(w.Result)
+			}
+			if ex.Else != nil {
+				collectAggs(ex.Else)
+			}
+		case *FuncCallExpr:
+			for _, a := range ex.Args {
+				collectAggs(a)
+			}
+		case *IsNullExpr:
+			collectAggs(ex.Expr)
+		case *BetweenExpr:
+			collectAggs(ex.Expr)
+			collectAggs(ex.Low)
+			collectAggs(ex.High)
+		}
+	}
+	for _, f := range s.Fields {
+		if f.Expr != nil {
+			collectAggs(f.Expr)
+		}
+	}
+
+	// 2. Build aggregate state map, keyed by pointer identity of the original expr.
+	states := make(map[*AggregateFuncExpr]*aggState)
+	for _, ae := range aggExprs {
+		st := &aggState{}
+		if ae.Distinct {
+			st.distinctSet = make(map[string]bool)
+		}
+		states[ae] = st
+	}
+
+	// 3. Scan all rows, updating each aggregate's state.
+	e.engine.ScanAll(treeKey, start, end, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, td.Columns)
+		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+			return true
+		}
+		for ae, st := range states {
+			name := strings.ToUpper(ae.Name)
+			switch name {
+			case "COUNT":
+				if len(ae.Args) == 0 {
+					st.count++
+				} else {
+					v := e.evalExpr(td, ae.Args[0], vals)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if !st.distinctSet[k] {
+								st.distinctSet[k] = true
+								st.count++
+							}
+						} else {
+							st.count++
+						}
+					}
+				}
+			case "SUM":
+				for _, arg := range ae.Args {
+					v := e.evalExpr(td, arg, vals)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						st.sumHasValue = true
+						switch n := v.(type) {
+						case int32:
+							st.sum += float64(n)
+						case int64:
+							st.sum += float64(n)
+						case float64:
+							st.sum += n
+						}
+					}
+				}
+			case "AVG":
+				for _, arg := range ae.Args {
+					v := e.evalExpr(td, arg, vals)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						st.avgCount++
+						switch n := v.(type) {
+						case int32:
+							st.sum += float64(n)
+						case int64:
+							st.sum += float64(n)
+						case float64:
+							st.sum += n
+						}
+					}
+				}
+			case "MIN":
+				for _, arg := range ae.Args {
+					v := e.evalExpr(td, arg, vals)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						if st.minVal == nil || compareValues(v, st.minVal) < 0 {
+							st.minVal = v
+						}
+					}
+				}
+			case "MAX":
+				for _, arg := range ae.Args {
+					v := e.evalExpr(td, arg, vals)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						if st.maxVal == nil || compareValues(v, st.maxVal) > 0 {
+							st.maxVal = v
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	// 4. Resolve each aggregate to its final value.
+	aggValues := make(map[*AggregateFuncExpr]any)
+	for ae, st := range states {
+		name := strings.ToUpper(ae.Name)
+		switch name {
+		case "COUNT":
+			aggValues[ae] = st.count
+		case "SUM":
+			if st.sumHasValue {
+				aggValues[ae] = floatToIntIfWhole(st.sum)
+			} else {
+				aggValues[ae] = nil // SUM of no non-NULL values is NULL
+			}
+		case "AVG":
+			if st.avgCount > 0 {
+				aggValues[ae] = st.sum / float64(st.avgCount)
+			} else {
+				aggValues[ae] = nil
+			}
+		case "MIN":
+			aggValues[ae] = st.minVal
+		case "MAX":
+			aggValues[ae] = st.maxVal
+		}
+	}
+
+	// 5. Evaluate each result expression with aggregates substituted.
+	colNames := make([]string, len(s.Fields))
+	row := make([]any, len(s.Fields))
+	for i, f := range s.Fields {
+		if f.Alias != "" {
+			colNames[i] = f.Alias
+		} else if f.Column != "" {
+			colNames[i] = f.Column
+		} else {
+			colNames[i] = exprToString(f.Expr)
+		}
+		if f.Expr != nil {
+			row[i] = e.evalExprWithAgg(td, f.Expr, aggValues)
+		} else if f.Column != "" {
+			// Column reference in aggregate query — should not happen for valid SQL,
+			// but handle gracefully by returning the column value from the last row.
+			row[i] = nil
+		}
+	}
+
+	return &SelectResult{Columns: colNames, Rows: [][]any{row}}, nil
+}
+
+// execSelectGroupBy handles SELECT ... GROUP BY ... [HAVING ...] for a single table.
+func (e *Executor) execSelectGroupBy(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, td *catalog.TableDef) (any, error) {
+	treeKey := td.DataFile()
+
+	var start, end []byte
+	if s.Where != nil {
+		start, end = e.extractPKRange(td, s.Where)
+	}
+	if start == nil {
+		start = []byte{0x00}
+		end = []byte{0xFF}
+	}
+
+	alias := ref.Alias
+
+	// 1. Scan all rows (full column values) into memory.
+	var allRows [][]any
+	e.engine.ScanAll(treeKey, start, end, func(pk, rowData []byte) bool {
+		vals, _ := storage.DecodeRow(rowData, td.Columns)
+		if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+			return true
+		}
+		// Make a copy since vals may be reused.
+		row := make([]any, len(vals))
+		copy(row, vals)
+		allRows = append(allRows, row)
+		return true
+	})
+
+	// 2. Group rows by GROUP BY key.
+	type group struct {
+		key  string
+		rows [][]any // all rows in this group
+	}
+	groupMap := make(map[string]*group)
+	var groups []*group
+	for _, row := range allRows {
+		var keyParts []string
+		for _, gbExpr := range s.GroupBy {
+			v := e.evalExpr(td, gbExpr, row)
+			keyParts = append(keyParts, fmt.Sprintf("%v", v))
+		}
+		key := strings.Join(keyParts, "\x00")
+		if g, ok := groupMap[key]; ok {
+			g.rows = append(g.rows, row)
+		} else {
+			g := &group{key: key, rows: [][]any{row}}
+			groupMap[key] = g
+			groups = append(groups, g)
+		}
+	}
+
+	// 3. Collect aggregate expressions from SELECT fields and HAVING.
+	type aggState struct {
+		count       int64
+		sum         float64
+		sumHasValue bool
+		avgCount    int64
+		minVal      any
+		maxVal      any
+		distinctSet map[string]bool
+	}
+
+	var aggExprs []*AggregateFuncExpr
+	seenPtr := make(map[*AggregateFuncExpr]bool)
+	var collectAggs func(Expr)
+	collectAggs = func(expr Expr) {
+		switch ex := expr.(type) {
+		case *AggregateFuncExpr:
+			if !seenPtr[ex] {
+				seenPtr[ex] = true
+				aggExprs = append(aggExprs, ex)
+			}
+		case *BinaryExpr:
+			collectAggs(ex.Left)
+			collectAggs(ex.Right)
+		case *UnaryExpr:
+			collectAggs(ex.Operand)
+		case *CastExpr:
+			collectAggs(ex.Expr)
+		case *CaseExpr:
+			if ex.Value != nil {
+				collectAggs(ex.Value)
+			}
+			for _, w := range ex.Whens {
+				collectAggs(w.Cond)
+				collectAggs(w.Result)
+			}
+			if ex.Else != nil {
+				collectAggs(ex.Else)
+			}
+		case *FuncCallExpr:
+			for _, a := range ex.Args {
+				collectAggs(a)
+			}
+		case *IsNullExpr:
+			collectAggs(ex.Expr)
+		case *BetweenExpr:
+			collectAggs(ex.Expr)
+			collectAggs(ex.Low)
+			collectAggs(ex.High)
+		}
+	}
+	for _, f := range s.Fields {
+		if f.Expr != nil {
+			collectAggs(f.Expr)
+		}
+	}
+	if s.Having != nil {
+		collectAggs(s.Having)
+	}
+
+	// 4. For each group, compute aggregates, evaluate SELECT fields, apply HAVING.
+	var resultRows [][]any
+
+	// Build column names and output projection.
+	var colNames []string
+	type outCol struct {
+		colIdx int    // index in td.Columns, -1 for expr
+		expr   Expr   // for expression fields
+		name   string
+	}
+	var outCols []outCol
+
+	if s.SelectAll {
+		for i, col := range td.Columns {
+			if col.Hidden {
+				continue
+			}
+			colNames = append(colNames, col.Name)
+			outCols = append(outCols, outCol{colIdx: i, name: col.Name})
+		}
+	} else {
+		colNames = make([]string, len(s.Fields))
+		for i, f := range s.Fields {
+			if f.Alias != "" {
+				colNames[i] = f.Alias
+			} else if f.Column != "" {
+				colNames[i] = f.Column
+			} else {
+				colNames[i] = exprToString(f.Expr)
+			}
+			if f.Expr != nil {
+				outCols = append(outCols, outCol{colIdx: -1, expr: f.Expr, name: colNames[i]})
+			} else if f.Column != "" {
+				idx := td.ColumnIndex(f.Column)
+				outCols = append(outCols, outCol{colIdx: idx, name: colNames[i]})
+			}
+		}
+	}
+
+	for _, g := range groups {
+		// Pick a representative row for column reference evaluation.
+		repRow := g.rows[0]
+
+		// Compute aggregates for this group.
+		states := make(map[*AggregateFuncExpr]*aggState)
+		for _, ae := range aggExprs {
+			st := &aggState{}
+			if ae.Distinct {
+				st.distinctSet = make(map[string]bool)
+			}
+			states[ae] = st
+		}
+		for _, row := range g.rows {
+			for ae, st := range states {
+				name := strings.ToUpper(ae.Name)
+				switch name {
+				case "COUNT":
+					if len(ae.Args) == 0 {
+						st.count++
+					} else {
+						var v any
+						if col, ok := ae.Args[0].(*ColumnRefExpr); ok {
+							idx := td.ColumnIndex(col.Name)
+							if idx >= 0 {
+								v = row[idx]
+							}
+						} else {
+							v = e.evalExpr(td, ae.Args[0], row)
+						}
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if !st.distinctSet[k] {
+									st.distinctSet[k] = true
+									st.count++
+								}
+							} else {
+								st.count++
+							}
+						}
+					}
+				case "SUM":
+					for _, arg := range ae.Args {
+						v := e.evalExpr(td, arg, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							st.sumHasValue = true
+							switch n := v.(type) {
+							case int32:
+								st.sum += float64(n)
+							case int64:
+								st.sum += float64(n)
+							case float64:
+								st.sum += n
+							}
+						}
+					}
+				case "AVG":
+					for _, arg := range ae.Args {
+						v := e.evalExpr(td, arg, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							st.avgCount++
+							switch n := v.(type) {
+							case int32:
+								st.sum += float64(n)
+							case int64:
+								st.sum += float64(n)
+							case float64:
+								st.sum += n
+							}
+						}
+					}
+				case "MIN":
+					for _, arg := range ae.Args {
+						v := e.evalExpr(td, arg, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							if st.minVal == nil || compareValues(v, st.minVal) < 0 {
+								st.minVal = v
+							}
+						}
+					}
+				case "MAX":
+					for _, arg := range ae.Args {
+						v := e.evalExpr(td, arg, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							if st.maxVal == nil || compareValues(v, st.maxVal) > 0 {
+								st.maxVal = v
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Resolve aggregates to final values.
+		aggValues := make(map[*AggregateFuncExpr]any)
+		for ae, st := range states {
+			name := strings.ToUpper(ae.Name)
+			switch name {
+			case "COUNT":
+				aggValues[ae] = st.count
+			case "SUM":
+				if st.sumHasValue {
+					aggValues[ae] = floatToIntIfWhole(st.sum)
+				} else {
+					aggValues[ae] = nil
+				}
+			case "AVG":
+				if st.avgCount > 0 {
+					aggValues[ae] = st.sum / float64(st.avgCount)
+				} else {
+					aggValues[ae] = nil
+				}
+			case "MIN":
+				aggValues[ae] = st.minVal
+			case "MAX":
+				aggValues[ae] = st.maxVal
+			}
+		}
+
+		// Evaluate HAVING clause.
+		if s.Having != nil {
+			hval := e.evalExprWithAggAndRow(td, s.Having, aggValues, repRow, alias)
+			if b, ok := hval.(bool); !ok || !b {
+				continue
+			}
+		}
+
+		// Evaluate result row.
+		row := make([]any, len(outCols))
+		for i, oc := range outCols {
+			if oc.expr != nil {
+				row[i] = e.evalExprWithAggAndRow(td, oc.expr, aggValues, repRow, alias)
+			} else if oc.colIdx >= 0 {
+				row[i] = repRow[oc.colIdx]
+			}
+		}
+		resultRows = append(resultRows, row)
+	}
+
+	// Apply ORDER BY
+	if len(s.OrderBy) > 0 {
+		e.sortRowsWithFields(resultRows, colNames, s.OrderBy, td)
+	}
+
+	// Apply DISTINCT
+	if s.Distinct {
+		resultRows = dedupRows(resultRows)
+	}
+
+	// Apply LIMIT
+	if s.Limit != nil && *s.Limit < len(resultRows) {
+		resultRows = resultRows[:*s.Limit]
+	}
+
+	tableName := ref.Table
+	if ref.Alias != "" {
+		tableName = ref.Alias
+	}
+	return &SelectResult{Columns: colNames, Rows: resultRows, TableAlias: tableName}, nil
+}
+
+// evalExprWithAggAndRow evaluates an expression with aggregate values substituted
+// and column references resolved from a data row.
+func (e *Executor) evalExprWithAggAndRow(td *catalog.TableDef, expr Expr, aggValues map[*AggregateFuncExpr]any, row []any, alias string) any {
+	switch ex := expr.(type) {
+	case *AggregateFuncExpr:
+		if v, ok := aggValues[ex]; ok {
+			return v
+		}
+		return nil
+	case *LiteralExpr:
+		return ex.Value
+	case *ColumnRefExpr:
+		colName := ex.Name
+		if ex.Table != "" && (ex.Table == alias || ex.Table == td.Name) {
+			// Qualified column reference.
+		}
+		idx := td.ColumnIndex(colName)
+		if idx >= 0 {
+			return row[idx]
+		}
+		return nil
+	case *BinaryExpr:
+		left := e.evalExprWithAggAndRow(td, ex.Left, aggValues, row, alias)
+		right := e.evalExprWithAggAndRow(td, ex.Right, aggValues, row, alias)
+		return e.evalBinaryOp(ex.Op, left, right)
+	case *UnaryExpr:
+		operand := e.evalExprWithAggAndRow(td, ex.Operand, aggValues, row, alias)
+		return e.evalUnaryOp(ex.Op, operand)
+	case *CastExpr:
+		v := e.evalExprWithAggAndRow(td, ex.Expr, aggValues, row, alias)
+		return castValue(v, ex.Type)
+	case *NullExpr:
+		return nil
+	case *FuncCallExpr:
+		var args []any
+		for _, a := range ex.Args {
+			args = append(args, e.evalExprWithAggAndRow(td, a, aggValues, row, alias))
+		}
+		return e.evalFuncCallValues(strings.ToUpper(ex.Name), args)
+	case *CaseExpr:
+		for _, w := range ex.Whens {
+			var cond any
+			if ex.Value != nil {
+				val := e.evalExprWithAggAndRow(td, ex.Value, aggValues, row, alias)
+				cmp := e.evalExprWithAggAndRow(td, w.Cond, aggValues, row, alias)
+				if val == nil || cmp == nil {
+					cond = false
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
+			} else {
+				cond = e.evalExprWithAggAndRow(td, w.Cond, aggValues, row, alias)
+			}
+			if b, ok := cond.(bool); ok && b {
+				return e.evalExprWithAggAndRow(td, w.Result, aggValues, row, alias)
+			}
+		}
+		if ex.Else != nil {
+			return e.evalExprWithAggAndRow(td, ex.Else, aggValues, row, alias)
+		}
+		return nil
+	case *IsNullExpr:
+		v := e.evalExprWithAggAndRow(td, ex.Expr, aggValues, row, alias)
+		if ex.Not {
+			return v != nil
+		}
+		return v == nil
+	case *BetweenExpr:
+		val := e.evalExprWithAggAndRow(td, ex.Expr, aggValues, row, alias)
+		low := e.evalExprWithAggAndRow(td, ex.Low, aggValues, row, alias)
+		high := e.evalExprWithAggAndRow(td, ex.High, aggValues, row, alias)
+		if val == nil || low == nil || high == nil {
+			return nil
+		}
+		geLow := compareValues(val, low) >= 0
+		leHigh := compareValues(val, high) <= 0
+		return geLow && leHigh
+	case *InExpr:
+		val := e.evalExprWithAggAndRow(td, ex.Expr, aggValues, row, alias)
+		if val == nil {
+			return nil
+		}
+		hasNull := false
+		for _, v := range ex.Values {
+			ev := e.evalExprWithAggAndRow(td, v, aggValues, row, alias)
+			if ev == nil {
+				hasNull = true
+				continue
+			}
+			if compareValues(val, ev) == 0 {
+				if ex.Not {
+					return false
+				}
+				return true
+			}
+		}
+		if hasNull {
+			return nil
+		}
+		if ex.Not {
+			return true
+		}
+		return false
+	default:
+		return nil
+	}
+}
+// results from the provided map.
+func (e *Executor) evalExprWithAgg(td *catalog.TableDef, expr Expr, aggValues map[*AggregateFuncExpr]any) any {
+	switch ex := expr.(type) {
+	case *AggregateFuncExpr:
+		if v, ok := aggValues[ex]; ok {
+			return v
+		}
+		return nil
+	case *LiteralExpr:
+		return ex.Value
+	case *ColumnRefExpr:
+		return nil // no row context in aggregate
+	case *BinaryExpr:
+		left := e.evalExprWithAgg(td, ex.Left, aggValues)
+		right := e.evalExprWithAgg(td, ex.Right, aggValues)
+		return e.evalBinaryOp(ex.Op, left, right)
+	case *UnaryExpr:
+		operand := e.evalExprWithAgg(td, ex.Operand, aggValues)
+		return e.evalUnaryOp(ex.Op, operand)
+	case *CastExpr:
+		v := e.evalExprWithAgg(td, ex.Expr, aggValues)
+		return castValue(v, ex.Type)
+	case *NullExpr:
+		return nil
+	case *CaseExpr:
+		for _, w := range ex.Whens {
+			var cond any
+			if ex.Value != nil {
+				val := e.evalExprWithAgg(td, ex.Value, aggValues)
+				cmp := e.evalExprWithAgg(td, w.Cond, aggValues)
+				if val == nil || cmp == nil {
+					cond = false
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
+			} else {
+				cond = e.evalExprWithAgg(td, w.Cond, aggValues)
+			}
+			if b, ok := cond.(bool); ok && b {
+				return e.evalExprWithAgg(td, w.Result, aggValues)
+			}
+		}
+		if ex.Else != nil {
+			return e.evalExprWithAgg(td, ex.Else, aggValues)
+		}
+		return nil
+	case *FuncCallExpr:
+		var args []any
+		for _, a := range ex.Args {
+			args = append(args, e.evalExprWithAgg(td, a, aggValues))
+		}
+		return e.evalFuncCallValues(strings.ToUpper(ex.Name), args)
+	default:
+		return nil
+	}
+}
+
+// evalFuncCallValues evaluates a function call given already-evaluated argument values.
+func (e *Executor) evalFuncCallValues(name string, args []any) any {
+	switch name {
+	case "COALESCE":
+		for _, v := range args {
+			if v != nil {
+				return v
+			}
+		}
+		return nil
+	case "IFNULL":
+		if len(args) == 2 {
+			if args[0] != nil {
+				return args[0]
+			}
+			return args[1]
+		}
+	case "ABS":
+		if len(args) == 1 {
+			switch n := args[0].(type) {
+			case int32:
+				if n < 0 { return -n }
+				return n
+			case int64:
+				if n < 0 { return -n }
+				return n
+			case float64:
+				if n < 0 { return -n }
+				return n
+			}
+		}
+	case "NULLIF":
+		if len(args) == 2 {
+			if args[0] != nil && args[1] != nil && compareValues(args[0], args[1]) == 0 {
+				return nil
+			}
+			return args[0]
+		}
+	case "UPPER":
+		if len(args) == 1 {
+			if s, ok := args[0].(string); ok {
+				return strings.ToUpper(s)
+			}
+		}
+	case "LOWER":
+		if len(args) == 1 {
+			if s, ok := args[0].(string); ok {
+				return strings.ToLower(s)
+			}
+		}
+	case "LENGTH", "CHAR_LENGTH":
+		if len(args) == 1 {
+			if s, ok := args[0].(string); ok {
+				return int64(len(s))
+			}
+		}
+	case "TYPEOF":
+		if len(args) == 1 {
+			return fmt.Sprintf("%T", args[0])
+		}
+	case "ZEROBLOB":
+		if len(args) == 1 {
+			if n, ok := toInt64(args[0]); ok && n > 0 {
+				return strings.Repeat("\x00", int(n))
+			}
+			return ""
+		}
+	case "IIF":
+		if len(args) == 3 {
+			if b, ok := args[0].(bool); ok && b {
+				return args[1]
+			}
+			return args[2]
+		}
+	}
+	return nil
+}
+
 func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
+	// Check if this join query contains aggregate functions in its result fields.
+	hasAgg := false
+	for _, f := range s.Fields {
+		if f.Expr != nil && exprContainsAgg(f.Expr) {
+			hasAgg = true
+			break
+		}
+	}
+
+	// If GROUP BY is present, we need to compute the join first, then group.
+	if len(s.GroupBy) > 0 {
+		return e.execSelectJoinGroupBy(t, s, ref)
+	}
+
+	if hasAgg {
+		// Execute the join with SELECT * to get all rows, then compute aggregates.
+		starStmt := *s
+		starStmt.Fields = nil
+		starStmt.SelectAll = true
+		starStmt.SelectExprs = nil
+		starStmt.Columns = nil
+		starStmt.Distinct = false
+		starStmt.OrderBy = nil
+		starStmt.Limit = nil
+		var joinRes *SelectResult
+		if isAllCrossJoin(ref) {
+			res, err := e.execMultiTableJoin(t, &starStmt, ref)
+			if err != nil {
+				return nil, err
+			}
+			joinRes = res.(*SelectResult)
+		} else {
+			res, err := e.execSelectJoinLegacy(t, &starStmt, ref)
+			if err != nil {
+				return nil, err
+			}
+			joinRes = res.(*SelectResult)
+		}
+		return e.computeAggregateOverRows(s, joinRes)
+	}
+
 	// For cross joins (comma-separated FROM, no ON condition), use the unified
 	// flatten+left-deep path which supports N tables, WHERE pushdown, and projection.
 	if isAllCrossJoin(ref) {
@@ -1780,6 +3212,730 @@ func (e *Executor) execSelectJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) 
 
 	// For explicit JOIN with ON / LEFT / RIGHT, use the original 2-table path.
 	return e.execSelectJoinLegacy(t, s, ref)
+}
+
+// execSelectJoinGroupBy handles GROUP BY for multi-table queries.
+func (e *Executor) execSelectJoinGroupBy(t *txn.Txn, s *SelectStmt, ref *JoinTableRef) (any, error) {
+	// 1. Flatten the join tree to get table entries.
+	tables, err := e.flattenJoinTree(ref)
+	if err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		return nil, fmt.Errorf("GROUP BY: no tables in join")
+	}
+
+	// 2. Load all table definitions.
+	for i := range tables {
+		td, err := e.cat.GetTable(e.dbName, tables[i].tableName)
+		if err != nil {
+			return nil, err
+		}
+		tables[i].td = td
+	}
+	// Compute column offsets for visible (non-hidden) columns only,
+	// since the join result has been projected to exclude hidden columns.
+	offset := 0
+	for i := range tables {
+		tables[i].colOffset = offset
+		visibleCount := 0
+		for _, col := range tables[i].td.Columns {
+			if !col.Hidden {
+				visibleCount++
+			}
+		}
+		tables[i].colCount = visibleCount
+		offset += visibleCount
+	}
+
+	// 3. Compute the join result (SELECT * to get all columns).
+	starStmt := *s
+	starStmt.Fields = nil
+	starStmt.SelectAll = true
+	starStmt.SelectExprs = nil
+	starStmt.Columns = nil
+	starStmt.Distinct = false
+	starStmt.GroupBy = nil
+	starStmt.Having = nil
+	starStmt.OrderBy = nil
+	starStmt.Limit = nil
+
+	var joinRes *SelectResult
+	if isAllCrossJoin(ref) {
+		res, err := e.execMultiTableJoin(t, &starStmt, ref)
+		if err != nil {
+			return nil, err
+		}
+		joinRes = res.(*SelectResult)
+	} else {
+		res, err := e.execSelectJoinLegacy(t, &starStmt, ref)
+		if err != nil {
+			return nil, err
+		}
+		joinRes = res.(*SelectResult)
+	}
+
+	allRows := joinRes.Rows
+
+	// 4. Group rows by GROUP BY key.
+	type group struct {
+		key  string
+		rows [][]any
+	}
+	groupMap := make(map[string]*group)
+	var groups []*group
+	for _, row := range allRows {
+		var keyParts []string
+		for _, gbExpr := range s.GroupBy {
+			v := e.evalExprMultiJoin(gbExpr, tables, row)
+			keyParts = append(keyParts, fmt.Sprintf("%v", v))
+		}
+		key := strings.Join(keyParts, "\x00")
+		if g, ok := groupMap[key]; ok {
+			g.rows = append(g.rows, row)
+		} else {
+			g := &group{key: key, rows: [][]any{row}}
+			groupMap[key] = g
+			groups = append(groups, g)
+		}
+	}
+
+	// 5. Collect aggregate expressions from SELECT fields and HAVING.
+	type aggState struct {
+		count       int64
+		sum         float64
+		sumHasValue bool
+		avgCount    int64
+		minVal      any
+		maxVal      any
+		distinctSet map[string]bool
+	}
+
+	var aggExprs []*AggregateFuncExpr
+	seenPtr := make(map[*AggregateFuncExpr]bool)
+	var collectAggs func(Expr)
+	collectAggs = func(expr Expr) {
+		switch ex := expr.(type) {
+		case *AggregateFuncExpr:
+			if !seenPtr[ex] {
+				seenPtr[ex] = true
+				aggExprs = append(aggExprs, ex)
+			}
+		case *BinaryExpr:
+			collectAggs(ex.Left)
+			collectAggs(ex.Right)
+		case *UnaryExpr:
+			collectAggs(ex.Operand)
+		case *CastExpr:
+			collectAggs(ex.Expr)
+		case *CaseExpr:
+			if ex.Value != nil {
+				collectAggs(ex.Value)
+			}
+			for _, w := range ex.Whens {
+				collectAggs(w.Cond)
+				collectAggs(w.Result)
+			}
+			if ex.Else != nil {
+				collectAggs(ex.Else)
+			}
+		case *FuncCallExpr:
+			for _, a := range ex.Args {
+				collectAggs(a)
+			}
+		case *IsNullExpr:
+			collectAggs(ex.Expr)
+		case *BetweenExpr:
+			collectAggs(ex.Expr)
+			collectAggs(ex.Low)
+			collectAggs(ex.High)
+		}
+	}
+	for _, f := range s.Fields {
+		if f.Expr != nil {
+			collectAggs(f.Expr)
+		}
+	}
+	if s.Having != nil {
+		collectAggs(s.Having)
+	}
+
+	// 6. For each group, compute aggregates, evaluate SELECT, apply HAVING.
+	var resultRows [][]any
+	var colNames []string
+	if s.SelectAll {
+		// Build column names from all tables.
+		for _, tbl := range tables {
+			for _, col := range tbl.td.Columns {
+				if !col.Hidden {
+					colNames = append(colNames, col.Name)
+				}
+			}
+		}
+	} else {
+		colNames = make([]string, len(s.Fields))
+		for i, f := range s.Fields {
+			if f.Alias != "" {
+				colNames[i] = f.Alias
+			} else if f.Column != "" {
+				colNames[i] = f.Column
+			} else {
+				colNames[i] = exprToString(f.Expr)
+			}
+		}
+	}
+
+	for _, g := range groups {
+		repRow := g.rows[0]
+
+		// Compute aggregates for this group.
+		states := make(map[*AggregateFuncExpr]*aggState)
+		for _, ae := range aggExprs {
+			st := &aggState{}
+			if ae.Distinct {
+				st.distinctSet = make(map[string]bool)
+			}
+			states[ae] = st
+		}
+		for _, row := range g.rows {
+			for ae, st := range states {
+				name := strings.ToUpper(ae.Name)
+				switch name {
+				case "COUNT":
+					if len(ae.Args) == 0 {
+						st.count++
+					} else {
+						v := e.evalExprMultiJoin(ae.Args[0], tables, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if !st.distinctSet[k] {
+									st.distinctSet[k] = true
+									st.count++
+								}
+							} else {
+								st.count++
+							}
+						}
+					}
+				case "SUM":
+					for _, arg := range ae.Args {
+						v := e.evalExprMultiJoin(arg, tables, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							st.sumHasValue = true
+							switch n := v.(type) {
+							case int32:
+								st.sum += float64(n)
+							case int64:
+								st.sum += float64(n)
+							case float64:
+								st.sum += n
+							}
+						}
+					}
+				case "AVG":
+					for _, arg := range ae.Args {
+						v := e.evalExprMultiJoin(arg, tables, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							st.avgCount++
+							switch n := v.(type) {
+							case int32:
+								st.sum += float64(n)
+							case int64:
+								st.sum += float64(n)
+							case float64:
+								st.sum += n
+							}
+						}
+					}
+				case "MIN":
+					for _, arg := range ae.Args {
+						v := e.evalExprMultiJoin(arg, tables, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							if st.minVal == nil || compareValues(v, st.minVal) < 0 {
+								st.minVal = v
+							}
+						}
+					}
+				case "MAX":
+					for _, arg := range ae.Args {
+						v := e.evalExprMultiJoin(arg, tables, row)
+						if v != nil {
+							if ae.Distinct {
+								k := fmt.Sprintf("%v", v)
+								if st.distinctSet[k] {
+									continue
+								}
+								st.distinctSet[k] = true
+							}
+							if st.maxVal == nil || compareValues(v, st.maxVal) > 0 {
+								st.maxVal = v
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Resolve aggregates to final values.
+		aggValues := make(map[*AggregateFuncExpr]any)
+		for ae, st := range states {
+			name := strings.ToUpper(ae.Name)
+			switch name {
+			case "COUNT":
+				aggValues[ae] = st.count
+			case "SUM":
+				if st.sumHasValue {
+					aggValues[ae] = floatToIntIfWhole(st.sum)
+				} else {
+					aggValues[ae] = nil
+				}
+			case "AVG":
+				if st.avgCount > 0 {
+					aggValues[ae] = st.sum / float64(st.avgCount)
+				} else {
+					aggValues[ae] = nil
+				}
+			case "MIN":
+				aggValues[ae] = st.minVal
+			case "MAX":
+				aggValues[ae] = st.maxVal
+			}
+		}
+
+		// Evaluate HAVING clause.
+		if s.Having != nil {
+			hval := e.evalExprWithAggMultiJoin(s.Having, aggValues, tables, repRow)
+			if b, ok := hval.(bool); !ok || !b {
+				continue
+			}
+		}
+
+		// Evaluate result row.
+		if s.SelectAll {
+			// Output all non-hidden columns.
+			var row []any
+			for i, tbl := range tables {
+				for j, col := range tbl.td.Columns {
+					if !col.Hidden {
+						row = append(row, repRow[tbl.colOffset+j])
+						_ = i
+					}
+				}
+			}
+			resultRows = append(resultRows, row)
+		} else {
+			row := make([]any, len(s.Fields))
+			for i, f := range s.Fields {
+				if f.Expr != nil {
+					row[i] = e.evalExprWithAggMultiJoin(f.Expr, aggValues, tables, repRow)
+				} else if f.Column != "" {
+					// Resolve column from the joined row, respecting table qualifier.
+					for _, tbl := range tables {
+						if f.Table != "" && tbl.tableName != f.Table && tbl.alias != f.Table {
+							continue
+						}
+						idx := tbl.td.ColumnIndex(f.Column)
+						if idx >= 0 {
+							row[i] = repRow[tbl.colOffset+idx]
+							break
+						}
+					}
+				}
+			}
+			resultRows = append(resultRows, row)
+		}
+	}
+
+	// Apply ORDER BY
+	if len(s.OrderBy) > 0 {
+		sortResultRows(resultRows, colNames, s.OrderBy)
+	}
+
+	// Apply DISTINCT
+	if s.Distinct {
+		resultRows = dedupRows(resultRows)
+	}
+
+	// Apply LIMIT
+	if s.Limit != nil && *s.Limit < len(resultRows) {
+		resultRows = resultRows[:*s.Limit]
+	}
+
+	return &SelectResult{Columns: colNames, Rows: resultRows}, nil
+}
+
+// evalExprWithAggMultiJoin evaluates an expression in a multi-table GROUP BY context.
+func (e *Executor) evalExprWithAggMultiJoin(expr Expr, aggValues map[*AggregateFuncExpr]any, tables []flatTableEntry, row []any) any {
+	switch ex := expr.(type) {
+	case *AggregateFuncExpr:
+		if v, ok := aggValues[ex]; ok {
+			return v
+		}
+		return nil
+	case *LiteralExpr:
+		return ex.Value
+	case *ColumnRefExpr:
+		idx, err := resolveColumnOffset(ex, tables)
+		if err != nil || idx < 0 || idx >= len(row) {
+			return nil
+		}
+		return row[idx]
+	case *BinaryExpr:
+		left := e.evalExprWithAggMultiJoin(ex.Left, aggValues, tables, row)
+		right := e.evalExprWithAggMultiJoin(ex.Right, aggValues, tables, row)
+		return e.evalBinaryOp(ex.Op, left, right)
+	case *UnaryExpr:
+		operand := e.evalExprWithAggMultiJoin(ex.Operand, aggValues, tables, row)
+		return e.evalUnaryOp(ex.Op, operand)
+	case *CastExpr:
+		v := e.evalExprWithAggMultiJoin(ex.Expr, aggValues, tables, row)
+		return castValue(v, ex.Type)
+	case *NullExpr:
+		return nil
+	case *FuncCallExpr:
+		var args []any
+		for _, a := range ex.Args {
+			args = append(args, e.evalExprWithAggMultiJoin(a, aggValues, tables, row))
+		}
+		return e.evalFuncCallValues(strings.ToUpper(ex.Name), args)
+	case *CaseExpr:
+		for _, w := range ex.Whens {
+			var cond any
+			if ex.Value != nil {
+				val := e.evalExprWithAggMultiJoin(ex.Value, aggValues, tables, row)
+				cmp := e.evalExprWithAggMultiJoin(w.Cond, aggValues, tables, row)
+				if val == nil || cmp == nil {
+					cond = false
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
+			} else {
+				cond = e.evalExprWithAggMultiJoin(w.Cond, aggValues, tables, row)
+			}
+			if b, ok := cond.(bool); ok && b {
+				return e.evalExprWithAggMultiJoin(w.Result, aggValues, tables, row)
+			}
+		}
+		if ex.Else != nil {
+			return e.evalExprWithAggMultiJoin(ex.Else, aggValues, tables, row)
+		}
+		return nil
+	case *IsNullExpr:
+		v := e.evalExprWithAggMultiJoin(ex.Expr, aggValues, tables, row)
+		if ex.Not {
+			return v != nil
+		}
+		return v == nil
+	case *BetweenExpr:
+		val := e.evalExprWithAggMultiJoin(ex.Expr, aggValues, tables, row)
+		low := e.evalExprWithAggMultiJoin(ex.Low, aggValues, tables, row)
+		high := e.evalExprWithAggMultiJoin(ex.High, aggValues, tables, row)
+		if val == nil || low == nil || high == nil {
+			return nil
+		}
+		return compareValues(val, low) >= 0 && compareValues(val, high) <= 0
+	case *InExpr:
+		val := e.evalExprWithAggMultiJoin(ex.Expr, aggValues, tables, row)
+		if val == nil {
+			return nil
+		}
+		hasNull := false
+		for _, v := range ex.Values {
+			ev := e.evalExprWithAggMultiJoin(v, aggValues, tables, row)
+			if ev == nil {
+				hasNull = true
+				continue
+			}
+			if compareValues(val, ev) == 0 {
+				if ex.Not {
+					return false
+				}
+				return true
+			}
+		}
+		if hasNull {
+			return nil
+		}
+		if ex.Not {
+			return true
+		}
+		return false
+	default:
+		return nil
+	}
+}
+
+// computeAggregateOverRows computes aggregate functions over a pre-computed
+// set of rows (e.g. from a cross join). The joinResult provides the rows
+// and column names; the SelectStmt provides the aggregate expressions.
+func (e *Executor) computeAggregateOverRows(s *SelectStmt, joinRes *SelectResult) (*SelectResult, error) {
+	// 1. Collect all unique AggregateFuncExpr nodes from result expressions.
+	type aggKey struct {
+		name     string
+		args     string
+		distinct bool
+	}
+	type aggState struct {
+		count       int64
+		sum         float64
+		sumHasValue bool
+		avgCount    int64
+		minVal      any
+		maxVal      any
+		distinctSet map[string]bool
+	}
+
+	var aggExprs []*AggregateFuncExpr
+	seenPtr := make(map[*AggregateFuncExpr]bool)
+	var collectAggs func(Expr)
+	collectAggs = func(expr Expr) {
+		switch ex := expr.(type) {
+		case *AggregateFuncExpr:
+			if !seenPtr[ex] {
+				seenPtr[ex] = true
+				aggExprs = append(aggExprs, ex)
+			}
+		case *BinaryExpr:
+			collectAggs(ex.Left)
+			collectAggs(ex.Right)
+		case *UnaryExpr:
+			collectAggs(ex.Operand)
+		case *CastExpr:
+			collectAggs(ex.Expr)
+		case *CaseExpr:
+			if ex.Value != nil {
+				collectAggs(ex.Value)
+			}
+			for _, w := range ex.Whens {
+				collectAggs(w.Cond)
+				collectAggs(w.Result)
+			}
+			if ex.Else != nil {
+				collectAggs(ex.Else)
+			}
+		case *FuncCallExpr:
+			for _, a := range ex.Args {
+				collectAggs(a)
+			}
+		}
+	}
+	for _, f := range s.Fields {
+		if f.Expr != nil {
+			collectAggs(f.Expr)
+		}
+	}
+
+	// 2. Build aggregate state map.
+	states := make(map[*AggregateFuncExpr]*aggState)
+	for _, ae := range aggExprs {
+		st := &aggState{}
+		if ae.Distinct {
+			st.distinctSet = make(map[string]bool)
+		}
+		states[ae] = st
+	}
+
+	// Build column name to index map for evaluating column refs.
+	colIndexMap := make(map[string]int)
+	for i, name := range joinRes.Columns {
+		colIndexMap[name] = i
+	}
+
+	// evalExprOverRow evaluates a non-aggregate expression over a single row.
+	var evalExprOverRow func(Expr, []any) any
+	evalExprOverRow = func(expr Expr, row []any) any {
+		switch ex := expr.(type) {
+		case *LiteralExpr:
+			return ex.Value
+		case *ColumnRefExpr:
+			name := ex.Name
+			if idx, ok := colIndexMap[name]; ok {
+				return row[idx]
+			}
+			return nil
+		case *BinaryExpr:
+			left := evalExprOverRow(ex.Left, row)
+			right := evalExprOverRow(ex.Right, row)
+			return e.evalBinaryOp(ex.Op, left, right)
+		case *UnaryExpr:
+			operand := evalExprOverRow(ex.Operand, row)
+			return e.evalUnaryOp(ex.Op, operand)
+		case *CastExpr:
+			v := evalExprOverRow(ex.Expr, row)
+			return castValue(v, ex.Type)
+		case *NullExpr:
+			return nil
+		default:
+			return nil
+		}
+	}
+
+	// 3. Scan all rows, updating each aggregate's state.
+	for _, row := range joinRes.Rows {
+		for ae, st := range states {
+			name := strings.ToUpper(ae.Name)
+			switch name {
+			case "COUNT":
+				if len(ae.Args) == 0 {
+					st.count++
+				} else {
+					v := evalExprOverRow(ae.Args[0], row)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if !st.distinctSet[k] {
+								st.distinctSet[k] = true
+								st.count++
+							}
+						} else {
+							st.count++
+						}
+					}
+				}
+			case "SUM":
+				for _, arg := range ae.Args {
+					v := evalExprOverRow(arg, row)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						st.sumHasValue = true
+						switch n := v.(type) {
+						case int32:
+							st.sum += float64(n)
+						case int64:
+							st.sum += float64(n)
+						case float64:
+							st.sum += n
+						}
+					}
+				}
+			case "AVG":
+				for _, arg := range ae.Args {
+					v := evalExprOverRow(arg, row)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						st.avgCount++
+						switch n := v.(type) {
+						case int32:
+							st.sum += float64(n)
+						case int64:
+							st.sum += float64(n)
+						case float64:
+							st.sum += n
+						}
+					}
+				}
+			case "MIN":
+				for _, arg := range ae.Args {
+					v := evalExprOverRow(arg, row)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						if st.minVal == nil || compareValues(v, st.minVal) < 0 {
+							st.minVal = v
+						}
+					}
+				}
+			case "MAX":
+				for _, arg := range ae.Args {
+					v := evalExprOverRow(arg, row)
+					if v != nil {
+						if ae.Distinct {
+							k := fmt.Sprintf("%v", v)
+							if st.distinctSet[k] {
+								continue
+							}
+							st.distinctSet[k] = true
+						}
+						if st.maxVal == nil || compareValues(v, st.maxVal) > 0 {
+							st.maxVal = v
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Resolve each aggregate to its final value.
+	aggValues := make(map[*AggregateFuncExpr]any)
+	for ae, st := range states {
+		switch strings.ToUpper(ae.Name) {
+		case "COUNT":
+			aggValues[ae] = st.count
+		case "SUM":
+			if st.sumHasValue {
+				aggValues[ae] = floatToIntIfWhole(st.sum)
+			} else {
+				aggValues[ae] = nil
+			}
+		case "AVG":
+			if st.avgCount > 0 {
+				aggValues[ae] = st.sum / float64(st.avgCount)
+			} else {
+				aggValues[ae] = nil
+			}
+		case "MIN":
+			aggValues[ae] = st.minVal
+		case "MAX":
+			aggValues[ae] = st.maxVal
+		}
+	}
+
+	// 5. Evaluate result expressions with aggregates substituted.
+	colNames := make([]string, len(s.Fields))
+	resultRow := make([]any, len(s.Fields))
+	for i, f := range s.Fields {
+		if f.Alias != "" {
+			colNames[i] = f.Alias
+		} else if f.Column != "" {
+			colNames[i] = f.Column
+		} else {
+			colNames[i] = exprToString(f.Expr)
+		}
+		if f.Expr != nil {
+			resultRow[i] = e.evalExprWithAgg(nil, f.Expr, aggValues)
+		}
+	}
+
+	return &SelectResult{Columns: colNames, Rows: [][]any{resultRow}}, nil
 }
 
 // isAllCrossJoin returns true if the join tree consists entirely of cross joins
@@ -2724,14 +4880,39 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 		val := e.evalExpr(td, ex.Expr, vals)
 		low := e.evalExpr(td, ex.Low, vals)
 		high := e.evalExpr(td, ex.High, vals)
-		if val == nil || low == nil || high == nil {
-			return nil
+		// BETWEEN is equivalent to val >= low AND val <= high
+		// using SQL three-valued logic.
+		var geResult any // val >= low
+		if val == nil || low == nil {
+			geResult = nil
+		} else {
+			geResult = compareValues(val, low) >= 0
 		}
-		cmpLow := compareValues(val, low)
-		cmpHigh := compareValues(val, high)
-		result := cmpLow >= 0 && cmpHigh <= 0
+		var leResult any // val <= high
+		if val == nil || high == nil {
+			leResult = nil
+		} else {
+			leResult = compareValues(val, high) <= 0
+		}
+		// AND: false AND anything = false; NULL AND true/NULL = NULL; true AND true = true
+		var result any
+		geB, geOk := toBoolNil(geResult)
+		leB, leOk := toBoolNil(leResult)
+		if !geOk || !leOk {
+			// At least one is NULL
+			if (geOk && !geB) || (leOk && !leB) {
+				result = false
+			} else {
+				result = nil
+			}
+		} else {
+			result = geB && leB
+		}
 		if ex.Not {
-			result = !result
+			if result == nil {
+				return nil
+			}
+			return !result.(bool)
 		}
 		return result
 	case *CaseExpr:
@@ -2758,12 +4939,24 @@ func (e *Executor) evalExpr(td *catalog.TableDef, expr Expr, vals []any) any {
 		return nil
 	case *FuncCallExpr:
 		return e.evalFuncCall(td, ex, vals)
+	case *CastExpr:
+		return e.evalCast(td, ex, vals)
 	default:
 		return nil
 	}
 }
 
 func (e *Executor) execSubquery(query *SelectStmt) any {
+	// Handle subqueries with no FROM clause (e.g., SELECT 1).
+	if query.TableRef == nil {
+		row := make([]any, len(query.Fields))
+		for i, f := range query.Fields {
+			if f.Expr != nil {
+				row[i] = e.evalExprNoTable(f.Expr)
+			}
+		}
+		return &SelectResult{Rows: [][]any{row}, Columns: make([]string, len(query.Fields))}
+	}
 	switch ref := query.TableRef.(type) {
 	case *SimpleTableRef:
 		txn := e.mgr.Begin()
@@ -2797,25 +4990,238 @@ func (e *Executor) execSubquery(query *SelectStmt) any {
 	}
 }
 
-func (e *Executor) evalInExpr(td *catalog.TableDef, expr *InExpr, vals []any) bool {
+// evalExprNoTable evaluates an expression without a table context (e.g., SELECT 1).
+func (e *Executor) evalExprNoTable(expr Expr) any {
+	switch ex := expr.(type) {
+	case *LiteralExpr:
+		return ex.Value
+	case *BinaryExpr:
+		left := e.evalExprNoTable(ex.Left)
+		right := e.evalExprNoTable(ex.Right)
+		return e.evalBinaryOp(ex.Op, left, right)
+	case *UnaryExpr:
+		operand := e.evalExprNoTable(ex.Operand)
+		return e.evalUnaryOp(ex.Op, operand)
+	case *FuncCallExpr:
+		return e.evalFuncCallNoTable(ex)
+	case *CastExpr:
+		v := e.evalExprNoTable(ex.Expr)
+		return castValue(v, ex.Type)
+	case *AggregateFuncExpr:
+		// In no-table context, aggregates operate on a single "virtual row".
+		name := strings.ToUpper(ex.Name)
+		switch name {
+		case "COUNT":
+			if len(ex.Args) == 0 {
+				return int64(1) // COUNT(*) counts the virtual row
+			}
+			// COUNT(expr): if expr evaluates to NULL, return 0; otherwise 1.
+			v := e.evalExprNoTable(ex.Args[0])
+			if v == nil {
+				return int64(0)
+			}
+			return int64(1)
+		case "SUM", "AVG", "MIN", "MAX":
+			if len(ex.Args) == 1 {
+				return e.evalExprNoTable(ex.Args[0])
+			}
+			return nil
+		}
+		return nil
+	case *CaseExpr:
+		for _, w := range ex.Whens {
+			var cond any
+			if ex.Value != nil {
+				val := e.evalExprNoTable(ex.Value)
+				cmp := e.evalExprNoTable(w.Cond)
+				if val == nil || cmp == nil {
+					cond = false
+				} else {
+					cond = compareValues(val, cmp) == 0
+				}
+			} else {
+				cond = e.evalExprNoTable(w.Cond)
+			}
+			if b, ok := cond.(bool); ok && b {
+				return e.evalExprNoTable(w.Result)
+			}
+		}
+		if ex.Else != nil {
+			return e.evalExprNoTable(ex.Else)
+		}
+		return nil
+	case *NullExpr:
+		return nil
+	case *IsNullExpr:
+		v := e.evalExprNoTable(ex.Expr)
+		if ex.Not {
+			return v != nil
+		}
+		return v == nil
+	case *BetweenExpr:
+		val := e.evalExprNoTable(ex.Expr)
+		low := e.evalExprNoTable(ex.Low)
+		high := e.evalExprNoTable(ex.High)
+		if val == nil || low == nil || high == nil {
+			return nil
+		}
+		result := compareValues(val, low) >= 0 && compareValues(val, high) <= 0
+		if ex.Not {
+			return !result
+		}
+		return result
+	case *InExpr:
+		val := e.evalExprNoTable(ex.Expr)
+		if val == nil {
+			return nil
+		}
+		hasNull := false
+		for _, v := range ex.Values {
+			ev := e.evalExprNoTable(v)
+			if ev == nil {
+				hasNull = true
+				continue
+			}
+			if compareValues(val, ev) == 0 {
+				if ex.Not {
+					return false
+				}
+				return true
+			}
+		}
+		if hasNull {
+			return nil
+		}
+		if ex.Not {
+			return true
+		}
+		return false
+	case *SubqueryExpr:
+		result := e.execSubquery(ex.Query)
+		if rs, ok := result.(*SelectResult); ok && len(rs.Rows) > 0 && len(rs.Rows[0]) > 0 {
+			return rs.Rows[0][0]
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func (e *Executor) evalFuncCallNoTable(f *FuncCallExpr) any {
+	switch strings.ToUpper(f.Name) {
+	case "MIN", "MAX", "COUNT", "SUM", "AVG":
+		if len(f.Args) == 1 {
+			return e.evalExprNoTable(f.Args[0])
+		}
+	case "COALESCE":
+		for _, arg := range f.Args {
+			v := e.evalExprNoTable(arg)
+			if v != nil {
+				return v
+			}
+		}
+		return nil
+	case "IFNULL":
+		if len(f.Args) == 2 {
+			v := e.evalExprNoTable(f.Args[0])
+			if v != nil {
+				return v
+			}
+			return e.evalExprNoTable(f.Args[1])
+		}
+	case "NULLIF":
+		if len(f.Args) == 2 {
+			v1 := e.evalExprNoTable(f.Args[0])
+			v2 := e.evalExprNoTable(f.Args[1])
+			if v1 != nil && v2 != nil && compareValues(v1, v2) == 0 {
+				return nil
+			}
+			return v1
+		}
+	case "ABS":
+		if len(f.Args) == 1 {
+			v := e.evalExprNoTable(f.Args[0])
+			switch n := v.(type) {
+			case int32:
+				if n < 0 { return -n }
+				return n
+			case int64:
+				if n < 0 { return -n }
+				return n
+			case float64:
+				if n < 0 { return -n }
+				return n
+			}
+		}
+	case "UPPER":
+		if len(f.Args) == 1 {
+			if s, ok := e.evalExprNoTable(f.Args[0]).(string); ok {
+				return strings.ToUpper(s)
+			}
+		}
+	case "LOWER":
+		if len(f.Args) == 1 {
+			if s, ok := e.evalExprNoTable(f.Args[0]).(string); ok {
+				return strings.ToLower(s)
+			}
+		}
+	case "LENGTH", "CHAR_LENGTH":
+		if len(f.Args) == 1 {
+			if s, ok := e.evalExprNoTable(f.Args[0]).(string); ok {
+				return int64(len(s))
+			}
+		}
+	case "TYPEOF":
+		if len(f.Args) == 1 {
+			return fmt.Sprintf("%T", e.evalExprNoTable(f.Args[0]))
+		}
+	case "IIF":
+		if len(f.Args) == 3 {
+			cond := e.evalExprNoTable(f.Args[0])
+			if b, ok := cond.(bool); ok && b {
+				return e.evalExprNoTable(f.Args[1])
+			}
+			return e.evalExprNoTable(f.Args[2])
+		}
+	}
+	return nil
+}
+
+func (e *Executor) evalInExpr(td *catalog.TableDef, expr *InExpr, vals []any) any {
+	// Handle empty IN list: IN () → false, NOT IN () → true.
+	if expr.Empty {
+		return expr.Not
+	}
 	val := e.evalExpr(td, expr.Expr, vals)
+	hasNull := val == nil
 	for _, v := range expr.Values {
 		if sq, ok := v.(*SubqueryExpr); ok {
 			result := e.execSubquery(sq.Query)
 			if rs, ok := result.(*SelectResult); ok {
+				if len(rs.Columns) > 1 {
+					panic(evalError{fmt.Errorf("sub-select returns %d columns - expected 1", len(rs.Columns))})
+				}
 				for _, row := range rs.Rows {
 					if len(row) > 0 && compareValues(val, row[0]) == 0 {
 						return !expr.Not
 					}
 				}
-				return expr.Not
 			}
 		} else {
-			v := e.evalExpr(td, v, vals)
-			if compareValues(val, v) == 0 {
+			ev := e.evalExpr(td, v, vals)
+			if ev == nil {
+				hasNull = true
+				continue
+			}
+			if val != nil && compareValues(val, ev) == 0 {
 				return !expr.Not
 			}
 		}
+	}
+	// No match found.
+	// If val is NULL or any list element is NULL → result is NULL.
+	if hasNull {
+		return nil
 	}
 	return expr.Not
 }
@@ -2833,6 +5239,16 @@ func (e *Executor) evalExistsExpr(td *catalog.TableDef, expr *ExistsExpr, vals [
 }
 
 func (e *Executor) execSubqueryWithOuter(query *SelectStmt, outerTd *catalog.TableDef, outerVals []any, outerAlias string) (*SelectResult, error) {
+	// Handle subqueries with no FROM clause (e.g., SELECT 1).
+	if query.TableRef == nil {
+		row := make([]any, len(query.Fields))
+		for i, f := range query.Fields {
+			if f.Expr != nil {
+				row[i] = e.evalExprNoTable(f.Expr)
+			}
+		}
+		return &SelectResult{Rows: [][]any{row}, Columns: make([]string, len(query.Fields))}, nil
+	}
 	switch ref := query.TableRef.(type) {
 	case *SimpleTableRef:
 		txn := e.mgr.Begin()
@@ -2980,12 +5396,13 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 	treeKey := td.DataFile()
 
 	type aggState struct {
-		count     int64 // COUNT(*) — total rows
-		sum       float64
-		avgCount  int64 // non-null values for AVG
-		minVal    any
-		maxVal    any
-		hasData   bool
+		count       int64 // COUNT(*) — total rows
+		sum         float64
+		sumHasValue bool // true if any non-NULL value was added to SUM
+		avgCount    int64 // non-null values for AVG
+		minVal      any
+		maxVal      any
+		hasData     bool
 	}
 
 	agg := &aggState{}
@@ -3086,8 +5503,11 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 			row[i] = agg.count
 			colNames[i] = "count(1)"
 		case "SUM":
-			row[i] = agg.sum
-			colNames[i] = "sum"
+			if agg.sumHasValue {
+				row[i] = agg.sum
+			} else {
+				row[i] = nil
+			}
 		case "AVG":
 			if agg.avgCount > 0 {
 				row[i] = agg.sum / float64(agg.avgCount)
@@ -3241,25 +5661,40 @@ func (e *Executor) evalExprWithOuter(td *catalog.TableDef, vals []any, expr Expr
 }
 
 func (e *Executor) evalInExprWithOuter(td *catalog.TableDef, vals []any, expr *InExpr, outerTd *catalog.TableDef, outerVals []any, innerAlias, outerAlias string) bool {
+	// Handle empty IN list: IN () → false, NOT IN () → true.
+	if expr.Empty {
+		return expr.Not
+	}
 	val := e.evalExprWithOuter(td, vals, expr.Expr, outerTd, outerVals, innerAlias, outerAlias)
+	hasNull := val == nil
 	for _, v := range expr.Values {
 		if sq, ok := v.(*SubqueryExpr); ok {
 			result, err := e.execSubqueryWithOuter(sq.Query, outerTd, outerVals, outerAlias)
 			if err != nil || result == nil {
 				return expr.Not
 			}
+			if len(result.Columns) > 1 {
+				panic(evalError{fmt.Errorf("sub-select returns %d columns - expected 1", len(result.Columns))})
+			}
 			for _, row := range result.Rows {
 				if len(row) > 0 && compareValues(val, row[0]) == 0 {
 					return !expr.Not
 				}
 			}
-			return expr.Not
 		} else {
-			v := e.evalExprWithOuter(td, vals, v, outerTd, outerVals, innerAlias, outerAlias)
-			if compareValues(val, v) == 0 {
+			ev := e.evalExprWithOuter(td, vals, v, outerTd, outerVals, innerAlias, outerAlias)
+			if ev == nil {
+				hasNull = true
+				continue
+			}
+			if val != nil && compareValues(val, ev) == 0 {
 				return !expr.Not
 			}
 		}
+	}
+	// No match found.
+	if hasNull {
+		return false
 	}
 	return expr.Not
 }
@@ -3452,6 +5887,8 @@ func likeToRegex(pattern string) string {
 
 func (e *Executor) evalUnaryOp(op string, operand any) any {
 	switch op {
+	case "+":
+		return operand
 	case "-":
 		switch v := operand.(type) {
 		case int32:
@@ -3462,6 +5899,9 @@ func (e *Executor) evalUnaryOp(op string, operand any) any {
 			return -v
 		}
 	case "NOT":
+		if operand == nil {
+			return nil
+		}
 		return !toBool(operand)
 	}
 	return nil
@@ -3561,7 +6001,134 @@ func (e *Executor) evalFuncCall(td *catalog.TableDef, f *FuncCallExpr, vals []an
 	return nil
 }
 
-// extractPKRange tries to extract a PK range from a WHERE clause.
+func (e *Executor) evalCast(td *catalog.TableDef, c *CastExpr, vals []any) any {
+	val := e.evalExpr(td, c.Expr, vals)
+	return castValue(val, c.Type)
+}
+
+func evalCastNoTable(c *CastExpr) any {
+	// For no-table context, we can't use evalExpr. Handle simple literals.
+	return castValue(evalExprSimpleNoTable(c.Expr), c.Type)
+}
+
+// floatToIntIfWhole converts a float64 to int64 if it represents a whole number.
+// This ensures that SUM of integer columns produces int64 results, enabling
+// integer division semantics in subsequent arithmetic.
+func floatToIntIfWhole(f float64) any {
+	if f == float64(int64(f)) && !math.IsInf(f, 0) && !math.IsNaN(f) {
+		return int64(f)
+	}
+	return f
+}
+
+func castValue(val any, targetType string) any {
+	if val == nil {
+		return nil
+	}
+	tpUpper := strings.ToUpper(targetType)
+	// Common patterns: "SIGNED", "SIGNED INTEGER", "UNSIGNED", "DOUBLE", "FLOAT", "CHAR", "BINARY"
+	if strings.Contains(tpUpper, "SIGNED") || strings.Contains(tpUpper, "INT") {
+		switch v := val.(type) {
+		case int64:
+			return v
+		case int32:
+			return int64(v)
+		case int:
+			return int64(v)
+		case float64:
+			return int64(v)
+		case string:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				return n
+			}
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				return int64(f)
+			}
+		case bool:
+			if v {
+				return int64(1)
+			}
+			return int64(0)
+		}
+		return int64(0)
+	}
+	if strings.Contains(tpUpper, "UNSIGNED") {
+		switch v := val.(type) {
+		case int64:
+			if v >= 0 {
+				return v
+			}
+			return int64(0)
+		case float64:
+			if v >= 0 {
+				return int64(v)
+			}
+			return int64(0)
+		}
+		return int64(0)
+	}
+	if strings.Contains(tpUpper, "DOUBLE") || strings.Contains(tpUpper, "FLOAT") || strings.Contains(tpUpper, "REAL") {
+		switch v := val.(type) {
+		case float64:
+			return v
+		case int64:
+			return float64(v)
+		case int32:
+			return float64(v)
+		case int:
+			return float64(v)
+		case string:
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				return f
+			}
+		}
+		return float64(0)
+	}
+	// Default: return as-is for CHAR/VARCHAR/BINARY etc.
+	return val
+}
+
+// evalExprSimpleNoTable evaluates simple expressions without a table context.
+// Used by evalCastNoTable and similar functions where full evalExprNoTable isn't available.
+func evalExprSimpleNoTable(expr Expr) any {
+	switch ex := expr.(type) {
+	case *LiteralExpr:
+		return ex.Value
+	case *UnaryExpr:
+		operand := evalExprSimpleNoTable(ex.Operand)
+		return evalUnaryOpSimple(ex.Op, operand)
+	case *CastExpr:
+		return castValue(evalExprSimpleNoTable(ex.Expr), ex.Type)
+	case *FuncCallExpr:
+		return nil // Complex - would need full evalExprNoTable
+	case *BinaryExpr:
+		return nil
+	default:
+		return nil
+	}
+}
+
+func evalUnaryOpSimple(op string, operand any) any {
+	switch op {
+	case "-", "UMINUS":
+		switch v := operand.(type) {
+		case int64:
+			return -v
+		case float64:
+			return -v
+		case int:
+			return -v
+		}
+	case "+", "UPLUS":
+		return operand
+	case "NOT":
+		if b, ok := toBoolNil(operand); ok {
+			return !b
+		}
+		return nil
+	}
+	return nil
+}
 // Returns nil start/end if it can't optimize.
 // Supports equality conditions on consecutive PK columns, plus one
 // range condition (>=, >, <=, <, BETWEEN) on the next PK column.
@@ -3657,6 +6224,57 @@ func (e *Executor) evalFuncCallWithOuter(td *catalog.TableDef, f *FuncCallExpr, 
 		}
 	}
 	return nil
+}
+
+// exprContainsAgg returns true if the expression tree contains any AggregateFuncExpr.
+func exprContainsAgg(expr Expr) bool {
+	switch ex := expr.(type) {
+	case *AggregateFuncExpr:
+		return true
+	case *BinaryExpr:
+		return exprContainsAgg(ex.Left) || exprContainsAgg(ex.Right)
+	case *UnaryExpr:
+		return exprContainsAgg(ex.Operand)
+	case *CastExpr:
+		return exprContainsAgg(ex.Expr)
+	case *IsNullExpr:
+		return exprContainsAgg(ex.Expr)
+	case *BetweenExpr:
+		return exprContainsAgg(ex.Expr) || exprContainsAgg(ex.Low) || exprContainsAgg(ex.High)
+	case *InExpr:
+		if exprContainsAgg(ex.Expr) {
+			return true
+		}
+		for _, v := range ex.Values {
+			if exprContainsAgg(v) {
+				return true
+			}
+		}
+		return false
+	case *CaseExpr:
+		if ex.Value != nil && exprContainsAgg(ex.Value) {
+			return true
+		}
+		for _, w := range ex.Whens {
+			if exprContainsAgg(w.Cond) || exprContainsAgg(w.Result) {
+				return true
+			}
+		}
+		if ex.Else != nil && exprContainsAgg(ex.Else) {
+			return true
+		}
+		return false
+	case *FuncCallExpr:
+		for _, a := range ex.Args {
+			if exprContainsAgg(a) {
+				return true
+			}
+		}
+		return false
+	case *SubqueryExpr:
+		return false
+	}
+	return false
 }
 
 // exprContainsSubquery returns true if the expression tree contains a
@@ -4096,11 +6714,11 @@ func (e *Executor) lessThanWithTD(a, b []any, orderBy []OrderByClause, colIdx ma
 
 func colTypeFromString(s string) storage.ColumnType {
 	switch strings.ToUpper(s) {
-	case "INT":
+	case "INT", "INTEGER":
 		return storage.ColTypeInt
 	case "BIGINT":
 		return storage.ColTypeBigInt
-	case "VARCHAR":
+	case "VARCHAR", "TEXT", "CHAR", "CLOB":
 		return storage.ColTypeVarchar
 	case "DECIMAL":
 		return storage.ColTypeDecimal
@@ -4275,6 +6893,8 @@ func arithOp(a, b any, intFn func(int64, int64) int64, floatFn func(float64, flo
 			return intFn(int64(av), int64(bv))
 		case int64:
 			return intFn(int64(av), bv)
+		case float64:
+			return floatFn(float64(av), bv)
 		}
 	case int64:
 		switch bv := b.(type) {
@@ -4282,9 +6902,15 @@ func arithOp(a, b any, intFn func(int64, int64) int64, floatFn func(float64, flo
 			return intFn(av, int64(bv))
 		case int64:
 			return intFn(av, bv)
+		case float64:
+			return floatFn(float64(av), bv)
 		}
 	case float64:
 		switch bv := b.(type) {
+		case int32:
+			return floatFn(av, float64(bv))
+		case int64:
+			return floatFn(av, float64(bv))
 		case float64:
 			return floatFn(av, bv)
 		}
@@ -4317,6 +6943,8 @@ func exprToString(expr Expr) string {
 			args = append(args, exprToString(a))
 		}
 		return ex.Name + "(" + strings.Join(args, ",") + ")"
+	case *CastExpr:
+		return "CAST(" + exprToString(ex.Expr) + " AS " + ex.Type + ")"
 	default:
 		return "?"
 	}
@@ -4880,30 +7508,46 @@ func (e *Executor) evalExprMultiJoin(expr Expr, tables []flatTableEntry, joinedR
 		return nil
 	case *FuncCallExpr:
 		return e.evalFuncCallMultiJoin(tables, ex, joinedRow)
+	case *CastExpr:
+		v := e.evalExprMultiJoin(ex.Expr, tables, joinedRow)
+		return castValue(v, ex.Type)
 	default:
 		return nil
 	}
 }
 
 func (e *Executor) evalInExprMultiJoin(tables []flatTableEntry, expr *InExpr, joinedRow []any) bool {
+	if expr.Empty {
+		return expr.Not
+	}
 	val := e.evalExprMultiJoin(expr.Expr, tables, joinedRow)
+	hasNull := val == nil
 	for _, v := range expr.Values {
 		if sq, ok := v.(*SubqueryExpr); ok {
 			result := e.execSubquery(sq.Query)
 			if rs, ok := result.(*SelectResult); ok {
+				if len(rs.Columns) > 1 {
+					panic(evalError{fmt.Errorf("sub-select returns %d columns - expected 1", len(rs.Columns))})
+				}
 				for _, row := range rs.Rows {
 					if len(row) > 0 && compareValues(val, row[0]) == 0 {
 						return !expr.Not
 					}
 				}
-				return expr.Not
 			}
 		} else {
 			ev := e.evalExprMultiJoin(v, tables, joinedRow)
-			if compareValues(val, ev) == 0 {
+			if ev == nil {
+				hasNull = true
+				continue
+			}
+			if val != nil && compareValues(val, ev) == 0 {
 				return !expr.Not
 			}
 		}
+	}
+	if hasNull {
+		return false
 	}
 	return expr.Not
 }
@@ -5454,6 +8098,19 @@ func (e *Executor) execMultiTableJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableR
 	// Step 6: Project result columns.
 	resultRows, colNames := e.projectMultiJoinResult(s, tables, resultRows)
 
+	// Apply ORDER BY.
+	if len(s.OrderBy) > 0 {
+		e.sortRowsWithFields(resultRows, colNames, s.OrderBy, nil)
+	}
+	// Apply LIMIT.
+	if s.Limit != nil && *s.Limit < len(resultRows) {
+		resultRows = resultRows[:*s.Limit]
+	}
+	// Apply DISTINCT.
+	if s.Distinct {
+		resultRows = dedupRows(resultRows)
+	}
+
 	return &SelectResult{Columns: colNames, Rows: resultRows}, nil
 }
 
@@ -5619,15 +8276,27 @@ func (e *Executor) projectMultiJoinResult(s *SelectStmt, tables []flatTableEntry
 	if s.SelectAll {
 		// Return all non-hidden columns with qualified names.
 		colNames := make([]string, 0)
+		// Build list of column offsets to include.
+		var includeIdx []int
 		for _, entry := range tables {
-			for _, col := range entry.td.Columns {
+			for i, col := range entry.td.Columns {
 				if col.Hidden {
 					continue
 				}
 				colNames = append(colNames, entry.alias+"."+col.Name)
+				includeIdx = append(includeIdx, entry.colOffset+i)
 			}
 		}
-		return rows, colNames
+		// Project rows to only include non-hidden columns.
+		projected := make([][]any, len(rows))
+		for i, row := range rows {
+			prow := make([]any, len(includeIdx))
+			for j, idx := range includeIdx {
+				prow[j] = row[idx]
+			}
+			projected[i] = prow
+		}
+		return projected, colNames
 	}
 
 	// Build projection descriptors from Fields.
@@ -5641,8 +8310,8 @@ func (e *Executor) projectMultiJoinResult(s *SelectStmt, tables []flatTableEntry
 	if len(s.Fields) > 0 {
 		for _, f := range s.Fields {
 			if f.Column != "" {
-				// Simple column reference.
-				idx, err := resolveColumnOffset(&ColumnRefExpr{Name: f.Column}, tables)
+				// Simple column reference — use table qualifier if present.
+				idx, err := resolveColumnOffset(&ColumnRefExpr{Name: f.Column, Table: f.Table}, tables)
 				name := f.Column
 				if f.Alias != "" {
 					name = f.Alias
