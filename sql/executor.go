@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"regexp"
@@ -27,11 +28,64 @@ type (
 		Rows       [][]any
 		TableAlias string
 	}
+	RowIterator interface {
+		Columns() []string
+		Next() ([]any, error)
+		Close() error
+	}
 	OKResult struct {
 		AffectedRows int
 		InsertID     int64
 	}
 )
+
+type streamRowIterator struct {
+	columns []string
+	rows    <-chan []any
+	errc    <-chan error
+	cancel  context.CancelFunc
+	done    <-chan struct{}
+	closed  bool
+	err     error
+}
+
+func (it *streamRowIterator) Columns() []string {
+	return it.columns
+}
+
+func (it *streamRowIterator) Next() ([]any, error) {
+	if it.err != nil {
+		return nil, it.err
+	}
+	row, ok := <-it.rows
+	if ok {
+		return row, nil
+	}
+	if it.errc != nil {
+		it.err = <-it.errc
+	}
+	return nil, it.err
+}
+
+func (it *streamRowIterator) Close() error {
+	if it.closed {
+		return it.err
+	}
+	it.closed = true
+	if it.cancel != nil {
+		it.cancel()
+	}
+	if it.done != nil {
+		<-it.done
+	}
+	if it.err == nil && it.errc != nil {
+		select {
+		case it.err = <-it.errc:
+		default:
+		}
+	}
+	return it.err
+}
 
 // Executor executes SQL statements against the storage engine.
 type Executor struct {
@@ -65,14 +119,7 @@ func (e *Executor) Database() string {
 
 // Execute parses and executes a SQL statement.
 func (e *Executor) Execute(sql string) (any, error) {
-	// Pre-process: replace empty IN () with always-false, NOT IN () with always-true.
-	sql = rewriteEmptyInLists(sql)
-	// Pre-process: handle SQLite-style DROP INDEX (without ON table clause).
-	sql = rewriteDropIndex(sql)
-	// Pre-process: rewrite CAST(... AS INTEGER) to CAST(... AS SIGNED) for TiDB parser.
-	sql = rewriteCastInteger(sql)
-	// Pre-process: remove space between function name and ( for TiDB parser.
-	sql = rewriteFuncSpaces(sql)
+	sql = normalizeSQL(sql)
 
 	parseStart := time.Now()
 	p := NewParser()
@@ -86,6 +133,76 @@ func (e *Executor) Execute(sql string) (any, error) {
 	result, err := e.executeStmt(stmt)
 	metrics.ExecuteDuration.WithLabelValues(stmtLabel(stmt)).Observe(time.Since(execStart).Seconds())
 	return result, err
+}
+
+// ExecuteStream returns a pull-based iterator for simple SELECT statements.
+// The boolean return is false when the statement should use Execute instead.
+func (e *Executor) ExecuteStream(sql string) (RowIterator, bool, error) {
+	sql = normalizeSQL(sql)
+
+	p := NewParser()
+	stmt, err := p.Parse(sql)
+	if err != nil {
+		return nil, false, err
+	}
+	s, ok := stmt.(*SelectStmt)
+	if !ok {
+		return nil, false, nil
+	}
+
+	switch ref := s.TableRef.(type) {
+	case *SimpleTableRef:
+		if !e.canStreamSimpleSelect(s, ref) {
+			return nil, false, nil
+		}
+		if e.dbName == "" {
+			return nil, false, fmt.Errorf("no database selected")
+		}
+		if e.txn != nil {
+			iter, err := e.execSelectSimpleStream(e.txn, s, ref, nil)
+			return iter, err == nil, err
+		}
+		t := e.mgr.Begin()
+		cleanup := func() {
+			t.Rollback()
+		}
+		iter, err := e.execSelectSimpleStream(t, s, ref, cleanup)
+		if err != nil {
+			t.Rollback()
+			return nil, false, err
+		}
+		return iter, true, nil
+	case *JoinTableRef:
+		if !e.canStreamJoinSelect(s, ref) {
+			return nil, false, nil
+		}
+		if e.dbName == "" {
+			return nil, false, fmt.Errorf("no database selected")
+		}
+		if e.txn != nil {
+			iter, err := e.execSelectJoinStream(e.txn, s, ref, nil)
+			return iter, err == nil, err
+		}
+		t := e.mgr.Begin()
+		cleanup := func() {
+			t.Rollback()
+		}
+		iter, err := e.execSelectJoinStream(t, s, ref, cleanup)
+		if err != nil {
+			t.Rollback()
+			return nil, false, err
+		}
+		return iter, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func normalizeSQL(sql string) string {
+	sql = rewriteEmptyInLists(sql)
+	sql = rewriteDropIndex(sql)
+	sql = rewriteCastInteger(sql)
+	return rewriteFuncSpaces(sql)
 }
 
 // rewriteEmptyInLists replaces "IN ()" and "NOT IN ()" with equivalent expressions
@@ -843,9 +960,9 @@ func (e *Executor) execShowIndex(s *ShowIndexStmt) (any, error) {
 			int32(seq + 1),
 			col.Name,
 			"A",
-			int64(0),   // Cardinality (unknown)
-			nil,         // Sub_part
-			nil,         // Packed
+			int64(0), // Cardinality (unknown)
+			nil,      // Sub_part
+			nil,      // Packed
 			nullStr,
 			"BTREE",
 			"",
@@ -1654,10 +1771,10 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 
 	// Build unified projection descriptors from Fields.
 	type outputField struct {
-		colIdx    int    // column index in td, -1 for expression
-		colName   string // output column name
-		expr      Expr   // non-nil for expression fields
-		isExpr    bool
+		colIdx  int    // column index in td, -1 for expression
+		colName string // output column name
+		expr    Expr   // non-nil for expression fields
+		isExpr  bool
 	}
 	var outFields []outputField
 	var colIndices []int // for backward compat with opt paths
@@ -1876,6 +1993,488 @@ func (e *Executor) execSelectSimple(t *txn.Txn, s *SelectStmt, ref *SimpleTableR
 	metrics.SelectPostProcessDuration.Observe(time.Since(t3).Seconds())
 
 	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: tableName}, nil
+}
+
+type streamOutputField struct {
+	colIdx int
+	expr   Expr
+	isExpr bool
+}
+
+type streamJoinOutputField struct {
+	colIdx int
+	expr   Expr
+	isExpr bool
+	name   string
+}
+
+func (e *Executor) canStreamSimpleSelect(s *SelectStmt, ref *SimpleTableRef) bool {
+	if ref == nil || s.TableRef == nil {
+		return false
+	}
+	if _, err := e.cat.GetView(e.dbName, ref.Table); err == nil {
+		return false
+	}
+	if s.Distinct || len(s.GroupBy) > 0 || len(s.OrderBy) > 0 {
+		return false
+	}
+	if s.Where != nil && exprContainsSubquery(s.Where) {
+		return false
+	}
+	for _, f := range s.Fields {
+		if f.Expr != nil && (exprContainsAgg(f.Expr) || exprContainsSubquery(f.Expr)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Executor) canStreamJoinSelect(s *SelectStmt, ref *JoinTableRef) bool {
+	if ref == nil || s.TableRef == nil {
+		return false
+	}
+	if !e.canStreamJoinTables(ref) {
+		return false
+	}
+	if s.Distinct || len(s.GroupBy) > 0 || len(s.OrderBy) > 0 {
+		return false
+	}
+	if s.Where != nil && exprContainsSubquery(s.Where) {
+		return false
+	}
+	if ref.On != nil && exprContainsSubquery(ref.On) {
+		return false
+	}
+	for _, f := range s.Fields {
+		if f.Expr != nil && (exprContainsAgg(f.Expr) || exprContainsSubquery(f.Expr)) {
+			return false
+		}
+	}
+	for _, expr := range s.SelectExprs {
+		if exprContainsAgg(expr) || exprContainsSubquery(expr) {
+			return false
+		}
+	}
+	if isAllCrossJoin(ref) {
+		return true
+	}
+	return isTwoTableJoin(ref)
+}
+
+func (e *Executor) canStreamJoinTables(ref TableRef) bool {
+	switch r := ref.(type) {
+	case *SimpleTableRef:
+		if _, err := e.cat.GetView(e.dbName, r.Table); err == nil {
+			return false
+		}
+		_, err := e.cat.GetTable(e.dbName, r.Table)
+		return err == nil
+	case *JoinTableRef:
+		return e.canStreamJoinTables(r.Left) && e.canStreamJoinTables(r.Right)
+	default:
+		return false
+	}
+}
+
+func isTwoTableJoin(ref *JoinTableRef) bool {
+	if ref == nil {
+		return false
+	}
+	_, leftOK := ref.Left.(*SimpleTableRef)
+	_, rightOK := ref.Right.(*SimpleTableRef)
+	return leftOK && rightOK
+}
+
+func (e *Executor) execSelectSimpleStream(t *txn.Txn, s *SelectStmt, ref *SimpleTableRef, cleanup func()) (RowIterator, error) {
+	td, err := e.cat.GetTable(e.dbName, ref.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	treeKey := td.DataFile()
+	colNames, outFields, err := e.resolveStreamOutputFields(td, s)
+	if err != nil {
+		return nil, err
+	}
+
+	start, end := []byte{0x00}, []byte{0xFF}
+	if s.Where != nil {
+		start, end = e.extractPKRange(td, s.Where)
+		if start == nil {
+			start = []byte{0x00}
+			end = []byte{0xFF}
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rows := make(chan []any, 32)
+	errc := make(chan error, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		defer close(rows)
+		defer func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				if ee, ok := r.(evalError); ok {
+					errc <- ee.err
+				} else {
+					errc <- fmt.Errorf("stream execution panic: %v", r)
+				}
+			}
+			close(errc)
+		}()
+
+		limit := -1
+		if s.Limit != nil {
+			limit = *s.Limit
+		}
+		emitted := 0
+		pkCols := td.PrimaryKeyColumns()
+		t.Scan(treeKey, pkCols, start, end, func(pk, rowData []byte) bool {
+			if limit >= 0 && emitted >= limit {
+				return false
+			}
+			vals, _ := storage.DecodeRow(rowData, td.Columns)
+			if s.Where != nil && !e.evalWhere(td, s.Where, vals) {
+				return true
+			}
+			row := make([]any, len(outFields))
+			for i, of := range outFields {
+				if of.isExpr {
+					row[i] = e.evalExpr(td, of.expr, vals)
+				} else {
+					row[i] = vals[of.colIdx]
+				}
+			}
+			select {
+			case rows <- row:
+				emitted++
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		})
+		errc <- nil
+	}()
+
+	return &streamRowIterator{
+		columns: colNames,
+		rows:    rows,
+		errc:    errc,
+		cancel:  cancel,
+		done:    done,
+	}, nil
+}
+
+func (e *Executor) resolveStreamOutputFields(td *catalog.TableDef, s *SelectStmt) ([]string, []streamOutputField, error) {
+	var colNames []string
+	var outFields []streamOutputField
+
+	if s.SelectAll {
+		for i, col := range td.Columns {
+			if col.Hidden {
+				continue
+			}
+			colNames = append(colNames, col.Name)
+			outFields = append(outFields, streamOutputField{colIdx: i})
+		}
+		return colNames, outFields, nil
+	}
+
+	if len(s.Fields) > 0 {
+		for _, f := range s.Fields {
+			if f.Column != "" {
+				idx := td.ColumnIndex(f.Column)
+				if idx < 0 {
+					return nil, nil, fmt.Errorf("unknown column %q", f.Column)
+				}
+				name := f.Column
+				if f.Alias != "" {
+					name = f.Alias
+				}
+				colNames = append(colNames, name)
+				outFields = append(outFields, streamOutputField{colIdx: idx})
+			} else if f.Expr != nil {
+				name := f.Alias
+				if name == "" {
+					name = exprToString(f.Expr)
+				}
+				colNames = append(colNames, name)
+				outFields = append(outFields, streamOutputField{colIdx: -1, expr: f.Expr, isExpr: true})
+			}
+		}
+		return colNames, outFields, nil
+	}
+
+	for _, name := range s.Columns {
+		idx := td.ColumnIndex(name)
+		if idx < 0 {
+			return nil, nil, fmt.Errorf("unknown column %q", name)
+		}
+		colNames = append(colNames, name)
+		outFields = append(outFields, streamOutputField{colIdx: idx})
+	}
+	return colNames, outFields, nil
+}
+
+func (e *Executor) execSelectJoinStream(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, cleanup func()) (RowIterator, error) {
+	tables, err := e.flattenJoinTree(ref)
+	if err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		return nil, fmt.Errorf("no tables in join")
+	}
+	colNames, outFields, err := e.resolveStreamJoinOutputFields(tables, s)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rows := make(chan []any, 32)
+	errc := make(chan error, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		defer close(rows)
+		defer func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				if ee, ok := r.(evalError); ok {
+					errc <- ee.err
+				} else {
+					errc <- fmt.Errorf("stream join execution panic: %v", r)
+				}
+			}
+			close(errc)
+		}()
+
+		emitLimit := -1
+		if s.Limit != nil {
+			emitLimit = *s.Limit
+		}
+		emitted := 0
+		emit := func(joined []any) bool {
+			if emitLimit >= 0 && emitted >= emitLimit {
+				return false
+			}
+			row := projectStreamJoinRow(e, tables, joined, outFields)
+			select {
+			case rows <- row:
+				emitted++
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
+		if isAllCrossJoin(ref) {
+			e.streamCrossJoinRows(ctx, t, tables, tables, s.Where, nil, emit)
+		} else {
+			e.streamTwoTableJoinRows(ctx, t, s, ref, tables, emit)
+		}
+		errc <- nil
+	}()
+
+	return &streamRowIterator{
+		columns: colNames,
+		rows:    rows,
+		errc:    errc,
+		cancel:  cancel,
+		done:    done,
+	}, nil
+}
+
+func (e *Executor) streamCrossJoinRows(ctx context.Context, t *txn.Txn, allTables, remaining []flatTableEntry, where Expr, prefix []any, emit func([]any) bool) bool {
+	if len(remaining) == 0 {
+		if where != nil && !e.evalWhereMultiJoin(where, allTables, prefix) {
+			return true
+		}
+		return emit(prefix)
+	}
+
+	entry := remaining[0]
+	return e.scanStreamTable(ctx, t, entry, nil, func(row []any) bool {
+		joined := make([]any, 0, len(prefix)+len(row))
+		joined = append(joined, prefix...)
+		joined = append(joined, row...)
+		return e.streamCrossJoinRows(ctx, t, allTables, remaining[1:], where, joined, emit)
+	})
+}
+
+func (e *Executor) streamTwoTableJoinRows(ctx context.Context, t *txn.Txn, s *SelectStmt, ref *JoinTableRef, tables []flatTableEntry, emit func([]any) bool) bool {
+	left := tables[0]
+	right := tables[1]
+	leftNullRow := make([]any, left.colCount)
+	rightNullRow := make([]any, right.colCount)
+
+	if ref.Type == JoinTypeRight {
+		return e.scanStreamTable(ctx, t, right, nil, func(rightRow []any) bool {
+			matched := false
+			keepGoing := e.scanStreamTable(ctx, t, left, nil, func(leftRow []any) bool {
+				joined := append(append([]any{}, leftRow...), rightRow...)
+				if !e.evalTwoTableJoinOn(ref, tables, joined) {
+					return true
+				}
+				matched = true
+				if s.Where != nil && !e.evalWhereMultiJoin(s.Where, tables, joined) {
+					return true
+				}
+				return emit(joined)
+			})
+			if !keepGoing {
+				return false
+			}
+			if !matched {
+				joined := append(append([]any{}, leftNullRow...), rightRow...)
+				if s.Where == nil || e.evalWhereMultiJoin(s.Where, tables, joined) {
+					return emit(joined)
+				}
+			}
+			return true
+		})
+	}
+
+	isLeftJoin := ref.Type == JoinTypeLeft
+	return e.scanStreamTable(ctx, t, left, nil, func(leftRow []any) bool {
+		matched := false
+		keepGoing := e.scanStreamTable(ctx, t, right, nil, func(rightRow []any) bool {
+			joined := append(append([]any{}, leftRow...), rightRow...)
+			if !e.evalTwoTableJoinOn(ref, tables, joined) {
+				return true
+			}
+			matched = true
+			if s.Where != nil && !e.evalWhereMultiJoin(s.Where, tables, joined) {
+				return true
+			}
+			return emit(joined)
+		})
+		if !keepGoing {
+			return false
+		}
+		if !matched && isLeftJoin {
+			joined := append(append([]any{}, leftRow...), rightNullRow...)
+			if s.Where == nil || e.evalWhereMultiJoin(s.Where, tables, joined) {
+				return emit(joined)
+			}
+		}
+		return true
+	})
+}
+
+func (e *Executor) evalTwoTableJoinOn(ref *JoinTableRef, tables []flatTableEntry, joined []any) bool {
+	if ref.On != nil && !e.evalWhereMultiJoin(ref.On, tables, joined) {
+		return false
+	}
+	return true
+}
+
+func (e *Executor) scanStreamTable(ctx context.Context, t *txn.Txn, entry flatTableEntry, where Expr, fn func([]any) bool) bool {
+	treeKey := entry.td.DataFile()
+	pkCols := entry.td.PrimaryKeyColumns()
+	keepGoing := true
+	t.Scan(treeKey, pkCols, []byte{0x00}, []byte{0xFF}, func(pk, rowData []byte) bool {
+		select {
+		case <-ctx.Done():
+			keepGoing = false
+			return false
+		default:
+		}
+		vals, _ := storage.DecodeRow(rowData, entry.td.Columns)
+		if where != nil && !e.evalWhere(entry.td, where, vals) {
+			return true
+		}
+		keepGoing = fn(vals)
+		return keepGoing
+	})
+	return keepGoing
+}
+
+func (e *Executor) resolveStreamJoinOutputFields(tables []flatTableEntry, s *SelectStmt) ([]string, []streamJoinOutputField, error) {
+	var fields []streamJoinOutputField
+
+	if s.SelectAll {
+		for _, entry := range tables {
+			for i, col := range entry.td.Columns {
+				if col.Hidden {
+					continue
+				}
+				fields = append(fields, streamJoinOutputField{
+					colIdx: entry.colOffset + i,
+					name:   entry.alias + "." + col.Name,
+				})
+			}
+		}
+		return streamJoinColumnNames(fields), fields, nil
+	}
+
+	if len(s.Fields) > 0 {
+		for _, f := range s.Fields {
+			if f.Column != "" {
+				idx, err := resolveColumnOffset(&ColumnRefExpr{Name: f.Column, Table: f.Table}, tables)
+				if err != nil {
+					return nil, nil, err
+				}
+				name := f.Column
+				if f.Alias != "" {
+					name = f.Alias
+				}
+				fields = append(fields, streamJoinOutputField{colIdx: idx, name: name})
+			} else if f.Expr != nil {
+				name := f.Alias
+				if name == "" {
+					name = exprToString(f.Expr)
+				}
+				fields = append(fields, streamJoinOutputField{colIdx: -1, expr: f.Expr, isExpr: true, name: name})
+			}
+		}
+		return streamJoinColumnNames(fields), fields, nil
+	}
+
+	for _, expr := range s.SelectExprs {
+		if col, ok := expr.(*ColumnRefExpr); ok {
+			idx, err := resolveColumnOffset(col, tables)
+			if err != nil {
+				return nil, nil, err
+			}
+			fields = append(fields, streamJoinOutputField{colIdx: idx, name: col.Name})
+		} else {
+			name := exprToString(expr)
+			fields = append(fields, streamJoinOutputField{colIdx: -1, expr: expr, isExpr: true, name: name})
+		}
+	}
+	return streamJoinColumnNames(fields), fields, nil
+}
+
+func streamJoinColumnNames(fields []streamJoinOutputField) []string {
+	names := make([]string, len(fields))
+	for i, f := range fields {
+		names[i] = f.name
+	}
+	return names
+}
+
+func projectStreamJoinRow(e *Executor, tables []flatTableEntry, joined []any, fields []streamJoinOutputField) []any {
+	row := make([]any, len(fields))
+	for i, f := range fields {
+		if f.isExpr {
+			row[i] = e.evalExprMultiJoin(f.expr, tables, joined)
+		} else if f.colIdx >= 0 && f.colIdx < len(joined) {
+			row[i] = joined[f.colIdx]
+		}
+	}
+	return row
 }
 
 // tryINOnPK checks if the WHERE clause is a simple col IN (v1, v2, ...) on a
@@ -2206,7 +2805,7 @@ func (e *Executor) execSelectAggregate(t *txn.Txn, s *SelectStmt, ref *SimpleTab
 	type aggState struct {
 		count       int64 // COUNT(*) — total rows
 		sum         float64
-		sumHasValue bool // true if any non-NULL value was added to SUM
+		sumHasValue bool  // true if any non-NULL value was added to SUM
 		avgCount    int64 // non-null values for AVG
 		minVal      any
 		maxVal      any
@@ -2353,8 +2952,8 @@ func (e *Executor) execSelectAggregateExpr(t *txn.Txn, s *SelectStmt, ref *Simpl
 
 	// 1. Collect all unique AggregateFuncExpr nodes from result expressions.
 	type aggKey struct {
-		name string
-		args string // serialized args for identity
+		name     string
+		args     string // serialized args for identity
 		distinct bool
 	}
 	type aggState struct {
@@ -2697,8 +3296,8 @@ func (e *Executor) execSelectGroupBy(t *txn.Txn, s *SelectStmt, ref *SimpleTable
 	// Build column names and output projection.
 	var colNames []string
 	type outCol struct {
-		colIdx int    // index in td.Columns, -1 for expr
-		expr   Expr   // for expression fields
+		colIdx int  // index in td.Columns, -1 for expr
+		expr   Expr // for expression fields
 		name   string
 	}
 	var outCols []outCol
@@ -3027,6 +3626,7 @@ func (e *Executor) evalExprWithAggAndRow(td *catalog.TableDef, expr Expr, aggVal
 		return nil
 	}
 }
+
 // results from the provided map.
 func (e *Executor) evalExprWithAgg(td *catalog.TableDef, expr Expr, aggValues map[*AggregateFuncExpr]any) any {
 	switch ex := expr.(type) {
@@ -3105,13 +3705,19 @@ func (e *Executor) evalFuncCallValues(name string, args []any) any {
 		if len(args) == 1 {
 			switch n := args[0].(type) {
 			case int32:
-				if n < 0 { return -n }
+				if n < 0 {
+					return -n
+				}
 				return n
 			case int64:
-				if n < 0 { return -n }
+				if n < 0 {
+					return -n
+				}
 				return n
 			case float64:
-				if n < 0 { return -n }
+				if n < 0 {
+					return -n
+				}
 				return n
 			}
 		}
@@ -3998,11 +4604,11 @@ func (e *Executor) execSelectJoinLegacy(t *txn.Txn, s *SelectStmt, ref *JoinTabl
 		for ri, rightRow := range rightRows {
 			matched := false
 			for li, leftRow := range leftRows {
-				if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
+				if e.evalJoinCondition(leftTd, rightTd, leftAlias, rightAlias, leftRow, rightRow, ref.On) {
 					matched = true
 					rightMatched[ri] = true
 					joined := append(append([]any{}, leftRow...), rightRow...)
-					if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
+					if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, effectiveWhere) {
 						rows = append(rows, joined)
 					}
 					_ = li
@@ -4010,7 +4616,7 @@ func (e *Executor) execSelectJoinLegacy(t *txn.Txn, s *SelectStmt, ref *JoinTabl
 			}
 			if !matched {
 				joined := append(append([]any{}, leftNullRow...), rightRow...)
-				if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
+				if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, effectiveWhere) {
 					rows = append(rows, joined)
 				}
 			}
@@ -4021,32 +4627,29 @@ func (e *Executor) execSelectJoinLegacy(t *txn.Txn, s *SelectStmt, ref *JoinTabl
 		for _, leftRow := range leftRows {
 			matched := false
 			for _, rightRow := range rightRows {
-				if e.evalJoinCondition(leftTd, rightTd, leftRow, rightRow, ref.On) {
+				if e.evalJoinCondition(leftTd, rightTd, leftAlias, rightAlias, leftRow, rightRow, ref.On) {
 					matched = true
 					joined := append(append([]any{}, leftRow...), rightRow...)
-					if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
+					if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, effectiveWhere) {
 						rows = append(rows, joined)
 					}
 				}
 			}
 			if !matched && isLeftJoin {
 				joined := append(append([]any{}, leftRow...), rightNullRow...)
-				if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, effectiveWhere) {
+				if effectiveWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, effectiveWhere) {
 					rows = append(rows, joined)
 				}
 			}
 		}
 	}
 
-	colNames := make([]string, 0, len(leftTd.Columns)+len(rightTd.Columns))
-	for _, col := range leftTd.Columns {
-		colNames = append(colNames, leftAlias+"."+col.Name)
+	entries, err := e.flattenJoinTree(ref)
+	if err != nil {
+		return nil, err
 	}
-	for _, col := range rightTd.Columns {
-		colNames = append(colNames, rightAlias+"."+col.Name)
-	}
-
-	return &SelectResult{Columns: colNames, Rows: rows, TableAlias: leftAlias + " join " + rightAlias}, nil
+	projectedRows, colNames := e.projectMultiJoinResult(s, entries, rows)
+	return &SelectResult{Columns: colNames, Rows: projectedRows, TableAlias: leftAlias + " join " + rightAlias}, nil
 }
 
 func (e *Executor) collectRows(t *txn.Txn, ref TableRef) ([][]any, error) {
@@ -4079,7 +4682,7 @@ func (e *Executor) collectRows(t *txn.Txn, ref TableRef) ([][]any, error) {
 		rightTd, _ := e.getTableDef(r.Right)
 		for _, lr := range leftRows {
 			for _, rr := range rightRows {
-				if e.evalJoinCondition(leftTd, rightTd, lr, rr, r.On) {
+				if e.evalJoinCondition(leftTd, rightTd, e.getTableAlias(r.Left), e.getTableAlias(r.Right), lr, rr, r.On) {
 					joined := append(append([]any{}, lr...), rr...)
 					allRows = append(allRows, joined)
 				}
@@ -4113,71 +4716,29 @@ func (e *Executor) getTableAlias(ref TableRef) string {
 	return ""
 }
 
-func (e *Executor) evalJoinCondition(leftTd, rightTd *catalog.TableDef, leftRow, rightRow []any, on Expr) bool {
+func (e *Executor) evalJoinCondition(leftTd, rightTd *catalog.TableDef, leftAlias, rightAlias string, leftRow, rightRow []any, on Expr) bool {
 	if on == nil {
 		return true
 	}
-	leftVals := leftRow
-	rightVals := rightRow
-	return e.evalBinaryExprForJoin(on, leftTd, leftVals, rightTd, rightVals)
+	joined := append(append([]any{}, leftRow...), rightRow...)
+	return e.evalWhereMultiJoin(on, twoTableJoinEntries(leftTd, rightTd, leftAlias, rightAlias), joined)
 }
 
-func (e *Executor) evalBinaryExprForJoin(expr Expr, leftTd *catalog.TableDef, leftVals []any, rightTd *catalog.TableDef, rightVals []any) bool {
-	if bin, ok := expr.(*BinaryExpr); ok {
-		if bin.Op == "AND" {
-			return e.evalBinaryExprForJoin(bin.Left, leftTd, leftVals, rightTd, rightVals) &&
-				e.evalBinaryExprForJoin(bin.Right, leftTd, leftVals, rightTd, rightVals)
-		}
-		lv := e.evalColumnRef(bin.Left, leftTd, leftVals, rightTd, rightVals)
-		rv := e.evalColumnRef(bin.Right, leftTd, leftVals, rightTd, rightVals)
-		cmp := compareValues(lv, rv)
-		switch bin.Op {
-		case "=":
-			return cmp == 0
-		case "!=":
-			return cmp != 0
-		case "<":
-			return cmp < 0
-		case "<=":
-			return cmp <= 0
-		case ">":
-			return cmp > 0
-		case ">=":
-			return cmp >= 0
-		}
+func (e *Executor) evalJoinWhere(leftTd, rightTd *catalog.TableDef, leftAlias, rightAlias string, joinedRow []any, where Expr) bool {
+	return e.evalWhereMultiJoin(where, twoTableJoinEntries(leftTd, rightTd, leftAlias, rightAlias), joinedRow)
+}
+
+func twoTableJoinEntries(leftTd, rightTd *catalog.TableDef, leftAlias, rightAlias string) []flatTableEntry {
+	if leftAlias == "" {
+		leftAlias = leftTd.Name
 	}
-	return true
-}
-
-func (e *Executor) evalColumnRef(expr Expr, leftTd *catalog.TableDef, leftVals []any, rightTd *catalog.TableDef, rightVals []any) any {
-	switch ex := expr.(type) {
-	case *ColumnRefExpr:
-		if ex.Table != "" && ex.Table != leftTd.Name {
-			idx := rightTd.ColumnIndex(ex.Name)
-			if idx >= 0 {
-				return rightVals[idx]
-			}
-			return nil
-		}
-		idx := leftTd.ColumnIndex(ex.Name)
-		if idx >= 0 {
-			return leftVals[idx]
-		}
-		idx = rightTd.ColumnIndex(ex.Name)
-		if idx >= 0 {
-			return rightVals[idx]
-		}
-	case *LiteralExpr:
-		return ex.Value
+	if rightAlias == "" {
+		rightAlias = rightTd.Name
 	}
-	return nil
-}
-
-func (e *Executor) evalJoinWhere(leftTd, rightTd *catalog.TableDef, joinedRow []any, where Expr) bool {
-	leftLen := len(leftTd.Columns)
-	leftVals := joinedRow[:leftLen]
-	rightVals := joinedRow[leftLen:]
-	return e.evalBinaryExprForJoin(where, leftTd, leftVals, rightTd, rightVals)
+	return []flatTableEntry{
+		{tableName: leftTd.Name, alias: leftAlias, td: leftTd, colOffset: 0},
+		{tableName: rightTd.Name, alias: rightAlias, td: rightTd, colOffset: len(leftTd.Columns)},
+	}
 }
 
 func (e *Executor) execUpdate(t *txn.Txn, s *UpdateStmt) (any, error) {
@@ -5143,13 +5704,19 @@ func (e *Executor) evalFuncCallNoTable(f *FuncCallExpr) any {
 			v := e.evalExprNoTable(f.Args[0])
 			switch n := v.(type) {
 			case int32:
-				if n < 0 { return -n }
+				if n < 0 {
+					return -n
+				}
 				return n
 			case int64:
-				if n < 0 { return -n }
+				if n < 0 {
+					return -n
+				}
 				return n
 			case float64:
-				if n < 0 { return -n }
+				if n < 0 {
+					return -n
+				}
 				return n
 			}
 		}
@@ -5310,7 +5877,7 @@ func (e *Executor) execSelectSimpleWithOuter(t *txn.Txn, s *SelectStmt, ref *Sim
 	treeKey := td.DataFile()
 
 	type outputField struct {
-		colIdx int
+		colIdx  int
 		colName string
 		expr    Expr
 		isExpr  bool
@@ -5398,7 +5965,7 @@ func (e *Executor) execSelectAggregateWithOuter(t *txn.Txn, s *SelectStmt, ref *
 	type aggState struct {
 		count       int64 // COUNT(*) — total rows
 		sum         float64
-		sumHasValue bool // true if any non-NULL value was added to SUM
+		sumHasValue bool  // true if any non-NULL value was added to SUM
 		avgCount    int64 // non-null values for AVG
 		minVal      any
 		maxVal      any
@@ -6129,6 +6696,7 @@ func evalUnaryOpSimple(op string, operand any) any {
 	}
 	return nil
 }
+
 // Returns nil start/end if it can't optimize.
 // Supports equality conditions on consecutive PK columns, plus one
 // range condition (>=, >, <=, <, BETWEEN) on the next PK column.
@@ -6386,8 +6954,8 @@ func (e *Executor) extractPKRange(td *catalog.TableDef, where Expr) ([]byte, []b
 
 // rangeBounds holds collected lower/upper bounds for a single column.
 type rangeBounds struct {
-	lowVal, highVal any
-	hasLow, hasHigh  bool
+	lowVal, highVal   any
+	hasLow, hasHigh   bool
 	lowIncl, highIncl bool
 }
 
@@ -6954,12 +7522,12 @@ func exprToString(expr Expr) string {
 
 // AccessPath represents a possible data access strategy.
 type AccessPath struct {
-	Type        string  // "full_scan", "pk_range", "pk_point", "index_scan", "index_covering"
-	IndexName   string  // name of index used (empty for full_scan)
-	MatchCols   int     // number of matched equality columns
-	EstRows     int64   // estimated output rows
-	EstCost     float64 // estimated cost
-	IsCovering  bool    // true if covering index scan
+	Type       string  // "full_scan", "pk_range", "pk_point", "index_scan", "index_covering"
+	IndexName  string  // name of index used (empty for full_scan)
+	MatchCols  int     // number of matched equality columns
+	EstRows    int64   // estimated output rows
+	EstCost    float64 // estimated cost
+	IsCovering bool    // true if covering index scan
 }
 
 // defaultSelectivity returns heuristic selectivity for an operator.
@@ -7131,12 +7699,12 @@ func estimateWHERECardinality(td *catalog.TableDef, where Expr, totalRows int64)
 
 // Cost model constants
 const (
-	costSeqIO       = 1.0  // cost of a sequential I/O (read one page)
-	costRandIO      = 4.0  // cost of a random I/O (seek + read)
-	costCPURow      = 0.01 // cost of evaluating WHERE on one row
+	costSeqIO       = 1.0   // cost of a sequential I/O (read one page)
+	costRandIO      = 4.0   // cost of a random I/O (seek + read)
+	costCPURow      = 0.01  // cost of evaluating WHERE on one row
 	costCPUIndexRow = 0.005 // cost per index entry scan
-	costTableLookup = 5.0  // cost of one table lookup from index (random I/O + decode)
-	rowsPerPage     = 100  // estimated rows per data page
+	costTableLookup = 5.0   // cost of one table lookup from index (random I/O + decode)
+	rowsPerPage     = 100   // estimated rows per data page
 )
 
 // estimateAccessPaths enumerates possible access paths for a single-table query.
@@ -7332,22 +7900,22 @@ type joinEquiKey struct {
 
 // joinPlan holds the optimizer's decisions for executing a join.
 type joinPlan struct {
-	method      string // "hash_join" | "nested_loop"
-	buildSide   TableRef
-	probeSide   TableRef
-	buildTd     *catalog.TableDef
-	probeTd     *catalog.TableDef
-	buildAlias  string
-	probeAlias  string
-	equiKeys    []joinEquiKey // build side key column indices
-	probeKeyIdx []int         // probe side column indices
-	residualOn  Expr          // non-equi residual from ON
-	leftWhere   Expr          // WHERE predicates for left table
-	rightWhere  Expr          // WHERE predicates for right table
-	remainWhere Expr          // cross-table WHERE (evaluated after join)
-	swapped     bool          // true if INNER join swapped left/right
-	estCost     float64
-	estRows     int64
+	method       string // "hash_join" | "nested_loop"
+	buildSide    TableRef
+	probeSide    TableRef
+	buildTd      *catalog.TableDef
+	probeTd      *catalog.TableDef
+	buildAlias   string
+	probeAlias   string
+	equiKeys     []joinEquiKey // build side key column indices
+	probeKeyIdx  []int         // probe side column indices
+	residualOn   Expr          // non-equi residual from ON
+	leftWhere    Expr          // WHERE predicates for left table
+	rightWhere   Expr          // WHERE predicates for right table
+	remainWhere  Expr          // cross-table WHERE (evaluated after join)
+	swapped      bool          // true if INNER join swapped left/right
+	estCost      float64
+	estRows      int64
 	estBuildRows int64
 	estProbeRows int64
 }
@@ -8200,7 +8768,9 @@ func resolveTableIndex(col *ColumnRefExpr, tables []flatTableEntry) int {
 
 // extractEquiKeysForTable splits applicable conjuncts into equi-join keys
 // (buildLocalOffsets = local column indices within the new table's row,
-//  probeOffsets = absolute column offsets in the accumulated joined row)
+//
+//	probeOffsets = absolute column offsets in the accumulated joined row)
+//
 // and residual conjuncts (non-equi or same-table conditions).
 func extractEquiKeysForTable(conjuncts []Expr, tableIdx int, tables []flatTableEntry) (
 	buildLocalOffsets []int, probeOffsets []int, residualConjuncts []Expr) {
@@ -8301,8 +8871,8 @@ func (e *Executor) projectMultiJoinResult(s *SelectStmt, tables []flatTableEntry
 
 	// Build projection descriptors from Fields.
 	type projField struct {
-		colIdx int   // absolute index in joined row, -1 for expression
-		expr   Expr  // expression to evaluate
+		colIdx int  // absolute index in joined row, -1 for expression
+		expr   Expr // expression to evaluate
 		name   string
 	}
 	var fields []projField
@@ -8381,8 +8951,8 @@ func (e *Executor) projectMultiJoinResult(s *SelectStmt, tables []flatTableEntry
 // ─── Join cost model ───────────────────────────────────────────────────
 
 func estimateHashJoinCost(buildRows, probeRows int64) float64 {
-	buildScan := math.Max(1, float64(buildRows)/float64(rowsPerPage)) * costSeqIO + float64(buildRows)*costCPURow
-	probeScan := math.Max(1, float64(probeRows)/float64(rowsPerPage)) * costSeqIO + float64(probeRows)*costCPURow
+	buildScan := math.Max(1, float64(buildRows)/float64(rowsPerPage))*costSeqIO + float64(buildRows)*costCPURow
+	probeScan := math.Max(1, float64(probeRows)/float64(rowsPerPage))*costSeqIO + float64(probeRows)*costCPURow
 	hashBuild := float64(buildRows) * 0.011
 	hashProbe := float64(probeRows) * 0.01
 	return buildScan + probeScan + hashBuild + hashProbe
@@ -8631,7 +9201,7 @@ func (e *Executor) execHashJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, le
 					// probe = right, build = left → (NULL_left, right)
 					joined = append(append([]any{}, make([]any, len(plan.buildTd.Columns))...), probeRow...)
 				}
-				if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, plan.remainWhere) {
+				if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, plan.remainWhere) {
 					resultRows = append(resultRows, joined)
 				}
 			}
@@ -8659,7 +9229,7 @@ func (e *Executor) execHashJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, le
 
 			// Check residual ON condition.
 			if plan.residualOn != nil {
-				if !e.evalJoinCondition(leftTd, rightTd, joined[:len(leftTd.Columns)], joined[len(leftTd.Columns):], plan.residualOn) {
+				if !e.evalJoinCondition(leftTd, rightTd, leftAlias, rightAlias, joined[:len(leftTd.Columns)], joined[len(leftTd.Columns):], plan.residualOn) {
 					continue
 				}
 			}
@@ -8667,7 +9237,7 @@ func (e *Executor) execHashJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, le
 			anyMatched = true
 
 			// Check remaining WHERE.
-			if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, plan.remainWhere) {
+			if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, plan.remainWhere) {
 				resultRows = append(resultRows, joined)
 			}
 		}
@@ -8683,7 +9253,7 @@ func (e *Executor) execHashJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, le
 				joined = append(append([]any{}, make([]any, len(plan.buildTd.Columns))...), probeRow...)
 			}
 			if joined != nil {
-				if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, joined, plan.remainWhere) {
+				if plan.remainWhere == nil || e.evalJoinWhere(leftTd, rightTd, leftAlias, rightAlias, joined, plan.remainWhere) {
 					resultRows = append(resultRows, joined)
 				}
 			}
@@ -8691,15 +9261,9 @@ func (e *Executor) execHashJoin(t *txn.Txn, s *SelectStmt, ref *JoinTableRef, le
 		_ = pi
 	}
 
-	colNames := make([]string, 0, len(leftTd.Columns)+len(rightTd.Columns))
-	for _, col := range leftTd.Columns {
-		colNames = append(colNames, leftAlias+"."+col.Name)
-	}
-	for _, col := range rightTd.Columns {
-		colNames = append(colNames, rightAlias+"."+col.Name)
-	}
-
-	return &SelectResult{Columns: colNames, Rows: resultRows, TableAlias: leftAlias + " join " + rightAlias}, nil
+	entries := twoTableJoinEntries(leftTd, rightTd, leftAlias, rightAlias)
+	projectedRows, colNames := e.projectMultiJoinResult(s, entries, resultRows)
+	return &SelectResult{Columns: colNames, Rows: projectedRows, TableAlias: leftAlias + " join " + rightAlias}, nil
 }
 
 // buildWhereForSide returns the pushdown WHERE for the build side.

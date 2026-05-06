@@ -3,6 +3,7 @@
 package protocol
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"regexp"
@@ -88,6 +89,21 @@ func (h *SvrHandler) HandleQuery(query string) (result *mysql.Result, err error)
 	metrics.RewriteDuration.Observe(time.Since(t0).Seconds())
 
 	// Stage 2: execute (parse + plan + run).
+	if strings.HasPrefix(upper, "SELECT") {
+		iter, ok, err := h.exec.ExecuteStream(q)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			t1 := time.Now()
+			mysqlRes, err := buildStreamResult(iter)
+			if err != nil {
+				return nil, err
+			}
+			metrics.ConvertResultDuration.Observe(time.Since(t1).Seconds())
+			return mysqlRes, nil
+		}
+	}
 	res, err := h.exec.Execute(q)
 	if err != nil {
 		return nil, err
@@ -152,6 +168,21 @@ func (h *SvrHandler) HandleStmtExecute(context any, query string, args []any) (*
 	metrics.RewriteDuration.Observe(time.Since(t0).Seconds())
 
 	// Stage 2: execute.
+	if strings.HasPrefix(upper, "SELECT") {
+		iter, ok, err := h.exec.ExecuteStream(q)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			t1 := time.Now()
+			mysqlRes, err := buildStreamResult(iter)
+			if err != nil {
+				return nil, err
+			}
+			metrics.ConvertResultDuration.Observe(time.Since(t1).Seconds())
+			return mysqlRes, nil
+		}
+	}
 	result, err := h.exec.Execute(q)
 	if err != nil {
 		return nil, err
@@ -303,6 +334,46 @@ func buildSelectResult(r *sql.SelectResult) (*mysql.Result, error) {
 		return nil, err
 	}
 	return mysql.NewResult(rs), nil
+}
+
+func buildStreamResult(iter sql.RowIterator) (*mysql.Result, error) {
+	columns := iter.Columns()
+	fields := make([]*mysql.Field, len(columns))
+	for i, col := range columns {
+		fields[i] = &mysql.Field{
+			Name:    []byte(col),
+			Charset: 33,
+			Type:    mysql.MYSQL_TYPE_VAR_STRING,
+		}
+	}
+
+	sr := mysql.NewStreamResult(fields, 32, false)
+	go func() {
+		defer sr.Close()
+		defer iter.Close()
+
+		ctx := context.Background()
+		for {
+			row, err := iter.Next()
+			if err != nil {
+				sr.SetError(err)
+				return
+			}
+			if row == nil {
+				return
+			}
+
+			vals := make([]any, len(row))
+			for i, v := range row {
+				vals[i] = convertValue(v)
+			}
+			if !sr.WriteRow(ctx, vals) {
+				return
+			}
+		}
+	}()
+
+	return sr.AsResult(), nil
 }
 
 func buildOKResult(r *sql.OKResult) (*mysql.Result, error) {

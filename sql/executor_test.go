@@ -119,6 +119,172 @@ func TestExecSelectAll(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamSimpleSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO t1 (id, v) VALUES (3, 30)")
+
+	iter, ok, err := env.exec.ExecuteStream("SELECT id, v FROM t1 WHERE id >= 2 LIMIT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected simple SELECT to use streaming path")
+	}
+	defer iter.Close()
+
+	if got := iter.Columns(); len(got) != 2 || got[0] != "id" || got[1] != "v" {
+		t.Fatalf("unexpected columns: %v", got)
+	}
+
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row[0].(int32) != 2 || row[1].(int32) != 20 {
+		t.Fatalf("unexpected first row: %v", row)
+	}
+
+	row, err = iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row != nil {
+		t.Fatalf("expected end of stream, got row %v", row)
+	}
+}
+
+func TestExecuteStreamFallsBackForOrderBy(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)`)
+
+	iter, ok, err := env.exec.ExecuteStream("SELECT id FROM t1 ORDER BY v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		iter.Close()
+		t.Fatal("expected ORDER BY query to fall back to materialized execution")
+	}
+	if iter != nil {
+		t.Fatalf("expected nil iterator on fallback, got %T", iter)
+	}
+}
+
+func TestExecuteStreamJoinSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, aid INT, v INT)`)
+	env.exec.Execute("INSERT INTO a (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO a (id, v) VALUES (2, 20)")
+	env.exec.Execute("INSERT INTO b (id, aid, v) VALUES (1, 1, 100)")
+	env.exec.Execute("INSERT INTO b (id, aid, v) VALUES (2, 2, 200)")
+	env.exec.Execute("INSERT INTO b (id, aid, v) VALUES (3, 2, 300)")
+
+	iter, ok, err := env.exec.ExecuteStream("SELECT a.id, b.v FROM a JOIN b ON a.id = b.aid WHERE b.v >= 200 LIMIT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected JOIN SELECT to use streaming path")
+	}
+	defer iter.Close()
+
+	if got := iter.Columns(); len(got) != 2 || got[0] != "id" || got[1] != "v" {
+		t.Fatalf("unexpected columns: %v", got)
+	}
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row[0].(int32) != 2 || row[1].(int32) != 200 {
+		t.Fatalf("unexpected first row: %v", row)
+	}
+	row, err = iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row != nil {
+		t.Fatalf("expected stream to stop after LIMIT, got %v", row)
+	}
+}
+
+func TestExecuteStreamCommaJoinSelect(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY)`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY)`)
+	env.exec.Execute(`CREATE TABLE c (id INT NOT NULL PRIMARY KEY)`)
+	env.exec.Execute("INSERT INTO a (id) VALUES (1)")
+	env.exec.Execute("INSERT INTO b (id) VALUES (2)")
+	env.exec.Execute("INSERT INTO c (id) VALUES (3)")
+
+	iter, ok, err := env.exec.ExecuteStream("SELECT a.id, b.id, c.id FROM a, b, c WHERE a.id < c.id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected comma join SELECT to use streaming path")
+	}
+	defer iter.Close()
+
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row[0].(int32) != 1 || row[1].(int32) != 2 || row[2].(int32) != 3 {
+		t.Fatalf("unexpected row: %v", row)
+	}
+	row, err = iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row != nil {
+		t.Fatalf("expected end of stream, got %v", row)
+	}
+}
+
+func TestExecuteStreamLeftJoinWhereDoesNotInventNullRow(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY)`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, aid INT, v INT)`)
+	env.exec.Execute("INSERT INTO a (id) VALUES (1)")
+	env.exec.Execute("INSERT INTO b (id, aid, v) VALUES (1, 1, 5)")
+
+	iter, ok, err := env.exec.ExecuteStream("SELECT a.id, b.v FROM a LEFT JOIN b ON a.id = b.aid WHERE b.v IS NULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected LEFT JOIN SELECT to use streaming path")
+	}
+	defer iter.Close()
+
+	row, err := iter.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row != nil {
+		t.Fatalf("expected no rows, got %v", row)
+	}
+}
+
 func TestExecUpdate(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.close()
@@ -360,6 +526,80 @@ func TestJoinSelectWithCondition(t *testing.T) {
 	rows := rs.(*SelectResult)
 	if len(rows.Rows) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rows.Rows))
+	}
+}
+
+func TestJoinOnNullPredicateUsesSQLTruth(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute(`CREATE TABLE b (id INT NOT NULL PRIMARY KEY, v INT)`)
+	env.exec.Execute("INSERT INTO a (id, v) VALUES (1, 10)")
+	env.exec.Execute("INSERT INTO b (id, v) VALUES (1, 20)")
+
+	rs, err := env.exec.Execute("SELECT * FROM a JOIN b ON NULL IS NOT NULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Rows) != 0 {
+		t.Fatalf("expected 0 rows, got %d", len(rows.Rows))
+	}
+}
+
+func TestJoinSelectAllOmitsHiddenColumns(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (x INT, y INT)`)
+	env.exec.Execute(`CREATE TABLE b (x INT, y INT)`)
+	env.exec.Execute("INSERT INTO a VALUES (1, 2)")
+	env.exec.Execute("INSERT INTO b VALUES (3, 4)")
+
+	rs, err := env.exec.Execute("SELECT * FROM a JOIN b ON NULL IS NULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Columns) != 4 {
+		t.Fatalf("expected 4 visible columns, got %d: %v", len(rows.Columns), rows.Columns)
+	}
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if len(rows.Rows[0]) != 4 {
+		t.Fatalf("expected 4 visible values, got %d: %v", len(rows.Rows[0]), rows.Rows[0])
+	}
+}
+
+func TestJoinSelectAllProjectsCommaTableAfterExplicitJoin(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.close()
+
+	env.exec.Execute("CREATE DATABASE testdb")
+	env.exec.Execute(`CREATE TABLE a (x INT, y INT)`)
+	env.exec.Execute(`CREATE TABLE b (x INT, y INT)`)
+	env.exec.Execute(`CREATE TABLE c (x INT, y INT)`)
+	env.exec.Execute("INSERT INTO a VALUES (1, 2)")
+	env.exec.Execute("INSERT INTO b VALUES (3, 4)")
+	env.exec.Execute("INSERT INTO c VALUES (5, 6)")
+
+	rs, err := env.exec.Execute("SELECT * FROM a JOIN b ON 1 IS NOT NULL, c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := rs.(*SelectResult)
+	if len(rows.Columns) != 6 {
+		t.Fatalf("expected 6 visible columns, got %d: %v", len(rows.Columns), rows.Columns)
+	}
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if len(rows.Rows[0]) != 6 {
+		t.Fatalf("expected 6 visible values, got %d: %v", len(rows.Rows[0]), rows.Rows[0])
 	}
 }
 
@@ -1340,7 +1580,6 @@ func TestCustomerIndexSimulatedTPCC(t *testing.T) {
 		t.Logf("  row %d: c_id=%v c_first=%v", i, row[0], row[1])
 	}
 }
-
 
 func TestTextType(t *testing.T) {
 	env := newTestEnv(t)
